@@ -19,12 +19,20 @@ let config = VmConfig {
     namespace: "dev".into(),
     kernel: PathBuf::from("/path/to/vmlinuz"),
     initramfs: Some(PathBuf::from("/path/to/initramfs")),
-    root_disk: None, // diskless boot
+    root_disk: None,
+    data_disk: None,
+    seed_iso: None,
     cpus: 2,
     memory_mb: 512,
+    networks: vec![],
+    shared_dirs: vec![],
     serial_log: PathBuf::from("/tmp/vms/my-vm/serial.log"),
-    // ... other fields
-    ..Default::default()
+    cmdline: None,
+    netns: None,
+    vsock: false,
+    machine_id: None,
+    efi_variable_store: None,
+    rosetta: false,
 };
 
 let handle = manager.start(&config)?;
