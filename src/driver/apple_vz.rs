@@ -1,7 +1,15 @@
 //! macOS driver — Apple Virtualization.framework via virtualization-rs FFI.
 //!
-//! Uses Box::leak to keep VZVirtualMachine alive (Objective-C reference counting
-//! requires the object to outlive the dispatch queue).
+//! # Thread Safety
+//!
+//! All Objective-C / VZ framework calls are dispatched to a per-VM GCD serial
+//! queue. The calling thread (which may be a Rust test runner thread) NEVER
+//! makes ObjC calls directly. This prevents ObjC autoreleased objects from
+//! accumulating in the caller's thread-local storage (TLS) autorelease pool,
+//! which would cause SIGSEGV in `_pthread_tsd_cleanup` when the thread exits.
+//!
+//! Uses `Box::leak` to keep `VZVirtualMachine` alive (Objective-C reference
+//! counting requires the object to outlive the dispatch queue).
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,7 +21,9 @@ use block::{Block, ConcreteBlock};
 use objc::rc::StrongPtr;
 
 use crate::ffi::apple_vz::{
-    base::{dispatch_async, dispatch_queue_create, Id, NSError, NSFileHandle, NIL},
+    base::{
+        dispatch_async, dispatch_queue_create, Id, NSError, NSFileHandle, NIL,
+    },
     boot_loader::VZLinuxBootLoaderBuilder,
     entropy_device::VZVirtioEntropyDeviceConfiguration,
     memory_device::VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
@@ -39,10 +49,21 @@ use crate::ffi::apple_vz::{
 use crate::config::{NetworkAttachment, VmConfig, VmHandle, VmState};
 use crate::driver::{VmDriver, VmError};
 
+/// Per-VM state stored in the global registry.
+struct VmEntry {
+    vm: &'static VZVirtualMachine,
+    queue: Id, // GCD dispatch queue for this VM
+}
+
+// SAFETY: Id (raw pointer to ObjC object) is Send — the dispatch queue is
+// retained by GCD and safe to reference from any thread. We only use it
+// via dispatch_sync/dispatch_async which are thread-safe by design.
+unsafe impl Send for VmEntry {}
+
 /// Global registry of leaked VM references, keyed by VM name.
 /// Required because Apple VZ needs the VZVirtualMachine object to stay alive
 /// for the VM to keep running. Box::leak prevents Rust from dropping it.
-static VM_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, &'static VZVirtualMachine>>> =
+static VM_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, VmEntry>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Apple Virtualization.framework driver for macOS.
@@ -67,16 +88,14 @@ impl AppleVzDriver {
 
 impl VmDriver for AppleVzDriver {
     fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
-        if !VZVirtualMachine::supported() {
-            return Err(VmError::Hypervisor(
-                "Apple Virtualization.framework is not supported on this machine".into(),
-            ));
-        }
+        // ── Step 1: Pre-validate and resolve paths (pure Rust, no ObjC) ──
 
-        let name = &config.name;
+        let name = config.name.clone();
+        let namespace = config.namespace.clone();
+        let serial_log = config.serial_log.clone();
         let memory_bytes = config.memory_mb * 1024 * 1024;
+        let cpus = config.cpus;
 
-        // Resolve to absolute paths (required by VZ framework)
         let kernel_abs = resolve_path(&config.kernel, "kernel")?;
         let initrd_abs = config
             .initramfs
@@ -94,146 +113,41 @@ impl VmDriver for AppleVzDriver {
             .map(|p| resolve_path(p, "seed ISO"))
             .transpose()?;
 
-        // Boot loader — direct Linux boot (fastest path)
-        // Apple VZ requires initramfs for Linux boot
         let initrd = initrd_abs.ok_or_else(|| {
             VmError::InvalidConfig("initramfs is required for Apple VZ boot".into())
         })?;
-        // Default cmdline depends on boot mode: disk-based vs initramfs-only
+
         let default_cmdline = if disk_abs.is_some() {
             "console=hvc0 root=/dev/vda1 rw ds=nocloud"
         } else {
             "console=hvc0"
         };
-        let cmdline = config.cmdline.as_deref().unwrap_or(default_cmdline);
-        let boot_loader = VZLinuxBootLoaderBuilder::new()
-            .kernel_url(&kernel_abs)
-            .initial_ramdisk_url(&initrd)
-            .command_line(cmdline)
-            .build();
+        let cmdline = config
+            .cmdline
+            .clone()
+            .unwrap_or_else(|| default_cmdline.to_string());
 
-        // Serial console → per-VM log file
-        let log_file = fs::File::create(&config.serial_log).map_err(VmError::Io)?;
-        let null_file = fs::File::open("/dev/null").map_err(VmError::Io)?;
-
-        // SAFETY: into_raw_fd() transfers ownership to the NSFileHandle (closeOnDealloc: YES).
-        let read_handle =
-            unsafe { NSFileHandle::file_handle_with_fd_owned(null_file.into_raw_fd()) };
-        // SAFETY: into_raw_fd() transfers ownership to the NSFileHandle (closeOnDealloc: YES).
-        let write_handle =
-            unsafe { NSFileHandle::file_handle_with_fd_owned(log_file.into_raw_fd()) };
-        let serial_attachment = VZFileHandleSerialPortAttachmentBuilder::new()
-            .file_handle_for_reading(read_handle)
-            .file_handle_for_writing(write_handle)
-            .build();
-        let serial = VZVirtioConsoleDeviceSerialPortConfiguration::new(serial_attachment);
-
-        // Entropy device (for /dev/random inside VM)
-        let entropy = VZVirtioEntropyDeviceConfiguration::new();
-
-        // Memory balloon (dynamic memory management)
-        let memory_balloon = VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new();
-
-        // NIC 1: NAT — internet access + SSH from host
-        let nat_attachment = VZNATNetworkDeviceAttachment::new();
-        let mut nat_nic = VZVirtioNetworkDeviceConfiguration::new(nat_attachment);
-        nat_nic.set_mac_address(VZMACAddress::random_locally_administered_address());
-        let mut network_devices: Vec<VZVirtioNetworkDeviceConfiguration> = vec![nat_nic];
-
-        // NIC 2+: FileHandle per network — inter-VM via L2 switch
+        // Validate network config (reject unsupported types before dispatching)
         for net in &config.networks {
-            match net {
-                NetworkAttachment::SocketPairFd(fd) => {
-                    // SAFETY: fd comes from a socketpair managed by the NetworkSwitch.
-                    // The switch owns the fd lifetime, so we borrow (closeOnDealloc: NO).
-                    let file_handle = unsafe { NSFileHandle::file_handle_with_fd_borrowed(*fd) };
-                    let fh_attachment = VZFileHandleNetworkDeviceAttachment::new(file_handle);
-                    let mut nic = VZVirtioNetworkDeviceConfiguration::new(fh_attachment);
-                    nic.set_mac_address(VZMACAddress::random_locally_administered_address());
-                    network_devices.push(nic);
-                }
-                NetworkAttachment::Tap { .. } => {
-                    return Err(VmError::InvalidConfig(
-                        "TAP devices are not supported on macOS; use SocketPairFd".into(),
-                    ));
-                }
+            if matches!(net, NetworkAttachment::Tap { .. }) {
+                return Err(VmError::InvalidConfig(
+                    "TAP devices are not supported on macOS; use SocketPairFd".into(),
+                ));
             }
         }
+        let networks = config.networks.clone();
+        let shared_dirs = config.shared_dirs.clone();
 
-        // Disks: attach only if provided (initramfs boot needs no disks)
-        let mut storage_devices: Vec<VZVirtioBlockDeviceConfiguration> = Vec::new();
+        // Open file descriptors (pure Rust syscalls, no ObjC)
+        let log_fd = fs::File::create(&config.serial_log)
+            .map_err(VmError::Io)?
+            .into_raw_fd();
+        let null_fd = fs::File::open("/dev/null")
+            .map_err(VmError::Io)?
+            .into_raw_fd();
 
-        if let Some(ref disk_path) = disk_abs {
-            let root_attachment = VZDiskImageStorageDeviceAttachmentBuilder::new()
-                .path(disk_path)
-                .read_only(false)
-                .caching_mode(VZDiskImageCachingMode::Automatic)
-                .sync_mode(VZDiskImageSynchronizationMode::Full)
-                .build()
-                .map_err(|e| VmError::BootFailed {
-                    name: name.clone(),
-                    detail: format!("failed to attach root disk: code {}", e.code()),
-                })?;
-            storage_devices.push(VZVirtioBlockDeviceConfiguration::new(root_attachment));
-        }
+        // ── Step 2: Create GCD queue (C function, no ObjC autorelease) ──
 
-        if let Some(ref seed_path) = seed_abs {
-            let seed_attachment = VZDiskImageStorageDeviceAttachmentBuilder::new()
-                .path(seed_path)
-                .read_only(true)
-                .build()
-                .map_err(|e| VmError::BootFailed {
-                    name: name.clone(),
-                    detail: format!("failed to attach seed ISO: code {}", e.code()),
-                })?;
-            storage_devices.push(VZVirtioBlockDeviceConfiguration::new(seed_attachment));
-        }
-
-        // VirtioFS shared directories (volume mounts)
-        let mut shared_dirs: Vec<VZVirtioFileSystemDeviceConfiguration> = Vec::new();
-        for vol in &config.shared_dirs {
-            let host_str = vol
-                .host_path
-                .to_str()
-                .ok_or_else(|| VmError::InvalidConfig("non-UTF8 shared dir path".into()))?;
-            let dir = VZSharedDirectory::new(host_str, vol.read_only);
-            let share = VZSingleDirectoryShare::new(dir);
-            let mut fs_device = VZVirtioFileSystemDeviceConfiguration::new(&vol.tag);
-            fs_device.set_share(share);
-            shared_dirs.push(fs_device);
-        }
-
-        // Assemble VM configuration
-        let mut builder = VZVirtualMachineConfigurationBuilder::new()
-            .boot_loader(boot_loader)
-            .cpu_count(config.cpus)
-            .memory_size(memory_bytes)
-            .entropy_devices(vec![entropy])
-            .memory_balloon_devices(vec![memory_balloon])
-            .network_devices(network_devices)
-            .serial_ports(vec![serial])
-            .storage_devices(storage_devices);
-
-        if !shared_dirs.is_empty() {
-            builder = builder.directory_sharing_devices(shared_dirs);
-        }
-
-        let vm_config = builder.build();
-
-        // Validate
-        vm_config.validate_with_error().map_err(|e| {
-            let code = e.code();
-            VmError::BootFailed {
-                name: name.clone(),
-                detail: format!(
-                    "VZ configuration validation failed: code {}. \
-                     Hint: the binary must be signed with virtualization entitlement",
-                    code
-                ),
-            }
-        })?;
-
-        // Create dispatch queue with unique label per VM
         let label =
             std::ffi::CString::new(format!("rs.vm.{}", name)).map_err(|e| VmError::BootFailed {
                 name: name.clone(),
@@ -241,126 +155,387 @@ impl VmDriver for AppleVzDriver {
             })?;
         // SAFETY: label is a valid null-terminated C string; NIL for serial queue.
         let queue = unsafe { dispatch_queue_create(label.as_ptr(), NIL) };
-        let vm = VZVirtualMachine::new(vm_config, queue);
 
-        // Box::leak: keep the VZVirtualMachine alive for the lifetime of the process.
-        // Without this, Rust drops the VM object, Objective-C releases the underlying
-        // VZVirtualMachine, and the VM dies immediately.
-        let vm_leaked: &'static VZVirtualMachine = Box::leak(Box::new(vm));
+        // ── Step 3: Dispatch ALL ObjC/VZ work to the GCD queue ──
+        //
+        // GCD manages autorelease pools for queue worker threads. All ObjC
+        // autoreleased objects stay on the queue's thread — never polluting
+        // the caller's TLS pool. This prevents SIGSEGV at thread exit.
 
-        // Register for graceful shutdown
-        {
-            let mut registry = VM_REGISTRY
-                .lock()
-                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-            registry.insert(name.to_string(), vm_leaked);
-        }
+        let (tx, rx) = std::sync::mpsc::channel::<Result<VmHandle, VmError>>();
+        let name_q = name.clone();
+        let namespace_q = namespace.clone();
+        let serial_log_q = serial_log.clone();
 
-        // Start VM on its dispatch queue
-        let name_for_log = name.to_string();
-        let name_for_err = name.to_string();
-        let dispatch_block = ConcreteBlock::new(move || {
-            tracing::debug!("dispatch block running for VM '{}'", name_for_log);
-            let name_err = name_for_err.clone();
-            let completion_handler = ConcreteBlock::new(move |err: Id| {
-                if err == NIL {
-                    tracing::info!("VM '{}' started successfully", name_err);
-                } else {
-                    // SAFETY: err is a valid NSError pointer from the framework.
-                    let error = unsafe { NSError(StrongPtr::retain(err)) };
-                    let code = error.code();
-                    tracing::error!("VM '{}' start FAILED (error code {})", name_err, code);
+        let boot_block = ConcreteBlock::new(move || {
+            let result = (|| -> Result<VmHandle, VmError> {
+                // Check VZ support (ObjC class method)
+                if !VZVirtualMachine::supported() {
+                    return Err(VmError::Hypervisor(
+                        "Apple Virtualization.framework is not supported on this machine".into(),
+                    ));
                 }
-            });
-            let completion_handler = completion_handler.copy();
-            let completion_handler: &Block<(Id,), ()> = &completion_handler;
-            vm_leaked.start_with_completion_handler(completion_handler);
+
+                // Boot loader — direct Linux boot
+                let boot_loader = VZLinuxBootLoaderBuilder::new()
+                    .kernel_url(&kernel_abs)
+                    .initial_ramdisk_url(&initrd)
+                    .command_line(&cmdline)
+                    .build();
+
+                // Serial console → per-VM log file
+                // SAFETY: fds are valid (opened on caller thread, ownership transferred here).
+                let read_handle =
+                    unsafe { NSFileHandle::file_handle_with_fd_owned(null_fd) };
+                let write_handle =
+                    unsafe { NSFileHandle::file_handle_with_fd_owned(log_fd) };
+                let serial_attachment = VZFileHandleSerialPortAttachmentBuilder::new()
+                    .file_handle_for_reading(read_handle)
+                    .file_handle_for_writing(write_handle)
+                    .build();
+                let serial =
+                    VZVirtioConsoleDeviceSerialPortConfiguration::new(serial_attachment);
+
+                let entropy = VZVirtioEntropyDeviceConfiguration::new();
+                let memory_balloon =
+                    VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new();
+
+                // NIC 1: NAT
+                let nat_attachment = VZNATNetworkDeviceAttachment::new();
+                let mut nat_nic = VZVirtioNetworkDeviceConfiguration::new(nat_attachment);
+                nat_nic
+                    .set_mac_address(VZMACAddress::random_locally_administered_address());
+                let mut network_devices = vec![nat_nic];
+
+                // NIC 2+: FileHandle per network
+                for net in &networks {
+                    if let NetworkAttachment::SocketPairFd(fd) = net {
+                        // SAFETY: fd from socketpair managed by NetworkSwitch.
+                        let file_handle =
+                            unsafe { NSFileHandle::file_handle_with_fd_borrowed(*fd) };
+                        let fh_attachment =
+                            VZFileHandleNetworkDeviceAttachment::new(file_handle);
+                        let mut nic =
+                            VZVirtioNetworkDeviceConfiguration::new(fh_attachment);
+                        nic.set_mac_address(
+                            VZMACAddress::random_locally_administered_address(),
+                        );
+                        network_devices.push(nic);
+                    }
+                }
+
+                // Disks
+                let mut storage_devices: Vec<VZVirtioBlockDeviceConfiguration> = Vec::new();
+                if let Some(ref disk_path) = disk_abs {
+                    let root_attachment = VZDiskImageStorageDeviceAttachmentBuilder::new()
+                        .path(disk_path)
+                        .read_only(false)
+                        .caching_mode(VZDiskImageCachingMode::Automatic)
+                        .sync_mode(VZDiskImageSynchronizationMode::Full)
+                        .build()
+                        .map_err(|e| VmError::BootFailed {
+                            name: name_q.clone(),
+                            detail: format!(
+                                "failed to attach root disk: code {}",
+                                e.code()
+                            ),
+                        })?;
+                    storage_devices
+                        .push(VZVirtioBlockDeviceConfiguration::new(root_attachment));
+                }
+                if let Some(ref seed_path) = seed_abs {
+                    let seed_attachment = VZDiskImageStorageDeviceAttachmentBuilder::new()
+                        .path(seed_path)
+                        .read_only(true)
+                        .build()
+                        .map_err(|e| VmError::BootFailed {
+                            name: name_q.clone(),
+                            detail: format!(
+                                "failed to attach seed ISO: code {}",
+                                e.code()
+                            ),
+                        })?;
+                    storage_devices
+                        .push(VZVirtioBlockDeviceConfiguration::new(seed_attachment));
+                }
+
+                // VirtioFS shared directories
+                let mut vz_shared_dirs: Vec<VZVirtioFileSystemDeviceConfiguration> =
+                    Vec::new();
+                for vol in &shared_dirs {
+                    let host_str = vol.host_path.to_str().ok_or_else(|| {
+                        VmError::InvalidConfig("non-UTF8 shared dir path".into())
+                    })?;
+                    let dir = VZSharedDirectory::new(host_str, vol.read_only);
+                    let share = VZSingleDirectoryShare::new(dir);
+                    let mut fs_device =
+                        VZVirtioFileSystemDeviceConfiguration::new(&vol.tag);
+                    fs_device.set_share(share);
+                    vz_shared_dirs.push(fs_device);
+                }
+
+                // Assemble VM configuration
+                let mut builder = VZVirtualMachineConfigurationBuilder::new()
+                    .boot_loader(boot_loader)
+                    .cpu_count(cpus)
+                    .memory_size(memory_bytes)
+                    .entropy_devices(vec![entropy])
+                    .memory_balloon_devices(vec![memory_balloon])
+                    .network_devices(network_devices)
+                    .serial_ports(vec![serial])
+                    .storage_devices(storage_devices);
+
+                if !vz_shared_dirs.is_empty() {
+                    builder = builder.directory_sharing_devices(vz_shared_dirs);
+                }
+
+                let vm_config = builder.build();
+
+                // Validate
+                vm_config.validate_with_error().map_err(|e| {
+                    VmError::BootFailed {
+                        name: name_q.clone(),
+                        detail: format!(
+                            "VZ configuration validation failed: code {}. \
+                             Hint: the binary must be signed with virtualization entitlement",
+                            e.code()
+                        ),
+                    }
+                })?;
+
+                // Create VM on this queue
+                let vm = VZVirtualMachine::new(vm_config, queue);
+
+                // Box::leak: keep VZVirtualMachine alive for the process lifetime.
+                let vm_leaked: &'static VZVirtualMachine = Box::leak(Box::new(vm));
+
+                // Register for graceful shutdown
+                {
+                    let mut registry = VM_REGISTRY.lock().map_err(|e| {
+                        VmError::Hypervisor(format!("VM registry lock poisoned: {}", e))
+                    })?;
+                    registry.insert(
+                        name_q.clone(),
+                        VmEntry {
+                            vm: vm_leaked,
+                            queue,
+                        },
+                    );
+                }
+
+                // Start VM (we're already on the VM's dispatch queue)
+                let name_for_err = name_q.clone();
+                let completion_handler = ConcreteBlock::new(move |err: Id| {
+                    if err == NIL {
+                        tracing::info!("VM '{}' started successfully", name_for_err);
+                    } else {
+                        // SAFETY: err is a valid NSError from the framework.
+                        let error = unsafe { NSError(StrongPtr::retain(err)) };
+                        tracing::error!(
+                            "VM '{}' start FAILED (error code {})",
+                            name_for_err,
+                            error.code()
+                        );
+                    }
+                });
+                let completion_handler = completion_handler.copy();
+                let completion_handler: &Block<(Id,), ()> = &completion_handler;
+                vm_leaked.start_with_completion_handler(completion_handler);
+
+                Ok(VmHandle {
+                    name: name_q.clone(),
+                    namespace: namespace_q.clone(),
+                    state: VmState::Starting,
+                    pid: None, // Apple VZ runs in-process, no separate PID
+                    serial_log: serial_log_q.clone(),
+                })
+            })();
+
+            let _ = tx.send(result);
         });
-        let dispatch_block = dispatch_block.copy();
-        let dispatch_block: &Block<(), ()> = &dispatch_block;
-        // SAFETY: queue is a valid GCD dispatch queue, block is properly retained.
+        let boot_block = boot_block.copy();
+        let boot_block: &Block<(), ()> = &boot_block;
+
+        // SAFETY: queue is a valid GCD queue, block is properly retained.
         unsafe {
-            dispatch_async(queue, dispatch_block);
+            dispatch_async(queue, boot_block);
         }
 
-        // Give dispatch queue a moment to fire
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // ── Step 4: Wait for result ──
 
-        Ok(VmHandle {
-            name: name.clone(),
-            namespace: config.namespace.clone(),
-            state: VmState::Starting,
-            pid: None, // Apple VZ runs in-process, no separate PID
-            serial_log: config.serial_log.clone(),
-        })
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => {
+                // Give the VM a moment to fire the start completion handler
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                result
+            }
+            Err(_) => Err(VmError::BootFailed {
+                name,
+                detail: "boot timed out after 10s (GCD block did not execute)".into(),
+            }),
+        }
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let registry = VM_REGISTRY
-            .lock()
-            .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-        let vm = registry
-            .get(&handle.name)
-            .ok_or_else(|| VmError::NotFound {
-                name: handle.name.clone(),
-            })?;
-
-        let mut vm_clone = (*vm).clone();
-        // SAFETY: vm_clone is a valid VZVirtualMachine reference from the registry.
-        unsafe {
-            vm_clone
-                .request_stop_with_error()
-                .map_err(|e| VmError::StopFailed {
+        // Extract vm + queue from registry, then drop the lock before blocking.
+        let (vm, queue) = {
+            let registry = VM_REGISTRY
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+            let entry = registry
+                .get(&handle.name)
+                .ok_or_else(|| VmError::NotFound {
                     name: handle.name.clone(),
-                    detail: format!("error code {}", e.code()),
                 })?;
+            (entry.vm, entry.queue)
+        };
+
+        let name = handle.name.clone();
+
+        // dispatch_async + channel avoids placing ObjC autorelease objects
+        // on the caller's thread pool (prevents SIGSEGV at thread exit).
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let stop_block = ConcreteBlock::new(move || {
+            let mut vm_ref = vm.clone();
+            // SAFETY: called on the VM's dispatch queue, vm_ref is a valid VZ object.
+            let result = unsafe {
+                match vm_ref.request_stop_with_error() {
+                    Ok(_) => {
+                        tracing::info!("VM '{}' stop requested", name);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("error code {}", e.code())),
+                }
+            };
+            let _ = tx.send(result);
+        });
+        let stop_block = stop_block.copy();
+        let stop_block: &Block<(), ()> = &stop_block;
+
+        // SAFETY: queue is a valid GCD queue, block is retained.
+        unsafe {
+            dispatch_async(queue, stop_block);
         }
 
-        Ok(())
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(detail)) => Err(VmError::StopFailed {
+                name: handle.name.clone(),
+                detail,
+            }),
+            Err(_) => Err(VmError::StopFailed {
+                name: handle.name.clone(),
+                detail: "stop timed out after 5s".into(),
+            }),
+        }
     }
 
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
-        // Apple VZ doesn't have a force-kill API separate from stop.
-        // Remove from registry — the leaked reference stays but the VM is abandoned.
-        let mut registry = VM_REGISTRY
-            .lock()
-            .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-        registry.remove(&handle.name);
-        tracing::warn!("force-killed VM '{}' (removed from registry)", handle.name);
+        // Remove entry and drop the lock before blocking on the channel.
+        let entry = {
+            let mut registry = VM_REGISTRY
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+            registry.remove(&handle.name)
+        };
+
+        if let Some(entry) = entry {
+            let vm = entry.vm;
+            let queue = entry.queue;
+            let name = handle.name.clone();
+
+            // stopWithCompletionHandler (macOS 14+) via dispatch_async.
+            // dispatch_async keeps all ObjC autoreleases on the GCD queue's
+            // thread — never the caller's TLS pool.
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+            let name_inner = name.clone();
+            let stop_block = ConcreteBlock::new(move || {
+                let name_err = name_inner.clone();
+                let tx_inner = tx.clone();
+                let completion = ConcreteBlock::new(move |err: Id| {
+                    if err == NIL {
+                        tracing::debug!("VM '{}' force-stopped", name_err);
+                    } else {
+                        // SAFETY: err is a valid NSError from the framework.
+                        let error = unsafe { NSError(StrongPtr::retain(err)) };
+                        tracing::debug!(
+                            "VM '{}' force-stop error: code {}",
+                            name_err,
+                            error.code()
+                        );
+                    }
+                    let _ = tx_inner.send(());
+                });
+                let completion = completion.copy();
+                let completion: &Block<(Id,), ()> = &completion;
+                vm.stop_with_completion_handler(completion);
+            });
+            let stop_block = stop_block.copy();
+            let stop_block: &Block<(), ()> = &stop_block;
+
+            // SAFETY: queue is a valid GCD queue, block is properly retained.
+            unsafe {
+                dispatch_async(queue, stop_block);
+            }
+
+            // Wait for completion (with timeout to avoid hanging)
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+        }
+
+        tracing::info!("killed VM '{}'", handle.name);
         Ok(())
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let registry = VM_REGISTRY
-            .lock()
-            .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-        let vm = match registry.get(&handle.name) {
-            Some(vm) => *vm,
-            None => return Ok(VmState::Stopped),
+        // Extract vm + queue, then drop the lock before blocking.
+        let (vm, queue) = {
+            let registry = VM_REGISTRY
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+            match registry.get(&handle.name) {
+                Some(entry) => (entry.vm, entry.queue),
+                None => return Ok(VmState::Stopped),
+            }
         };
 
-        // Query actual VZ framework state instead of assuming Running
-        // SAFETY: state() sends an ObjC message on the VM object we hold in the registry.
-        let vz_state = unsafe { vm.state() };
-        match vz_state {
-            VZVirtualMachineState::VZVirtualMachineStateStopped
-            | VZVirtualMachineState::VZVirtualMachineStateError => Ok(VmState::Stopped),
-            VZVirtualMachineState::VZVirtualMachineStateStarting => Ok(VmState::Starting),
-            VZVirtualMachineState::VZVirtualMachineStatePaused
-            | VZVirtualMachineState::VZVirtualMachineStatePausing
-            | VZVirtualMachineState::VZVirtualMachineStateResuming => {
-                // Report paused states as Starting (we don't have a Paused variant)
-                Ok(VmState::Starting)
-            }
-            VZVirtualMachineState::VZVirtualMachineStateRunning => {
-                // VZ says Running — check console log for readiness marker with IP
-                if let Some(ip) = check_ready_marker(&handle.serial_log) {
-                    Ok(VmState::Running { ip })
-                } else {
-                    Ok(VmState::Starting)
+        let serial_log = handle.serial_log.clone();
+
+        // Dispatch the ObjC state query to the VM's GCD queue.
+        // This keeps ObjC autoreleases off the caller's thread.
+        let (tx, rx) = std::sync::mpsc::channel::<VmState>();
+        let state_block = ConcreteBlock::new(move || {
+            // SAFETY: called on the VM's dispatch queue; vm is a valid leaked reference.
+            let vz_state = unsafe { vm.state() };
+            let result = match vz_state {
+                VZVirtualMachineState::VZVirtualMachineStateStopped
+                | VZVirtualMachineState::VZVirtualMachineStateError => VmState::Stopped,
+                VZVirtualMachineState::VZVirtualMachineStateStarting => VmState::Starting,
+                VZVirtualMachineState::VZVirtualMachineStatePaused
+                | VZVirtualMachineState::VZVirtualMachineStatePausing
+                | VZVirtualMachineState::VZVirtualMachineStateResuming => VmState::Starting,
+                VZVirtualMachineState::VZVirtualMachineStateRunning => {
+                    if let Some(ip) = check_ready_marker(&serial_log) {
+                        VmState::Running { ip }
+                    } else {
+                        VmState::Starting
+                    }
                 }
-            }
-            VZVirtualMachineState::Other => Ok(VmState::Starting),
+                VZVirtualMachineState::Other => VmState::Starting,
+            };
+            let _ = tx.send(result);
+        });
+        let state_block = state_block.copy();
+        let state_block: &Block<(), ()> = &state_block;
+
+        // SAFETY: queue is a valid GCD queue, block is retained.
+        unsafe {
+            dispatch_async(queue, state_block);
+        }
+
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(state) => Ok(state),
+            Err(_) => Err(VmError::Hypervisor("state query timed out after 5s".into())),
         }
     }
 }

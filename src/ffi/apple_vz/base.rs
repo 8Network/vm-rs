@@ -16,10 +16,8 @@ extern "C" {}
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
     pub fn dispatch_queue_create(label: *const libc::c_char, attr: Id) -> Id;
-    // pub fn dispatch_sync(queue: Id, block: &Block<(), ()>);
     pub fn dispatch_sync(queue: Id, block: *mut c_void);
     pub fn dispatch_async(queue: Id, block: &Block<(), ()>);
-    // pub fn dispatch_async(queue: Id, block: *mut c_void);
 }
 
 pub type Id = *mut Object;
@@ -33,7 +31,9 @@ pub struct NSArray<T> {
 impl<T> NSArray<T> {
     pub fn array_with_objects(objects: Vec<Id>) -> NSArray<T> {
         unsafe {
-            let p = StrongPtr::new(
+            // arrayWithObjects:count: is a factory method returning autoreleased (+0).
+            // Must use StrongPtr::retain to add +1 before taking ownership.
+            let p = StrongPtr::retain(
                 msg_send![class!(NSArray), arrayWithObjects:objects.as_slice().as_ptr() count:objects.len()],
             );
             NSArray {

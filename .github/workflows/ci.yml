@@ -136,7 +136,7 @@ jobs:
       - name: Install Cloud Hypervisor
         if: env.KVM_AVAILABLE == 'true'
         run: |
-          CH_VERSION="v42.0"
+          CH_VERSION="v51.1"
           sudo curl -L "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static" \
             -o /usr/local/bin/cloud-hypervisor
           sudo chmod +x /usr/local/bin/cloud-hypervisor
@@ -145,7 +145,7 @@ jobs:
       - name: Download Alpine test assets
         if: env.KVM_AVAILABLE == 'true'
         run: |
-          ALPINE_VERSION="3.20"
+          ALPINE_VERSION="3.23"
           ARCH="x86_64"
           BASE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ARCH}/netboot"
 

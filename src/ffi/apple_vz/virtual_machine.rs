@@ -298,6 +298,16 @@ impl VZVirtualMachine {
         }
     }
 
+    /// Force-stop the VM (macOS 14+). Calls `-[VZVirtualMachine stopWithCompletionHandler:]`.
+    ///
+    /// # Safety
+    /// Must be called from the same dispatch queue that started the VM.
+    pub fn stop_with_completion_handler(&self, completion_handler: &Block<(Id,), ()>) {
+        unsafe {
+            let _: Id = msg_send![*self.0, stopWithCompletionHandler: completion_handler];
+        }
+    }
+
     /// # Safety
     /// Must be called from the same dispatch queue that owns the VM.
     pub unsafe fn state(&self) -> VZVirtualMachineState {

@@ -109,8 +109,10 @@ impl VZMACAddress {
         VZMACAddress(p)
     }
     pub fn random_locally_administered_address() -> VZMACAddress {
+        // randomLocallyAdministeredAddress is a factory method returning autoreleased (+0).
+        // Must use StrongPtr::retain to add +1 before taking ownership.
         let p = unsafe {
-            StrongPtr::new(msg_send![
+            StrongPtr::retain(msg_send![
                 class!(VZMACAddress),
                 randomLocallyAdministeredAddress
             ])
@@ -120,9 +122,11 @@ impl VZMACAddress {
 
     pub fn init_with_string(s: &str) -> VZMACAddress {
         let string = NSString::new(s);
-        let p =
-            unsafe { StrongPtr::new(msg_send![class!(VZMACAddress), initWithString:*string.0]) };
-        VZMACAddress(p)
+        unsafe {
+            let alloc: Id = msg_send![class!(VZMACAddress), alloc];
+            let p = StrongPtr::new(msg_send![alloc, initWithString:*string.0]);
+            VZMACAddress(p)
+        }
     }
 }
 
