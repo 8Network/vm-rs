@@ -48,7 +48,7 @@ let state = manager.state("my-vm")?;
 
 **Setup**: Cloud-init seed ISO generation, SSH key generation, image download and caching
 
-See [CAPABILITIES.md](CAPABILITIES.md) for the full capability matrix with per-platform status.
+See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for the full capability matrix with per-platform status.
 
 ## Requirements
 
@@ -122,4 +122,4 @@ cargo test --test ffi_smoke       # Apple VZ FFI (macOS only)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).

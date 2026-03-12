@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Cross-platform VM lifecycle management — Apple Virtualization.framework (macOS) + Cloud Hypervisor (Linux)"
 license = "MIT"
+repository = "https://github.com/8Network/vm-rs"
+homepage = "https://github.com/8Network/vm-rs"
+readme = "README.md"
 keywords = ["virtualization", "vm", "apple-vz", "cloud-hypervisor", "microvm"]
 categories = ["virtualization", "os"]
 
