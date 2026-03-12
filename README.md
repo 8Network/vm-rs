@@ -1,10 +1,11 @@
 # vm-rs
 
 Cross-platform VM lifecycle management for Rust.
-Boot, stop, and orchestrate lightweight virtual machines on macOS and Linux from a single API.
+Boot, stop, and orchestrate lightweight virtual machines on macOS, Linux, and Windows from a single API.
 
 - **macOS**: Apple Virtualization.framework (in-process, via Objective-C FFI)
 - **Linux**: Cloud Hypervisor (separate VMM process, CLI mode)
+- **Windows**: WHP driver planned (compiles and tests today, VM driver coming)
 
 ## Quick Start
 
@@ -73,16 +74,18 @@ See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for the full capability matrix 
 - Optional: `virtiofsd` for VirtioFS shared directories
 - Optional: `genisoimage` or `mkisofs` for cloud-init seed ISOs
 
+### Windows
+
+- Windows 10/11 with Hyper-V enabled (WHP driver planned)
+- OCI, setup, and core types work today; VM lifecycle driver coming
+
 ## Building
 
 ```bash
-# macOS
+# All platforms
 cargo build
 
-# Linux
-cargo build
-
-# Run tests (both platforms)
+# Run tests
 cargo test
 
 # Run only unit tests (no hypervisor needed)
@@ -113,7 +116,7 @@ lifecycle via signals. The `Child` handle prevents PID reuse.
 
 ## Testing
 
-156 tests across 8 test suites. CI runs on both macOS (aarch64) and Linux (x86_64).
+156 tests across 8 test suites. CI runs on macOS (aarch64), Linux (x86_64), and Windows (x86_64).
 
 ```bash
 cargo test                        # everything

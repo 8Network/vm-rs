@@ -60,7 +60,7 @@ jobs:
       - name: Doc tests
         run: cargo test --doc --target ${{ matrix.target }}
 
-  # ── Integration tests (no VM, both platforms) ──────────────────────
+  # ── Integration tests (all platforms) ──────────────────────────────
   integration:
     name: Integration (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -72,6 +72,8 @@ jobs:
             target: aarch64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -94,10 +96,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y genisoimage
       - name: Seed ISO tests
+        if: runner.os != 'Windows'
         run: cargo test --test seed_iso --target ${{ matrix.target }}
 
-      # Network switch tests (socketpairs, works everywhere)
+      # Network switch tests (Unix socketpairs — not available on Windows)
       - name: Network switch tests
+        if: runner.os != 'Windows'
         run: cargo test --test network_switch --target ${{ matrix.target }}
 
   # ── OCI registry tests (requires internet) ─────────────────────────

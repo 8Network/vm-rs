@@ -6,6 +6,21 @@ This project follows [Semantic Versioning](https://semver.org/). During `0.x`, m
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-03-12
+
+### Added
+- **Windows support**: Crate compiles and unit/integration tests pass on `x86_64-pc-windows-msvc`
+- **CI/CD release pipeline**: Tag-triggered (`v*`) workflow — validates version, runs full test suite on all 3 platforms, publishes to crates.io, creates GitHub release with changelog
+- **Windows CI**: Build, unit tests, and integration tests (vm_manager, disk_clone) run on `windows-latest`
+- Platform-conditional compilation (`#[cfg(unix)]`) for Unix-only APIs (socketpairs, libc)
+- `USERPROFILE` fallback for data directory on Windows
+
+### Changed
+- `NetworkAttachment::SocketPairFd` is now `#[cfg(unix)]` only
+- `NetworkSwitch` module is `#[cfg(unix)]` only
+- `libc` dependency moved to `[target.'cfg(unix)'.dependencies]`
+- Integration tests (network_switch, seed_iso) skipped on Windows runners
+
 ## [0.1.0] — 2026-03-12
 
 Initial release.
