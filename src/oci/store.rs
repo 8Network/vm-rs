@@ -499,7 +499,10 @@ mod tests {
             ]
         }"#;
         let result = ImageStore::parse_manifest(manifest_json.as_bytes());
-        assert!(result.is_err(), "layer with missing digest must be a parse error");
+        assert!(
+            result.is_err(),
+            "layer with missing digest must be a parse error"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("layer missing digest"),

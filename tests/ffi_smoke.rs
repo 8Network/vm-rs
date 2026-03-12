@@ -217,7 +217,9 @@ mod apple_vz {
 
     #[test]
     fn file_serial_port_attachment_creates() {
-        use vm_rs::ffi::apple_vz::serial_port::{VZFileSerialPortAttachment, VZSerialPortAttachment};
+        use vm_rs::ffi::apple_vz::serial_port::{
+            VZFileSerialPortAttachment, VZSerialPortAttachment,
+        };
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let log_path = tmp.path().join("serial.log");

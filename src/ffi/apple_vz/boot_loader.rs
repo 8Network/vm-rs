@@ -171,10 +171,8 @@ impl VZEFIVariableStore {
             let mut error: Id = super::base::NIL;
 
             // macOS 16+ changed the selector to include an options: parameter
-            let new_sel =
-                Sel::register("initCreatingVariableStoreAtURL:options:error:");
-            let has_new: bool =
-                msg_send![cls, instancesRespondToSelector: new_sel];
+            let new_sel = Sel::register("initCreatingVariableStoreAtURL:options:error:");
+            let has_new: bool = msg_send![cls, instancesRespondToSelector: new_sel];
 
             let p: Id = if has_new {
                 let options: u64 = 0; // default options
@@ -206,13 +204,11 @@ impl VZEFIVariableStore {
 
             // macOS 16+ simplified to initWithURL: (no error: param)
             let old_sel = Sel::register("initWithURL:error:");
-            let has_old: bool =
-                msg_send![cls, instancesRespondToSelector: old_sel];
+            let has_old: bool = msg_send![cls, instancesRespondToSelector: old_sel];
 
             if has_old {
                 let mut error: Id = super::base::NIL;
-                let p: Id =
-                    msg_send![alloc, initWithURL:*url.0 error:&mut error];
+                let p: Id = msg_send![alloc, initWithURL:*url.0 error:&mut error];
                 if !error.is_null() {
                     Err(super::base::NSError(StrongPtr::retain(error)))
                 } else {

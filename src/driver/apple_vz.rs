@@ -181,10 +181,8 @@ impl VmDriver for AppleVzDriver {
         // autoreleased objects stay on the queue's thread — never polluting
         // the caller's TLS pool. This prevents SIGSEGV at thread exit.
 
-        type BootResult = Result<
-            (VmHandle, std::sync::mpsc::Receiver<Result<(), String>>),
-            VmError,
-        >;
+        type BootResult =
+            Result<(VmHandle, std::sync::mpsc::Receiver<Result<(), String>>), VmError>;
         let (tx, rx) = std::sync::mpsc::channel::<BootResult>();
         let name_q = name.clone();
         let namespace_q = namespace.clone();
@@ -529,17 +527,15 @@ impl VmDriver for AppleVzDriver {
         // ── Step 4: Wait for result ──
 
         // Wait for the GCD block to finish configuration + start call
-        let (handle, start_rx) =
-            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(VmError::BootFailed {
-                        name,
-                        detail: "boot timed out after 10s (GCD block did not execute)"
-                            .into(),
-                    })
-                }
-            };
+        let (handle, start_rx) = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(VmError::BootFailed {
+                    name,
+                    detail: "boot timed out after 10s (GCD block did not execute)".into(),
+                })
+            }
+        };
 
         // Now wait for the actual start completion handler to confirm the
         // VM started. This fires asynchronously on the GCD queue.

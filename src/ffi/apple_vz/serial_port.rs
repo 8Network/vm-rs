@@ -74,7 +74,6 @@ impl VZFileHandleSerialPortAttachmentBuilder<NSFileHandle, NSFileHandle> {
     }
 }
 
-
 /// thie struct configure a serial port
 pub struct VZFileHandleSerialPortAttachment(StrongPtr);
 
@@ -165,8 +164,7 @@ impl VZFileSerialPortAttachment {
 
             // macOS 16+ renamed shouldAppend → append
             let new_sel = Sel::register("initWithURL:append:error:");
-            let has_new: bool =
-                msg_send![cls, instancesRespondToSelector: new_sel];
+            let has_new: bool = msg_send![cls, instancesRespondToSelector: new_sel];
 
             let p: Id = if has_new {
                 msg_send![alloc, initWithURL:*url.0

@@ -313,8 +313,7 @@ impl NSError {
             let ns_domain = NSString::new(domain);
             let ns_desc = NSString::new(description);
             let desc_key = NSString::new("NSLocalizedDescription");
-            let user_info =
-                NSDictionary::from_pairs(&[(*desc_key.0, *ns_desc.0)]);
+            let user_info = NSDictionary::from_pairs(&[(*desc_key.0, *ns_desc.0)]);
             let p: Id = msg_send![class!(NSError), errorWithDomain:*ns_domain.0
                                                    code:(-1isize)
                                                    userInfo:*user_info.0];

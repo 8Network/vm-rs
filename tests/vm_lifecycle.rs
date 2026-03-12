@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use vm_rs::config::{SharedDir, VmConfig, VmState};
 use vm_rs::VmManager;
 
-
 /// Load test assets from environment. Returns None if not configured.
 fn test_assets() -> Option<(PathBuf, PathBuf)> {
     let kernel = std::env::var("VMRS_TEST_KERNEL").ok().map(PathBuf::from)?;

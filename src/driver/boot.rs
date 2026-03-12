@@ -125,7 +125,9 @@ pub fn load_kernel_from_bytes(
     memory_mb: usize,
 ) -> Result<u64, VmError> {
     if kernel_data.len() < 0x250 {
-        return Err(VmError::InvalidConfig("kernel image too small for bzImage".into()));
+        return Err(VmError::InvalidConfig(
+            "kernel image too small for bzImage".into(),
+        ));
     }
 
     // Check bzImage magic: boot flag at 0x1FE and "HdrS" at 0x202
@@ -136,7 +138,9 @@ pub fn load_kernel_from_bytes(
         // Not a bzImage — load as raw flat binary at KERNEL_ADDR
         let dest = KERNEL_ADDR as usize;
         if dest + kernel_data.len() > memory.len() {
-            return Err(VmError::InvalidConfig("kernel too large for allocated memory".into()));
+            return Err(VmError::InvalidConfig(
+                "kernel too large for allocated memory".into(),
+            ));
         }
         memory[dest..dest + kernel_data.len()].copy_from_slice(kernel_data);
         return Ok(KERNEL_ADDR);
@@ -169,7 +173,9 @@ pub fn load_kernel_from_bytes(
     // Copy protected-mode kernel to KERNEL_ADDR
     let dest = KERNEL_ADDR as usize;
     if dest + pm_kernel.len() > memory.len() {
-        return Err(VmError::InvalidConfig("kernel too large for allocated memory".into()));
+        return Err(VmError::InvalidConfig(
+            "kernel too large for allocated memory".into(),
+        ));
     }
     memory[dest..dest + pm_kernel.len()].copy_from_slice(pm_kernel);
 
@@ -217,10 +223,8 @@ pub fn load_kernel_from_bytes(
         }
         memory[initrd_addr as usize..initrd_end].copy_from_slice(&initrd_data);
 
-        memory[bp + 0x218..bp + 0x21C]
-            .copy_from_slice(&(initrd_addr as u32).to_le_bytes());
-        memory[bp + 0x21C..bp + 0x220]
-            .copy_from_slice(&(initrd_data.len() as u32).to_le_bytes());
+        memory[bp + 0x218..bp + 0x21C].copy_from_slice(&(initrd_addr as u32).to_le_bytes());
+        memory[bp + 0x21C..bp + 0x220].copy_from_slice(&(initrd_data.len() as u32).to_le_bytes());
 
         tracing::info!(
             addr = format!("0x{:x}", initrd_addr),

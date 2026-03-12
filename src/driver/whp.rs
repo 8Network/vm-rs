@@ -32,9 +32,11 @@ use windows::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 
+use super::boot::{
+    self, BOOT_PARAMS_ADDR, GDT_ADDR, GDT_CODE_SELECTOR, GDT_DATA_SELECTOR, PML4_ADDR,
+};
 use crate::config::{VmConfig, VmHandle, VmState};
 use crate::driver::{VmDriver, VmError};
-use super::boot::{self, BOOT_PARAMS_ADDR, PML4_ADDR, GDT_ADDR, GDT_CODE_SELECTOR, GDT_DATA_SELECTOR};
 
 // COM1 serial port registers
 const COM1_DATA: u16 = 0x3F8;
@@ -63,14 +65,7 @@ impl GuestMemory {
         // SAFETY: VirtualAlloc with MEM_COMMIT|MEM_RESERVE allocates
         // and commits `size` bytes of page-aligned virtual memory.
         // Returns null on failure.
-        let ptr = unsafe {
-            VirtualAlloc(
-                None,
-                size,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        };
+        let ptr = unsafe { VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
         if ptr.is_null() {
             return Err(VmError::Hypervisor(format!(
                 "VirtualAlloc failed for {} MB",
@@ -175,7 +170,9 @@ impl WhpDriver {
                 None,
             )
         };
-        result.is_ok() && capability.HypervisorPresent.as_bool()
+        // SAFETY: HypervisorPresent is a union field — valid when
+        // WHvGetCapability succeeded with WHvCapabilityCodeHypervisorPresent.
+        result.is_ok() && unsafe { capability.HypervisorPresent.as_bool() }
     }
 }
 
@@ -223,7 +220,9 @@ impl VmDriver for WhpDriver {
         }
         .map_err(|e| {
             // SAFETY: partition is valid.
-            unsafe { let _ = WHvDeletePartition(partition); }
+            unsafe {
+                let _ = WHvDeletePartition(partition);
+            }
             VmError::BootFailed {
                 name: name.clone(),
                 detail: format!("WHvSetPartitionProperty(ProcessorCount) failed: {e}"),
@@ -233,7 +232,9 @@ impl VmDriver for WhpDriver {
         // Materialize partition in the hypervisor
         // SAFETY: partition is configured and ready to be set up.
         unsafe { WHvSetupPartition(partition) }.map_err(|e| {
-            unsafe { let _ = WHvDeletePartition(partition); }
+            unsafe {
+                let _ = WHvDeletePartition(partition);
+            }
             VmError::BootFailed {
                 name: name.clone(),
                 detail: format!("WHvSetupPartition failed: {e}"),
@@ -243,7 +244,9 @@ impl VmDriver for WhpDriver {
         // ── Step 3: Allocate and map guest memory ──
 
         let mut memory = GuestMemory::allocate(memory_bytes).map_err(|e| {
-            unsafe { let _ = WHvDeletePartition(partition); }
+            unsafe {
+                let _ = WHvDeletePartition(partition);
+            }
             e
         })?;
 
@@ -259,7 +262,9 @@ impl VmDriver for WhpDriver {
             )
         }
         .map_err(|e| {
-            unsafe { let _ = WHvDeletePartition(partition); }
+            unsafe {
+                let _ = WHvDeletePartition(partition);
+            }
             VmError::BootFailed {
                 name: name.clone(),
                 detail: format!("WHvMapGpaRange failed: {e}"),
@@ -293,7 +298,9 @@ impl VmDriver for WhpDriver {
             if let VmError::BootFailed { ref mut name, .. } = e {
                 *name = config.name.clone();
             }
-            unsafe { let _ = WHvDeletePartition(partition); }
+            unsafe {
+                let _ = WHvDeletePartition(partition);
+            }
             e
         })?;
 
@@ -301,7 +308,9 @@ impl VmDriver for WhpDriver {
 
         // SAFETY: partition is set up, vCPU index 0.
         unsafe { WHvCreateVirtualProcessor(partition, 0, 0) }.map_err(|e| {
-            unsafe { let _ = WHvDeletePartition(partition); }
+            unsafe {
+                let _ = WHvDeletePartition(partition);
+            }
             VmError::BootFailed {
                 name: name.clone(),
                 detail: format!("WHvCreateVirtualProcessor failed: {e}"),
@@ -356,9 +365,10 @@ impl VmDriver for WhpDriver {
         };
 
         {
-            let mut vms = self.vms.lock().map_err(|e| {
-                VmError::Hypervisor(format!("VM lock poisoned: {e}"))
-            })?;
+            let mut vms = self
+                .vms
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("VM lock poisoned: {e}")))?;
             vms.insert(name.clone(), vm);
         }
 
@@ -373,9 +383,10 @@ impl VmDriver for WhpDriver {
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("VM lock poisoned: {e}"))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("VM lock poisoned: {e}")))?;
 
         let vm = vms.get_mut(&handle.name).ok_or_else(|| VmError::NotFound {
             name: handle.name.clone(),
@@ -417,15 +428,17 @@ impl VmDriver for WhpDriver {
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("VM lock poisoned: {e}"))
-        })?;
+        let vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("VM lock poisoned: {e}")))?;
 
         match vms.get(&handle.name) {
             Some(vm) => {
-                let state = vm.state.read().map_err(|e| {
-                    VmError::Hypervisor(format!("state lock poisoned: {e}"))
-                })?;
+                let state = vm
+                    .state
+                    .read()
+                    .map_err(|e| VmError::Hypervisor(format!("state lock poisoned: {e}")))?;
                 Ok(state.clone())
             }
             None => Ok(VmState::Stopped),
@@ -433,9 +446,10 @@ impl VmDriver for WhpDriver {
     }
 
     fn pause(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("VM lock poisoned: {e}"))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("VM lock poisoned: {e}")))?;
 
         let vm = vms.get_mut(&handle.name).ok_or_else(|| VmError::NotFound {
             name: handle.name.clone(),
@@ -460,9 +474,10 @@ impl VmDriver for WhpDriver {
     }
 
     fn resume(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("VM lock poisoned: {e}"))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("VM lock poisoned: {e}")))?;
 
         let vm = vms.get_mut(&handle.name).ok_or_else(|| VmError::NotFound {
             name: handle.name.clone(),
@@ -535,7 +550,9 @@ fn setup_initial_registers(
         // RIP = kernel entry point
         WHV_REGISTER_VALUE { Reg64: entry_point },
         // RSP = top of low memory (below boot_params)
-        WHV_REGISTER_VALUE { Reg64: BOOT_PARAMS_ADDR - 0x10 },
+        WHV_REGISTER_VALUE {
+            Reg64: BOOT_PARAMS_ADDR - 0x10,
+        },
         // RFLAGS = reserved bit 1 set, interrupts disabled
         WHV_REGISTER_VALUE { Reg64: 0x2 },
         // CR0 = PE (protected mode) + PG (paging) + WP (write protect)
@@ -547,7 +564,9 @@ fn setup_initial_registers(
         // EFER = LME (long mode enable) + LMA (long mode active) + NXE
         WHV_REGISTER_VALUE { Reg64: 0xD00 },
         // RSI = pointer to boot_params (Linux boot protocol)
-        WHV_REGISTER_VALUE { Reg64: BOOT_PARAMS_ADDR },
+        WHV_REGISTER_VALUE {
+            Reg64: BOOT_PARAMS_ADDR,
+        },
     ];
 
     // SAFETY: partition is valid, vCPU 0 exists, arrays are correctly sized.
@@ -600,20 +619,22 @@ fn set_segment_registers(partition: WHV_PARTITION_HANDLE) -> Result<(), VmError>
 
     // CS
     let names = [WHV_REGISTER_NAME(WHvX64RegisterCs.0)];
-    let values = [WHV_REGISTER_VALUE { Segment: code_segment }];
+    let values = [WHV_REGISTER_VALUE {
+        Segment: code_segment,
+    }];
     // SAFETY: partition is valid, vCPU 0 exists.
-    unsafe {
-        WHvSetVirtualProcessorRegisters(partition, 0, names.as_ptr(), 1, values.as_ptr())
-    }
-    .map_err(|e| VmError::BootFailed {
-        name: String::new(),
-        detail: format!("failed to set CS: {e}"),
-    })?;
+    unsafe { WHvSetVirtualProcessorRegisters(partition, 0, names.as_ptr(), 1, values.as_ptr()) }
+        .map_err(|e| VmError::BootFailed {
+            name: String::new(),
+            detail: format!("failed to set CS: {e}"),
+        })?;
 
     // DS, ES, SS — all use data segment
     for reg in [WHvX64RegisterDs, WHvX64RegisterEs, WHvX64RegisterSs] {
         let names = [WHV_REGISTER_NAME(reg.0)];
-        let values = [WHV_REGISTER_VALUE { Segment: data_segment }];
+        let values = [WHV_REGISTER_VALUE {
+            Segment: data_segment,
+        }];
         unsafe {
             WHvSetVirtualProcessorRegisters(partition, 0, names.as_ptr(), 1, values.as_ptr())
         }
@@ -626,13 +647,11 @@ fn set_segment_registers(partition: WHV_PARTITION_HANDLE) -> Result<(), VmError>
     // GDTR
     let names = [WHV_REGISTER_NAME(WHvX64RegisterGdtr.0)];
     let values = [WHV_REGISTER_VALUE { Table: gdt_table }];
-    unsafe {
-        WHvSetVirtualProcessorRegisters(partition, 0, names.as_ptr(), 1, values.as_ptr())
-    }
-    .map_err(|e| VmError::BootFailed {
-        name: String::new(),
-        detail: format!("failed to set GDTR: {e}"),
-    })?;
+    unsafe { WHvSetVirtualProcessorRegisters(partition, 0, names.as_ptr(), 1, values.as_ptr()) }
+        .map_err(|e| VmError::BootFailed {
+            name: String::new(),
+            detail: format!("failed to set GDTR: {e}"),
+        })?;
 
     Ok(())
 }
@@ -656,9 +675,12 @@ fn vcpu_loop(
         Ok(f) => f,
         Err(e) => {
             tracing::error!(vm = %vm_name, "failed to create serial log: {e}");
-            update_state(&state, VmState::Failed {
-                reason: format!("failed to create serial log: {e}"),
-            });
+            update_state(
+                &state,
+                VmState::Failed {
+                    reason: format!("failed to create serial log: {e}"),
+                },
+            );
             return;
         }
     };
@@ -683,9 +705,12 @@ fn vcpu_loop(
 
         if let Err(e) = result {
             tracing::error!(vm = %vm_name, "WHvRunVirtualProcessor failed: {e}");
-            update_state(&state, VmState::Failed {
-                reason: format!("vCPU execution failed: {e}"),
-            });
+            update_state(
+                &state,
+                VmState::Failed {
+                    reason: format!("vCPU execution failed: {e}"),
+                },
+            );
             break;
         }
 
@@ -762,7 +787,9 @@ fn handle_io_port(
     vm_name: &str,
 ) {
     let port = io.PortNumber;
-    let is_write = io.AccessInfo.Anonymous.Anonymous.IsWrite().to_owned() != 0;
+    // SAFETY: AccessInfo is a union; AsUINT32 gives the raw bitfield.
+    // Bit 0 = IsWrite per the WHP C header.
+    let is_write = unsafe { io.AccessInfo.AsUINT32 } & 1 != 0;
 
     if is_write && port == COM1_DATA {
         // Serial output — write byte to log file and buffer
@@ -799,8 +826,8 @@ fn handle_io_port(
 
 /// Advance RIP past the current instruction.
 fn advance_rip(partition: WHV_PARTITION_HANDLE, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) {
-    let new_rip = exit_context.VpContext.Rip
-        + exit_context.VpContext.InstructionLength() as u64;
+    // _bitfield lower 4 bits = InstructionLength per the WHP C header
+    let new_rip = exit_context.VpContext.Rip + (exit_context.VpContext._bitfield & 0xF) as u64;
 
     let names = [WHV_REGISTER_NAME(WHvX64RegisterRip.0)];
     let values = [WHV_REGISTER_VALUE { Reg64: new_rip }];
@@ -838,5 +865,9 @@ fn check_ready_marker(log_path: &Path) -> Option<String> {
     let pos = content.find(crate::config::READY_MARKER)?;
     let after = &content[pos + crate::config::READY_MARKER.len()..];
     let ip = after.split_whitespace().next()?.trim().to_string();
-    if ip.is_empty() { None } else { Some(ip) }
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip)
+    }
 }
