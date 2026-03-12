@@ -36,6 +36,12 @@ pub struct CloudHvDriver {
     vms: Mutex<HashMap<String, VmProcess>>,
 }
 
+impl Default for CloudHvDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CloudHvDriver {
     pub fn new() -> Self {
         Self {
@@ -196,7 +202,7 @@ impl VmDriver for CloudHvDriver {
             name: name.clone(),
             detail: format!("failed to create VMM log file: {}", e),
         })?;
-        let vmm_log_stderr = vmm_log.try_clone().map_err(|e| VmError::Io(e))?;
+        let vmm_log_stderr = vmm_log.try_clone().map_err(VmError::Io)?;
         let process = cmd
             .stdout(vmm_log)
             .stderr(vmm_log_stderr)

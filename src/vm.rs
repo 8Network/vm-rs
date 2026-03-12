@@ -284,9 +284,9 @@ impl VmManager {
                 .arg(base)
                 .arg(target)
                 .status()
-                .map_err(|e| VmError::Io(e))?;
+                .map_err(VmError::Io)?;
             if !status.success() {
-                std::fs::copy(base, target).map_err(|e| VmError::Io(e))?;
+                std::fs::copy(base, target).map_err(VmError::Io)?;
             }
         }
 
