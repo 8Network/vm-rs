@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Lint & Format ─────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy (Linux)
+        run: cargo clippy --all-targets -- -D warnings
+
+  # ── Unit tests (both platforms) ─────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Build
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: Unit tests
+        run: cargo test --lib --target ${{ matrix.target }}
+
+      - name: Doc tests
+        run: cargo test --doc --target ${{ matrix.target }}
+
+  # ── Integration tests (no VM, both platforms) ──────────────────────
+  integration:
+    name: Integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-integration
+
+      # Disk clone tests
+      - name: Disk clone tests
+        run: cargo test --test disk_clone --target ${{ matrix.target }}
+
+      # Seed ISO tests (requires hdiutil on macOS, genisoimage on Linux)
+      - name: Install genisoimage (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y genisoimage
+      - name: Seed ISO tests
+        run: cargo test --test seed_iso --target ${{ matrix.target }}
+
+      # Network switch tests (socketpairs, works everywhere)
+      - name: Network switch tests
+        run: cargo test --test network_switch --target ${{ matrix.target }}
+
+  # ── OCI registry tests (requires internet) ─────────────────────────
+  oci:
+    name: OCI Pull
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: oci
+      - name: OCI registry pull tests
+        run: cargo test --test oci_pull
+        timeout-minutes: 5
+
+  # ── VM lifecycle tests (requires hypervisor) ────────────────────────
+  # These tests need real kernel/initramfs assets and hardware virtualization.
+  # macOS: Apple Virtualization.framework (macOS 13+ runner)
+  # Linux: Cloud Hypervisor + KVM (/dev/kvm)
+  #
+  # Skipped by default — VM tests only run when VMRS_TEST_KERNEL and
+  # VMRS_TEST_INITRAMFS env vars point to valid assets.
+  vm-macos:
+    name: VM Lifecycle (macOS)
+    runs-on: macos-latest
+    if: false  # Enable when test assets are available in CI
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: vm-macos
+      - name: VM lifecycle tests
+        env:
+          VMRS_TEST_KERNEL: ${{ github.workspace }}/testdata/vmlinuz
+          VMRS_TEST_INITRAMFS: ${{ github.workspace }}/testdata/initramfs
+        run: cargo test --test vm_lifecycle
+        timeout-minutes: 10
+
+  vm-linux:
+    name: VM Lifecycle (Linux)
+    runs-on: ubuntu-latest
+    if: false  # Enable when cloud-hypervisor + test assets are available
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: vm-linux
+      - name: Install Cloud Hypervisor
+        run: |
+          CH_VERSION="v42.0"
+          curl -L "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static" \
+            -o /usr/local/bin/cloud-hypervisor
+          chmod +x /usr/local/bin/cloud-hypervisor
+          cloud-hypervisor --version
+      - name: Check KVM
+        run: |
+          ls -la /dev/kvm || echo "KVM not available"
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+      - name: VM lifecycle tests
+        env:
+          VMRS_TEST_KERNEL: ${{ github.workspace }}/testdata/vmlinuz
+          VMRS_TEST_INITRAMFS: ${{ github.workspace }}/testdata/initramfs
+        run: cargo test --test vm_lifecycle
+        timeout-minutes: 10

@@ -1,0 +1,62 @@
+[package]
+name = "vm-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform VM lifecycle management — Apple Virtualization.framework (macOS) + Cloud Hypervisor (Linux)"
+license = "MIT"
+keywords = ["virtualization", "vm", "apple-vz", "cloud-hypervisor", "microvm"]
+categories = ["virtualization", "os"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "net", "fs", "io-util"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+
+# HTTP client (OCI registry, Cloud Hypervisor REST API)
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
+
+# Futures
+futures-util = "0.3"
+
+# Compression (OCI layers, kernel)
+flate2 = "1"
+
+# Hashing (OCI digests)
+sha2 = "0.10"
+
+# Tar archive (OCI layer extraction)
+tar = "0.4"
+
+# Process management + Unix primitives
+libc = "0.2"
+
+# Progress reporting (asset downloads)
+indicatif = "0.17"
+
+# macOS: Apple Virtualization.framework (FFI absorbed from virtualization-rs)
+[target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
+objc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+
+[lints.rust]
+unused_must_use = "deny"
+# The `objc` 0.2 crate's msg_send!/class! macros emit cfg(feature = "cargo-clippy")
+# which triggers unexpected_cfgs on modern Rust. Suppress until we migrate to objc2.
+unexpected_cfgs = "allow"
+
+[lints.clippy]
+unwrap_used = "warn"

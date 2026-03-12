@@ -1,0 +1,335 @@
+#!/bin/busybox sh
+# Custom initramfs /init — PID 1
+# Generic VM runtime. Receives config from kernel cmdline, executes it.
+# No knowledge of upper-layer abstractions. This is infrastructure.
+
+# ── Create busybox symlinks FIRST (before any commands are available) ────────
+
+/bin/busybox --install -s /bin
+/bin/busybox --install -s /sbin
+
+# ── Mount essential filesystems ──────────────────────────────────────────────
+
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs    tmpfs    /tmp
+mount -t tmpfs    tmpfs    /run
+
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs  tmpfs  /dev/shm
+
+# ── Parse kernel cmdline ─────────────────────────────────────────────────────
+# Parameters: vm.ip, vm.gateway, vm.netmask, vm.hostname, vm.dns,
+#             vm.ssh_key, vm.user, vm.workload, vm.workload_args
+
+cmdline=$(cat /proc/cmdline)
+
+get_param() {
+    local key="$1" default="$2"
+    local val
+    val=$(echo "$cmdline" | tr ' ' '\n' | grep "^${key}=" | tail -1 | cut -d= -f2-)
+    echo "${val:-$default}"
+}
+
+VM_IP=$(get_param vm.ip "")
+VM_GATEWAY=$(get_param vm.gateway "192.168.8.1")
+VM_NETMASK=$(get_param vm.netmask "24")
+VM_HOSTNAME=$(get_param vm.hostname "vm")
+VM_DNS=$(get_param vm.dns "1.1.1.1")
+VM_USER=$(get_param vm.user "stack")
+# SSH key and workload args use commas as space separators on kernel cmdline
+# (kernel cmdline splits on spaces, so we can't pass multi-word values directly)
+VM_SSH_KEY=$(get_param vm.ssh_key "" | tr ',' ' ')
+VM_WORKLOAD=$(get_param vm.workload "" | tr ',' ' ')
+VM_WORKLOAD_ARGS=$(get_param vm.workload_args "" | tr ',' ' ')
+
+hostname "$VM_HOSTNAME"
+echo "$VM_HOSTNAME" > /etc/hostname
+
+# ── Load kernel modules ──────────────────────────────────────────────────────
+
+# Load virtio_net (and dependency net_failover) for networking
+# These are modules in Alpine's virt kernel, not built-in
+if [ -d /lib/modules ]; then
+    KVER=$(ls /lib/modules/ 2>/dev/null | head -1)
+    if [ -n "$KVER" ]; then
+        MODBASE="/lib/modules/$KVER/kernel"
+        # Load in dependency order: af_packet (DHCP needs raw sockets),
+        # failover → net_failover → virtio_net, then filesystems
+        for mod in \
+            "$MODBASE/net/packet/af_packet.ko.gz" \
+            "$MODBASE/net/core/failover.ko.gz" \
+            "$MODBASE/drivers/net/net_failover.ko.gz" \
+            "$MODBASE/drivers/net/virtio_net.ko.gz" \
+            "$MODBASE/fs/fuse/fuse.ko.gz" \
+            "$MODBASE/fs/fuse/virtiofs.ko.gz" \
+            "$MODBASE/fs/overlayfs/overlay.ko.gz" \
+        ; do
+            if [ -f "$mod" ]; then
+                gzip -d "$mod" 2>/dev/null
+                ko="${mod%.gz}"
+                insmod "$ko" 2>/dev/null && echo "[init] module: $(basename $ko)" || echo "[init] module FAILED: $(basename $ko)"
+            fi
+        done
+    fi
+fi
+
+# ── Configure networking ─────────────────────────────────────────────────────
+
+# Wait for network device to appear (virtio-net may take a moment to probe)
+NET_DEV=""
+for attempt in $(seq 1 50); do
+    for dev in eth0 enp0s1 enp0s2 ens3; do
+        if ip link show "$dev" >/dev/null 2>&1; then
+            NET_DEV="$dev"
+            break 2
+        fi
+    done
+    sleep 0.05
+done
+
+if [ -z "$NET_DEV" ]; then
+    echo "[init] ERROR: no network device found"
+    # List available interfaces for debugging
+    ip link show 2>/dev/null || true
+else
+    ip link set lo up
+    ip link set "$NET_DEV" up
+
+    if [ -z "$VM_IP" ] || [ "$VM_IP" = "dhcp" ]; then
+        # DHCP mode (macOS Apple VZ NAT)
+        cat > /tmp/udhcpc.sh << 'DHCP_SCRIPT'
+#!/bin/sh
+[ "$1" = "bound" ] || [ "$1" = "renew" ] || exit 0
+ip addr flush dev "$interface"
+ip addr add "$ip/$mask" dev "$interface"
+[ -n "$router" ] && ip route add default via "$router"
+if [ -n "$dns" ]; then
+    echo "nameserver $dns" > /etc/resolv.conf
+fi
+DHCP_SCRIPT
+        chmod +x /tmp/udhcpc.sh
+        # -t 5 = 5 attempts, -T 3 = 3s between attempts, -n = exit if no lease, -q = quit after lease
+        udhcpc -i "$NET_DEV" -s /tmp/udhcpc.sh -t 5 -T 3 -n -q
+        # Wait briefly for IP to settle
+        sleep 1
+        VM_IP=$(ip addr show "$NET_DEV" 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1)
+        echo "[init] network: ${VM_IP} on ${NET_DEV} (dhcp)"
+    else
+        # Static IP mode (Linux TAP bridge)
+        ip addr add "${VM_IP}/${VM_NETMASK}" dev "$NET_DEV"
+        ip route add default via "$VM_GATEWAY"
+        echo "[init] network: ${VM_IP}/${VM_NETMASK} on ${NET_DEV} gw ${VM_GATEWAY}"
+    fi
+fi
+
+mkdir -p /etc
+if [ -z "$(cat /etc/resolv.conf 2>/dev/null)" ]; then
+    echo "nameserver $VM_DNS" > /etc/resolv.conf
+fi
+echo "127.0.0.1 localhost" > /etc/hosts
+echo "${VM_IP} ${VM_HOSTNAME}" >> /etc/hosts
+
+# ── Create user for SSH access ───────────────────────────────────────────────
+
+mkdir -p /home/"$VM_USER" /etc/dropbear
+
+# Minimal passwd/group/shadow
+echo "root:x:0:0:root:/root:/bin/sh" > /etc/passwd
+echo "${VM_USER}:x:1000:1000:${VM_USER}:/home/${VM_USER}:/bin/sh" >> /etc/passwd
+echo "root:x:0:" > /etc/group
+echo "${VM_USER}:x:1000:" >> /etc/group
+# Empty password field = blank password (works with dropbear -B)
+# '*' means locked account, '' means blank password
+echo "root::0:0:99999:7:::" > /etc/shadow
+echo "${VM_USER}::0:0:99999:7:::" >> /etc/shadow
+chmod 640 /etc/shadow
+
+chown 1000:1000 /home/"$VM_USER"
+
+# Install SSH public key
+if [ -n "$VM_SSH_KEY" ]; then
+    mkdir -p /home/"$VM_USER"/.ssh
+    echo "$VM_SSH_KEY" > /home/"$VM_USER"/.ssh/authorized_keys
+    chmod 700 /home/"$VM_USER"/.ssh
+    chmod 600 /home/"$VM_USER"/.ssh/authorized_keys
+    chown -R 1000:1000 /home/"$VM_USER"/.ssh
+fi
+
+# Also allow root SSH with same key (for debugging)
+mkdir -p /root/.ssh
+if [ -n "$VM_SSH_KEY" ]; then
+    echo "$VM_SSH_KEY" > /root/.ssh/authorized_keys
+    chmod 700 /root/.ssh
+    chmod 600 /root/.ssh/authorized_keys
+fi
+
+# ── Start dropbear SSH server ────────────────────────────────────────────────
+
+# Generate host keys
+dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
+dropbearkey -t rsa     -f /etc/dropbear/dropbear_rsa_host_key     2>/dev/null
+
+# Start dropbear (background daemon, allow root login, no password auth)
+# Debug: log authorized_keys
+echo "[init] ssh: authorized_keys fingerprint: $(cat /root/.ssh/authorized_keys 2>/dev/null | awk '{print $1, $2}' | head -c 40)..."
+
+if dropbear -R -B -p 22 2>/tmp/dropbear-start.log; then
+    sleep 0.2
+    if pidof dropbear >/dev/null 2>&1; then
+        echo "[init] ssh: dropbear started on port 22 (pid $(pidof dropbear))"
+    else
+        echo "[init] ssh: dropbear exited immediately"
+        cat /tmp/dropbear-start.log 2>/dev/null
+    fi
+else
+    echo "[init] ssh: dropbear FAILED to start"
+    cat /tmp/dropbear-start.log 2>/dev/null
+fi
+
+# ── Mount VM config (env, hosts, volumes, startup script) ────────────────────
+
+mkdir -p /mnt/vm-config
+if mount -t virtiofs vm-config /mnt/vm-config 2>/dev/null; then
+    echo "[init] config: loaded via virtio-fs"
+
+    # Append extra hosts entries (service discovery)
+    if [ -f /mnt/vm-config/hosts ]; then
+        cat /mnt/vm-config/hosts >> /etc/hosts
+        echo "[init] hosts: $(wc -l < /mnt/vm-config/hosts) entries added"
+    fi
+
+    # Mount user volumes (tag mount_path ro|rw)
+    if [ -f /mnt/vm-config/volumes.conf ]; then
+        while IFS=' ' read -r vtag vmpath vmode; do
+            [ -z "$vtag" ] && continue
+            mkdir -p "$vmpath"
+            mount -t virtiofs "$vtag" "$vmpath" -o "$vmode" 2>/dev/null && \
+                echo "[init] volume: $vtag -> $vmpath ($vmode)" || \
+                echo "[init] volume FAILED: $vtag -> $vmpath"
+        done < /mnt/vm-config/volumes.conf
+    fi
+fi
+
+# ── Mount OCI layers if available (virtio-fs) ────────────────────────────────
+
+mkdir -p /mnt/oci-layers /mnt/rootfs /mnt/overlay-work
+
+# Try mounting virtio-fs tag "oci-layers" — this is how the host shares OCI image layers
+if mount -t virtiofs oci-layers /mnt/oci-layers 2>/dev/null; then
+    echo "[init] oci: layers mounted via virtio-fs"
+
+    # Build overlayfs: OCI layers as lowerdir (stacked), tmpfs as upperdir
+    # Layers are in numbered dirs: /mnt/oci-layers/0/, /mnt/oci-layers/1/, ...
+    # overlayfs lowerdir order: topmost layer first (highest number)
+    mount -t tmpfs tmpfs /mnt/overlay-work
+    mkdir -p /mnt/overlay-work/upper /mnt/overlay-work/work
+
+    LOWER=""
+    for d in $(ls -d /mnt/oci-layers/[0-9]* 2>/dev/null | sort -rn); do
+        if [ -z "$LOWER" ]; then LOWER="$d"; else LOWER="$LOWER:$d"; fi
+    done
+    # Fallback: if no numbered dirs, use the mount point directly
+    [ -z "$LOWER" ] && LOWER="/mnt/oci-layers"
+
+    if mount -t overlay overlay \
+        -o "lowerdir=$LOWER,upperdir=/mnt/overlay-work/upper,workdir=/mnt/overlay-work/work" \
+        /mnt/rootfs; then
+        echo "[init] oci: overlayfs mounted at /mnt/rootfs (layers: $LOWER)"
+
+        # Copy DNS and hosts into rootfs for processes
+        cp /etc/resolv.conf /mnt/rootfs/etc/resolv.conf 2>/dev/null || true
+        cp /etc/hosts /mnt/rootfs/etc/hosts 2>/dev/null || true
+
+        # Bind-mount user volumes into the rootfs
+        if [ -f /mnt/vm-config/volumes.conf ]; then
+            while IFS=' ' read -r vtag vmpath vmode; do
+                [ -z "$vtag" ] && continue
+                mkdir -p "/mnt/rootfs${vmpath}"
+                mount --bind "$vmpath" "/mnt/rootfs${vmpath}" 2>/dev/null || true
+                [ "$vmode" = "ro" ] && mount -o remount,ro,bind "/mnt/rootfs${vmpath}" 2>/dev/null || true
+            done < /mnt/vm-config/volumes.conf
+        fi
+    else
+        echo "[init] ERROR: overlayfs mount failed"
+    fi
+fi
+
+# ── Signal readiness ─────────────────────────────────────────────────────────
+
+BOOT_TIME=""
+if [ -f /proc/uptime ]; then
+    BOOT_TIME=$(cut -d' ' -f1 < /proc/uptime)
+fi
+
+# Signal readiness to vm-rs (parsed by serial console log watcher)
+# Write to both hvc0 (macOS Apple VZ) and ttyS0 (Linux Cloud Hypervisor)
+for console_dev in /dev/hvc0 /dev/ttyS0; do
+    [ -c "$console_dev" ] && echo "VMRS_READY ${VM_IP}" > "$console_dev" 2>/dev/null
+done
+echo "[init] ready: ${VM_HOSTNAME} ${VM_IP} boot_time=${BOOT_TIME}s"
+
+# ── Execute workload ─────────────────────────────────────────────────────────
+
+# Prefer startup script from vm-config (has env vars, workdir, proper quoting)
+if [ -f /mnt/vm-config/start.sh ]; then
+    echo "[init] workload: /mnt/vm-config/start.sh"
+
+    if mountpoint -q /mnt/rootfs 2>/dev/null; then
+        # Bind-mount essential filesystems into the rootfs
+        mount --bind /proc /mnt/rootfs/proc 2>/dev/null || true
+        mount --bind /sys  /mnt/rootfs/sys  2>/dev/null || true
+        mount --bind /dev  /mnt/rootfs/dev  2>/dev/null || true
+        mount --bind /tmp  /mnt/rootfs/tmp  2>/dev/null || true
+
+        # Copy startup script AFTER bind-mounts (tmp is now shared)
+        cp /mnt/vm-config/start.sh /mnt/rootfs/tmp/vmrs-start.sh
+        chmod +x /mnt/rootfs/tmp/vmrs-start.sh
+
+        chroot /mnt/rootfs /tmp/vmrs-start.sh > /tmp/vmrs-svc.log 2>&1 &
+    else
+        cp /mnt/vm-config/start.sh /tmp/vmrs-start.sh
+        chmod +x /tmp/vmrs-start.sh
+        /tmp/vmrs-start.sh > /tmp/vmrs-svc.log 2>&1 &
+    fi
+
+    # Start health check daemon if configured
+    if [ -f /mnt/vm-config/healthcheck.sh ]; then
+        if mountpoint -q /mnt/rootfs 2>/dev/null; then
+            cp /mnt/vm-config/healthcheck.sh /mnt/rootfs/tmp/vmrs-healthcheck.sh
+            chmod +x /mnt/rootfs/tmp/vmrs-healthcheck.sh
+            chroot /mnt/rootfs /tmp/vmrs-healthcheck.sh &
+        else
+            cp /mnt/vm-config/healthcheck.sh /tmp/vmrs-healthcheck.sh
+            chmod +x /tmp/vmrs-healthcheck.sh
+            /tmp/vmrs-healthcheck.sh &
+        fi
+        echo "[init] healthcheck: started"
+    fi
+
+elif [ -n "$VM_WORKLOAD" ]; then
+    # Fallback: kernel cmdline workload (no env vars)
+    echo "[init] workload: $VM_WORKLOAD $VM_WORKLOAD_ARGS"
+
+    if mountpoint -q /mnt/rootfs 2>/dev/null; then
+        mount --bind /proc /mnt/rootfs/proc 2>/dev/null || true
+        mount --bind /sys  /mnt/rootfs/sys  2>/dev/null || true
+        mount --bind /dev  /mnt/rootfs/dev  2>/dev/null || true
+        mount --bind /tmp  /mnt/rootfs/tmp  2>/dev/null || true
+
+        chroot /mnt/rootfs sh -c "$VM_WORKLOAD $VM_WORKLOAD_ARGS" &
+    else
+        sh -c "$VM_WORKLOAD $VM_WORKLOAD_ARGS" &
+    fi
+fi
+
+# ── PID 1: reap zombies forever ──────────────────────────────────────────────
+
+# Catch SIGTERM/SIGINT for graceful shutdown
+trap 'echo "[init] shutting down..."; kill -TERM -1 2>/dev/null; sleep 1; kill -KILL -1 2>/dev/null; poweroff -f' TERM INT
+
+while true; do
+    wait || true
+done
