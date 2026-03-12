@@ -77,6 +77,7 @@ pub struct NetworkSwitch {
     networks: Arc<Mutex<HashMap<String, Vec<SwitchPort>>>>,
     mac_tables: Arc<RwLock<HashMap<String, MacTable>>>,
     running: Arc<std::sync::atomic::AtomicBool>,
+    thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Default for NetworkSwitch {
@@ -91,6 +92,7 @@ impl NetworkSwitch {
             networks: Arc::new(Mutex::new(HashMap::new())),
             mac_tables: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            thread_handle: Mutex::new(None),
         }
     }
 
@@ -142,19 +144,35 @@ impl NetworkSwitch {
         let mac_tables = Arc::clone(&self.mac_tables);
         let running = Arc::clone(&self.running);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("network-switch".to_string())
             .spawn(move || {
                 forwarding_loop(&networks, &mac_tables, &running);
             })?;
 
+        if let Ok(mut h) = self.thread_handle.lock() {
+            *h = Some(handle);
+        }
+
         Ok(())
     }
 
-    /// Stop the forwarding loop.
+    /// Stop the forwarding loop and wait for the thread to exit.
+    ///
+    /// Joins the background thread before returning, ensuring no reads/writes
+    /// are in flight when file descriptors are later closed in `Drop`.
     pub fn stop(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // Join the forwarding thread so it exits before we close any fds
+        if let Ok(mut handle) = self.thread_handle.lock() {
+            if let Some(h) = handle.take() {
+                if let Err(e) = h.join() {
+                    eprintln!("vm-rs: network switch thread panicked: {:?}", e);
+                }
+            }
+        }
     }
 }
 

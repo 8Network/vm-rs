@@ -307,10 +307,26 @@ impl ImageStore {
                     .to_path_buf();
                 let path_str = path.to_string_lossy();
 
+                // SECURITY: Reject path traversal and absolute paths BEFORE any
+                // filesystem operations (including whiteout processing).
+                // A malicious layer with `../../.wh.shadow` could otherwise delete
+                // host files outside the extraction root.
+                let has_traversal = path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                });
+                if has_traversal {
+                    tracing::warn!(path = %path_str, "skipping tar entry with path traversal");
+                    continue;
+                }
+
                 // Handle whiteout files (.wh.*)
                 if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
                     if let Some(deleted_name) = filename.strip_prefix(".wh.") {
                         if deleted_name == ".wh..opq" {
+                            // Opaque whiteout: delete all children of the parent directory
                             if let Some(parent) = path.parent() {
                                 let full_parent = target.join(parent);
                                 if full_parent.exists() {
@@ -322,8 +338,15 @@ impl ImageStore {
                                         ))
                                     })?;
                                     for child in entries.flatten() {
-                                        if let Err(e) = std::fs::remove_dir_all(child.path()) {
-                                            tracing::warn!(path = %child.path().display(), "opaque whiteout cleanup failed: {}", e);
+                                        let child_path = child.path();
+                                        // Remove files and directories alike
+                                        let result = if child_path.is_dir() {
+                                            std::fs::remove_dir_all(&child_path)
+                                        } else {
+                                            std::fs::remove_file(&child_path)
+                                        };
+                                        if let Err(e) = result {
+                                            tracing::warn!(path = %child_path.display(), "opaque whiteout cleanup failed: {}", e);
                                         }
                                     }
                                 }
@@ -339,19 +362,6 @@ impl ImageStore {
                         }
                         continue;
                     }
-                }
-
-                // Skip absolute paths and path traversal.
-                // Check each component individually — "foo..bar" is safe, "../foo" is not.
-                let has_traversal = path.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir | std::path::Component::RootDir
-                    )
-                });
-                if has_traversal {
-                    tracing::warn!(path = %path_str, "skipping tar entry with path traversal");
-                    continue;
                 }
 
                 entry
@@ -504,5 +514,148 @@ mod tests {
         let mut ports = config.exposed_ports.clone();
         ports.sort();
         assert_eq!(ports, vec![80, 443, 8080]);
+    }
+
+    /// Build a tar archive in memory, allowing unsafe paths (like `..`).
+    /// Uses raw header manipulation to bypass tar crate's path validation.
+    fn build_tar_raw(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for (path, content) in entries {
+            // Build a GNU tar header manually (512 bytes)
+            let mut header = [0u8; 512];
+            // name field: bytes 0..100
+            let path_bytes = path.as_bytes();
+            let copy_len = path_bytes.len().min(100);
+            header[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
+            // mode: bytes 100..108
+            header[100..107].copy_from_slice(b"0000644");
+            // uid/gid: bytes 108..124
+            header[108..115].copy_from_slice(b"0000000");
+            header[116..123].copy_from_slice(b"0000000");
+            // size: bytes 124..136 (octal)
+            let size_str = format!("{:011o}", content.len());
+            header[124..135].copy_from_slice(size_str.as_bytes());
+            // mtime: bytes 136..148
+            header[136..147].copy_from_slice(b"00000000000");
+            // typeflag: byte 156 ('0' = regular file)
+            header[156] = b'0';
+            // magic: bytes 257..263
+            header[257..263].copy_from_slice(b"ustar\0");
+            // version: bytes 263..265
+            header[263..265].copy_from_slice(b"00");
+            // Compute checksum: bytes 148..156, treat as spaces during calc
+            header[148..156].copy_from_slice(b"        ");
+            let cksum: u32 = header.iter().map(|&b| b as u32).sum();
+            let cksum_str = format!("{:06o}\0 ", cksum);
+            header[148..156].copy_from_slice(cksum_str.as_bytes());
+
+            buf.extend_from_slice(&header);
+            buf.extend_from_slice(content);
+            // Pad to 512-byte boundary
+            let remainder = content.len() % 512;
+            if remainder > 0 {
+                buf.extend(std::iter::repeat(0u8).take(512 - remainder));
+            }
+        }
+        // Two zero blocks = end of archive
+        buf.extend(std::iter::repeat(0u8).take(1024));
+        buf
+    }
+
+    /// Compute sha256 digest string for data
+    fn sha256_digest(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(data);
+        format!("sha256:{:x}", hash)
+    }
+
+    #[test]
+    fn extract_rejects_path_traversal_in_whiteout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(&tmp.path().join("store")).unwrap();
+
+        // Create a file outside the extraction root that a malicious whiteout
+        // entry would try to delete
+        let canary = tmp.path().join("canary.txt");
+        std::fs::write(&canary, "do not delete me").unwrap();
+
+        // Malicious tar with path-traversal whiteout: ../../.wh.canary.txt
+        let tar_bytes = build_tar_raw(&[("../../.wh.canary.txt", b"")]);
+        let digest = sha256_digest(&tar_bytes);
+
+        store.put_blob(&digest, &tar_bytes).unwrap();
+
+        let extract_dir = tmp.path().join("extract");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let manifest = ImageManifest {
+            config_digest: "sha256:dummy".to_string(),
+            layer_digests: vec![digest],
+            media_type: String::new(),
+        };
+        store.extract_layers(&manifest, &extract_dir).unwrap();
+
+        assert!(
+            canary.exists(),
+            "path traversal whiteout must not delete files outside extraction root"
+        );
+    }
+
+    #[test]
+    fn extract_rejects_path_traversal_in_regular_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(&tmp.path().join("store")).unwrap();
+
+        let tar_bytes = build_tar_raw(&[("../../etc/evil", b"pwned")]);
+        let digest = sha256_digest(&tar_bytes);
+        store.put_blob(&digest, &tar_bytes).unwrap();
+
+        let extract_dir = tmp.path().join("extract");
+        std::fs::create_dir_all(&extract_dir).unwrap();
+        let manifest = ImageManifest {
+            config_digest: "sha256:dummy".to_string(),
+            layer_digests: vec![digest],
+            media_type: String::new(),
+        };
+        store.extract_layers(&manifest, &extract_dir).unwrap();
+
+        assert!(
+            !tmp.path().join("etc/evil").exists(),
+            "path traversal must not create files outside extraction root"
+        );
+    }
+
+    #[test]
+    fn extract_handles_opaque_whiteout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(&tmp.path().join("store")).unwrap();
+
+        // Pre-populate with files in subdir/
+        let extract_dir = tmp.path().join("extract");
+        let subdir = extract_dir.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("old_file.txt"), "old").unwrap();
+        std::fs::create_dir_all(subdir.join("old_dir")).unwrap();
+        std::fs::write(subdir.join("old_dir/nested.txt"), "nested").unwrap();
+
+        let tar_bytes = build_tar_raw(&[("subdir/.wh..wh..opq", b"")]);
+        let digest = sha256_digest(&tar_bytes);
+        store.put_blob(&digest, &tar_bytes).unwrap();
+
+        let manifest = ImageManifest {
+            config_digest: "sha256:dummy".to_string(),
+            layer_digests: vec![digest],
+            media_type: String::new(),
+        };
+        store.extract_layers(&manifest, &extract_dir).unwrap();
+
+        assert!(
+            !subdir.join("old_file.txt").exists(),
+            "opaque whiteout should remove files"
+        );
+        assert!(
+            !subdir.join("old_dir").exists(),
+            "opaque whiteout should remove directories"
+        );
+        assert!(subdir.exists(), "opaque whiteout should keep the parent dir");
     }
 }

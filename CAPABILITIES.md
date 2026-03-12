@@ -10,7 +10,7 @@ macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 | **Lifecycle** | | | |
 | Boot VM | Supported | Supported | Kernel + initramfs + root disk |
 | Stop (graceful) | Supported | Supported | ACPI shutdown |
-| Kill (force) | Supported | Supported | Immediate termination |
+| Kill (force) | Registry removal only | Supported | macOS: no force-kill API, removes tracking. Linux: SIGKILL |
 | Query state | Supported | Supported | Starting → Running → Stopped / Failed |
 | Reboot | Not supported | Planned | CH: `vm.reboot` or `ch-remote reboot` |
 | Delete/cleanup | Supported | Supported | Remove VM state and resources |
@@ -43,11 +43,11 @@ macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 | Bridged networking | Supported (FFI wrapped) | Planned | Direct host NIC bridge |
 | vhost-user net | Not possible | Planned | Offload to external daemon |
 | **Shared Directories** | | | |
-| VirtioFS | Supported (in-process) | Planned | macOS: native VZ. Linux: virtiofsd sidecar |
-| Read-only mounts | Supported | Planned | Immutable shared data |
+| VirtioFS | Supported (in-process) | Supported | macOS: native VZ. Linux: virtiofsd sidecar |
+| Read-only mounts | Supported | Supported | Immutable shared data |
 | **Serial Console** | | | |
 | File output | Supported | Supported | Log serial to file |
-| Readiness detection | Supported | Supported | Parse `8STACK_READY` marker from console |
+| Readiness detection | Supported | Supported | Parse `VMRS_READY` marker from console |
 | **Entropy** | | | |
 | VirtIO RNG | Supported | Supported | /dev/random in guest |
 | **Advanced (API mode)** | | | |

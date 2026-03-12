@@ -124,6 +124,9 @@ fn resolve_alpine(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
 
     let base = format!("https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch_str}");
 
+    // Alpine only provides kernel + initramfs for netboot.
+    // The .iso is NOT a root disk image — it cannot be attached as /dev/vda1
+    // or converted with qemu-img. Alpine boots diskless with tmpfs rootfs.
     Ok(vec![
         ImageAsset {
             filename: "vmlinuz",
@@ -132,10 +135,6 @@ fn resolve_alpine(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
         ImageAsset {
             filename: "initramfs",
             url: format!("{base}/netboot/initramfs-virt"),
-        },
-        ImageAsset {
-            filename: "disk.img",
-            url: format!("{base}/alpine-virt-{version}.0-{arch_str}.iso"),
         },
     ])
 }
@@ -309,14 +308,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_alpine_returns_3_assets() {
+    fn resolve_alpine_returns_2_assets() {
         let spec = ImageSpec {
             distro: "alpine".into(),
             version: "3.20".into(),
             arch: Some(Arch::X86_64),
         };
         let assets = resolve_image(&spec).unwrap();
-        assert_eq!(assets.len(), 3);
+        // Alpine netboot: kernel + initramfs only (no disk image)
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].filename, "vmlinuz");
+        assert_eq!(assets[1].filename, "initramfs");
         assert!(assets[0].url.contains("x86_64"));
     }
 

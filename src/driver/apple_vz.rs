@@ -114,10 +114,12 @@ impl VmDriver for AppleVzDriver {
         let log_file = fs::File::create(&config.serial_log).map_err(VmError::Io)?;
         let null_file = fs::File::open("/dev/null").map_err(VmError::Io)?;
 
-        // SAFETY: into_raw_fd() transfers ownership; the fd is valid and open.
-        let read_handle = unsafe { NSFileHandle::file_handle_with_fd(null_file.into_raw_fd()) };
-        // SAFETY: into_raw_fd() transfers ownership; the fd is valid and open.
-        let write_handle = unsafe { NSFileHandle::file_handle_with_fd(log_file.into_raw_fd()) };
+        // SAFETY: into_raw_fd() transfers ownership to the NSFileHandle (closeOnDealloc: YES).
+        let read_handle =
+            unsafe { NSFileHandle::file_handle_with_fd_owned(null_file.into_raw_fd()) };
+        // SAFETY: into_raw_fd() transfers ownership to the NSFileHandle (closeOnDealloc: YES).
+        let write_handle =
+            unsafe { NSFileHandle::file_handle_with_fd_owned(log_file.into_raw_fd()) };
         let serial_attachment = VZFileHandleSerialPortAttachmentBuilder::new()
             .file_handle_for_reading(read_handle)
             .file_handle_for_writing(write_handle)
@@ -140,8 +142,9 @@ impl VmDriver for AppleVzDriver {
         for net in &config.networks {
             match net {
                 NetworkAttachment::SocketPairFd(fd) => {
-                    // SAFETY: fd comes from a socketpair we created; it is valid and open.
-                    let file_handle = unsafe { NSFileHandle::file_handle_with_fd(*fd) };
+                    // SAFETY: fd comes from a socketpair managed by the NetworkSwitch.
+                    // The switch owns the fd lifetime, so we borrow (closeOnDealloc: NO).
+                    let file_handle = unsafe { NSFileHandle::file_handle_with_fd_borrowed(*fd) };
                     let fh_attachment = VZFileHandleNetworkDeviceAttachment::new(file_handle);
                     let mut nic = VZVirtioNetworkDeviceConfiguration::new(fh_attachment);
                     nic.set_mac_address(VZMACAddress::random_locally_administered_address());

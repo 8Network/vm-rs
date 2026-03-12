@@ -77,8 +77,34 @@ pub fn delete_tap(name: &str) {
     }
 }
 
-/// Delete a bridge (best-effort).
-pub fn delete_bridge(name: &str) {
+/// Delete a bridge and its associated NAT rules (best-effort).
+///
+/// If `subnet_cidr` is provided, the corresponding iptables MASQUERADE rule
+/// is removed before the bridge device is deleted.
+pub fn delete_bridge(name: &str, subnet_cidr: Option<&str>) {
+    // Clean up iptables NAT rule if we know the subnet
+    if let Some(subnet) = subnet_cidr {
+        let result = Command::new("iptables")
+            .args([
+                "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "!", "-o", name, "-j",
+                "MASQUERADE",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match result {
+            Ok(s) if s.success() => {
+                tracing::info!(bridge = %name, subnet = %subnet, "NAT rule removed");
+            }
+            _ => {
+                tracing::debug!(bridge = %name, subnet = %subnet, "NAT rule removal failed (may not exist)");
+            }
+        }
+    }
+}
+
+/// Delete a bridge device only (legacy — prefer `delete_bridge` with subnet).
+pub fn delete_bridge_device(name: &str) {
     if let Err(e) = Command::new("ip")
         .args(["link", "set", name, "down"])
         .stdout(Stdio::null())

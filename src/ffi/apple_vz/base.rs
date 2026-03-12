@@ -166,12 +166,26 @@ impl NSFileHandle {
         }
     }
 
+    /// Create an `NSFileHandle` that does NOT take ownership of the fd.
+    /// The caller must ensure the fd outlives this handle.
+    ///
     /// # Safety
-    /// `fd` must be a valid, open file descriptor. The caller retains ownership —
-    /// the returned handle does NOT close the fd on drop (`closeOnDealloc: NO`).
-    pub unsafe fn file_handle_with_fd(fd: i32) -> NSFileHandle {
+    /// `fd` must be a valid, open file descriptor.
+    pub unsafe fn file_handle_with_fd_borrowed(fd: i32) -> NSFileHandle {
         let alloc: Id = msg_send![class!(NSFileHandle), alloc];
         let p = StrongPtr::new(msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: NO]);
+        NSFileHandle(p)
+    }
+
+    /// Create an `NSFileHandle` that takes ownership of the fd.
+    /// The fd will be closed when the Objective-C object is deallocated.
+    ///
+    /// # Safety
+    /// `fd` must be a valid, open file descriptor. The caller must NOT close it
+    /// after this call — ownership transfers to the `NSFileHandle`.
+    pub unsafe fn file_handle_with_fd_owned(fd: i32) -> NSFileHandle {
+        let alloc: Id = msg_send![class!(NSFileHandle), alloc];
+        let p = StrongPtr::new(msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: YES]);
         NSFileHandle(p)
     }
 }

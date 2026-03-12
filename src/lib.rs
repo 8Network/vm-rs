@@ -8,7 +8,7 @@
 //! ```text
 //! VmDriver trait        ← Platform-agnostic VM lifecycle
 //!   ├── AppleVzDriver   ← macOS: Apple Virtualization.framework
-//!   └── CloudHvDriver   ← Linux: Cloud Hypervisor REST API
+//!   └── CloudHvDriver   ← Linux: Cloud Hypervisor CLI
 //!
 //! VmManager             ← Multi-VM orchestration (auto-selects driver)
 //! NetworkSwitch         ← L2 userspace Ethernet switch with MAC learning

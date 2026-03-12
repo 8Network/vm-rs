@@ -38,13 +38,13 @@ impl VZNetworkDeviceAttachment for VZNATNetworkDeviceAttachment {
 pub trait VZBridgedNetworkInterface {
     fn id(&self) -> Id;
     fn localized_display_name(&self) -> NSString {
-        let _obj = self.id();
-        let p = unsafe { StrongPtr::retain(msg_send![class!(_obj), localizedDisplayName]) };
+        let obj = self.id();
+        let p = unsafe { StrongPtr::retain(msg_send![obj, localizedDisplayName]) };
         NSString(p)
     }
     fn identifier(&self) -> NSString {
-        let _obj = self.id();
-        let p = unsafe { StrongPtr::retain(msg_send![class!(_obj), identifier]) };
+        let obj = self.id();
+        let p = unsafe { StrongPtr::retain(msg_send![obj, identifier]) };
         NSString(p)
     }
 }

@@ -56,22 +56,40 @@ impl VmManager {
     }
 
     /// Boot a VM. Creates the VM directory and delegates to the driver.
+    ///
+    /// Holds a write lock across the duplicate check AND boot to prevent
+    /// two concurrent callers from booting the same VM name.
     pub fn start(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
-        // Check for duplicate
-        {
-            let vms = self
-                .vms
-                .read()
-                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-            if let Some(existing) = vms.get(&config.name) {
-                if existing.state != VmState::Stopped {
-                    return Err(VmError::BootFailed {
-                        name: config.name.clone(),
-                        detail: format!("VM already exists in state: {}", existing.state),
-                    });
-                }
+        // Take write lock for the entire operation: check + boot + insert.
+        // This prevents a TOCTOU race where two callers both pass the
+        // duplicate check and boot separate VMs with the same name.
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+
+        if let Some(existing) = vms.get(&config.name) {
+            if existing.state != VmState::Stopped {
+                return Err(VmError::BootFailed {
+                    name: config.name.clone(),
+                    detail: format!("VM already exists in state: {}", existing.state),
+                });
             }
         }
+
+        // Reserve the name with a Starting entry before boot.
+        // If boot fails, we remove it.
+        let placeholder = VmHandle {
+            name: config.name.clone(),
+            namespace: config.namespace.clone(),
+            state: VmState::Starting,
+            pid: None,
+            serial_log: config.serial_log.clone(),
+        };
+        vms.insert(config.name.clone(), placeholder);
+
+        // Release the lock during the actual boot (which may take time)
+        drop(vms);
 
         // Ensure VM directory exists
         let vm_dir = self.vm_dir(&config.name);
@@ -84,18 +102,23 @@ impl VmManager {
             "booting VM"
         );
 
-        let handle = self.driver.boot(config)?;
-
-        // Track the VM
-        {
-            let mut vms = self
-                .vms
-                .write()
-                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-            vms.insert(config.name.clone(), handle.clone());
+        match self.driver.boot(config) {
+            Ok(handle) => {
+                let mut vms = self
+                    .vms
+                    .write()
+                    .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                vms.insert(config.name.clone(), handle.clone());
+                Ok(handle)
+            }
+            Err(e) => {
+                // Boot failed — remove the placeholder
+                if let Ok(mut vms) = self.vms.write() {
+                    vms.remove(&config.name);
+                }
+                Err(e)
+            }
         }
-
-        Ok(handle)
     }
 
     /// Stop a VM gracefully.
