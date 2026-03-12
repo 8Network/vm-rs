@@ -28,7 +28,11 @@ pub fn ensure_bridge(name: &str, gateway_ip: &str, subnet_cidr: &str) -> Result<
         .output()
         .map_err(|e| VmError::Hypervisor(format!("failed to check bridge address: {}", e)))?;
     let addr_str = String::from_utf8_lossy(&addr_output.stdout);
-    let cidr = format!("{}/{}", gateway_ip, subnet_cidr.split('/').last().unwrap_or("24"));
+    let cidr = format!(
+        "{}/{}",
+        gateway_ip,
+        subnet_cidr.split('/').last().unwrap_or("24")
+    );
     if !addr_str.contains(&cidr) {
         run_ip(&["addr", "add", &cidr, "dev", name])?;
     }
@@ -106,9 +110,17 @@ fn setup_nat(bridge: &str, subnet: &str) -> Result<(), VmError> {
     // Check if rule already exists
     let check = Command::new("iptables")
         .args([
-            "-t", "nat", "-C", "POSTROUTING",
-            "-s", subnet, "!", "-o", bridge,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "!",
+            "-o",
+            bridge,
+            "-j",
+            "MASQUERADE",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -123,9 +135,17 @@ fn setup_nat(bridge: &str, subnet: &str) -> Result<(), VmError> {
     // Add the rule
     let status = Command::new("iptables")
         .args([
-            "-t", "nat", "-A", "POSTROUTING",
-            "-s", subnet, "!", "-o", bridge,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "!",
+            "-o",
+            bridge,
+            "-j",
+            "MASQUERADE",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

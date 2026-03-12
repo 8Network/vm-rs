@@ -102,14 +102,18 @@ impl NetworkSwitch {
             label: label.to_string(),
         };
 
-        let mut networks = self.networks.lock()
+        let mut networks = self
+            .networks
+            .lock()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {}", e)))?;
         networks
             .entry(network_id.to_string())
             .or_default()
             .push(port);
 
-        let mut mac_tables = self.mac_tables.write()
+        let mut mac_tables = self
+            .mac_tables
+            .write()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {}", e)))?;
         mac_tables.entry(network_id.to_string()).or_default();
 
@@ -258,8 +262,7 @@ fn forwarding_loop(
         }
 
         // SAFETY: poll(2) on fds we own. pollfds array is valid and properly sized.
-        let ready =
-            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
 
         if ready <= 0 {
             continue;
@@ -274,14 +277,8 @@ fn forwarding_loop(
 
             // Read one Ethernet frame
             // SAFETY: Reading from our own fd into a stack buffer of MAX_FRAME_SIZE.
-            let n = unsafe {
-                libc::recv(
-                    pfd.fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                )
-            };
+            let n =
+                unsafe { libc::recv(pfd.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
 
             if n < MIN_FRAME_SIZE as isize {
                 continue;
@@ -477,14 +474,8 @@ mod tests {
 
         // Send from fd1 (the VM's end of the socketpair)
         // SAFETY: Writing to our own socketpair fd.
-        let sent = unsafe {
-            libc::send(
-                fd1,
-                frame.as_ptr() as *const libc::c_void,
-                frame.len(),
-                0,
-            )
-        };
+        let sent =
+            unsafe { libc::send(fd1, frame.as_ptr() as *const libc::c_void, frame.len(), 0) };
         assert_eq!(sent, 14);
 
         // Wait briefly for the switch forwarding loop
@@ -501,7 +492,10 @@ mod tests {
                 libc::MSG_DONTWAIT,
             )
         };
-        assert_eq!(recvd, 14, "broadcast frame should be forwarded to the other port");
+        assert_eq!(
+            recvd, 14,
+            "broadcast frame should be forwarded to the other port"
+        );
         assert_eq!(&buf[..14], &frame[..14]);
 
         switch.stop();

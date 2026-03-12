@@ -3,8 +3,8 @@
 use super::base::{Id, NSString};
 
 use objc::rc::StrongPtr;
-use objc::{class, msg_send, sel, sel_impl};
 use objc::runtime::YES;
+use objc::{class, msg_send, sel, sel_impl};
 
 /// Trait for directory sharing configurations.
 pub trait VZDirectorySharingDeviceConfiguration {

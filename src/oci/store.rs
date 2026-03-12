@@ -118,7 +118,8 @@ impl ImageStore {
     /// Read a blob's bytes.
     pub fn get_blob(&self, digest: &str) -> Result<Vec<u8>, OciError> {
         let path = self.blob_path(digest);
-        std::fs::read(&path).map_err(|e| OciError::Blob(format!("failed to read blob {}: {}", digest, e)))
+        std::fs::read(&path)
+            .map_err(|e| OciError::Blob(format!("failed to read blob {}: {}", digest, e)))
     }
 
     /// Save a manifest for an image reference.
@@ -201,7 +202,9 @@ impl ImageStore {
         let raw: RawManifest = serde_json::from_slice(data)
             .map_err(|e| OciError::ManifestParse(format!("invalid JSON: {}", e)))?;
 
-        let media_type = raw.media_type.as_deref()
+        let media_type = raw
+            .media_type
+            .as_deref()
             .or_else(|| raw.schema_version.map(|_| ""))
             .unwrap_or("");
 
@@ -209,11 +212,13 @@ impl ImageStore {
             return Err(OciError::ManifestParse("manifest_list".into()));
         }
 
-        let config_digest = raw.config
+        let config_digest = raw
+            .config
             .and_then(|c| c.digest)
             .ok_or_else(|| OciError::ManifestParse("missing config digest".into()))?;
 
-        let layers = raw.layers
+        let layers = raw
+            .layers
             .ok_or_else(|| OciError::ManifestParse("missing layers".into()))?;
         let layer_digests: Vec<String> = layers
             .into_iter()
@@ -241,7 +246,8 @@ impl ImageStore {
             ExposedPorts: None,
         });
 
-        let exposed_ports = cfg.ExposedPorts
+        let exposed_ports = cfg
+            .ExposedPorts
             .map(|obj| {
                 obj.keys()
                     .filter_map(|k| k.split('/').next().and_then(|p| p.parse::<u16>().ok()))
@@ -260,11 +266,7 @@ impl ImageStore {
     }
 
     /// Extract all layers of an image into a target directory (for rootfs preparation).
-    pub fn extract_layers(
-        &self,
-        manifest: &ImageManifest,
-        target: &Path,
-    ) -> Result<(), OciError> {
+    pub fn extract_layers(&self, manifest: &ImageManifest, target: &Path) -> Result<(), OciError> {
         std::fs::create_dir_all(target)?;
 
         for (i, digest) in manifest.layer_digests.iter().enumerate() {
@@ -313,8 +315,13 @@ impl ImageStore {
                             if let Some(parent) = path.parent() {
                                 let full_parent = target.join(parent);
                                 if full_parent.exists() {
-                                    let entries = std::fs::read_dir(&full_parent)
-                                        .map_err(|e| OciError::Blob(format!("opaque whiteout read_dir failed for {}: {}", full_parent.display(), e)))?;
+                                    let entries = std::fs::read_dir(&full_parent).map_err(|e| {
+                                        OciError::Blob(format!(
+                                            "opaque whiteout read_dir failed for {}: {}",
+                                            full_parent.display(),
+                                            e
+                                        ))
+                                    })?;
                                     for child in entries.flatten() {
                                         if let Err(e) = std::fs::remove_dir_all(child.path()) {
                                             tracing::warn!(path = %child.path().display(), "opaque whiteout cleanup failed: {}", e);
@@ -338,7 +345,10 @@ impl ImageStore {
                 // Skip absolute paths and path traversal.
                 // Check each component individually — "foo..bar" is safe, "../foo" is not.
                 let has_traversal = path.components().any(|c| {
-                    matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir)
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
                 });
                 if has_traversal {
                     tracing::warn!(path = %path_str, "skipping tar entry with path traversal");
@@ -433,7 +443,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path()).unwrap();
         let path = store.blob_path("sha256:abc123def456");
-        assert!(path.to_string_lossy().ends_with("blobs/sha256/abc123def456"));
+        assert!(path
+            .to_string_lossy()
+            .ends_with("blobs/sha256/abc123def456"));
     }
 
     #[test]

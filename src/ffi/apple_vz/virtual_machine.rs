@@ -1,7 +1,7 @@
 //! virtual machine module
 
 use super::{
-    base::{Id, NIL, NSArray, NSError},
+    base::{Id, NSArray, NSError, NIL},
     boot_loader::VZBootLoader,
     entropy_device::VZEntropyDeviceConfiguration,
     memory_device::VZMemoryBalloonDeviceConfiguration,

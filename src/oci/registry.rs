@@ -110,7 +110,10 @@ pub async fn pull(image: &str, store: &ImageStore) -> Result<ImageManifest, OciE
 
     // 4. Fetch config blob
     if !store.has_blob(&manifest.config_digest) {
-        tracing::debug!("pulling config {}", &manifest.config_digest[..19.min(manifest.config_digest.len())]);
+        tracing::debug!(
+            "pulling config {}",
+            &manifest.config_digest[..19.min(manifest.config_digest.len())]
+        );
         let config_data = fetch_blob(&client, &image_ref, &manifest.config_digest, &token).await?;
         store.put_blob(&manifest.config_digest, &config_data)?;
     }
@@ -123,7 +126,13 @@ pub async fn pull(image: &str, store: &ImageStore) -> Result<ImageManifest, OciE
             continue;
         }
 
-        tracing::info!("pulling layer {}/{}: {}..{}", i + 1, total, &digest[..19.min(digest.len())], &digest[digest.len().saturating_sub(4)..]);
+        tracing::info!(
+            "pulling layer {}/{}: {}..{}",
+            i + 1,
+            total,
+            &digest[..19.min(digest.len())],
+            &digest[digest.len().saturating_sub(4)..]
+        );
         let data = fetch_blob(&client, &image_ref, digest, &token).await?;
         store.put_blob(digest, &data)?;
     }
@@ -143,8 +152,8 @@ pub fn parse_image_ref(image: &str) -> ImageRef {
 
     let first_part = image_no_digest.split('/').next().unwrap_or(image_no_digest);
     // A registry is present if the first path segment contains a dot OR a colon (port)
-    let has_registry = image_no_digest.contains('/')
-        && (first_part.contains('.') || first_part.contains(':'));
+    let has_registry =
+        image_no_digest.contains('/') && (first_part.contains('.') || first_part.contains(':'));
 
     let (registry, rest) = if has_registry {
         let slash = image_no_digest.find('/').expect("checked above");
@@ -176,33 +185,45 @@ pub fn parse_image_ref(image: &str) -> ImageRef {
     }
 }
 
-async fn authenticate(
-    client: &reqwest::Client,
-    image_ref: &ImageRef,
-) -> Result<String, OciError> {
+async fn authenticate(client: &reqwest::Client, image_ref: &ImageRef) -> Result<String, OciError> {
     if image_ref.registry == "registry-1.docker.io" {
         let url = format!(
             "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{}:pull",
             image_ref.repository
         );
-        let resp = client.get(&url).send().await
+        let resp = client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| OciError::Http(format!("auth request failed: {}", e)))?
             .error_for_status()
             .map_err(|e| OciError::Auth(format!("auth failed: {}", e)))?;
-        let token_resp: TokenResponse = resp.json().await
+        let token_resp: TokenResponse = resp
+            .json()
+            .await
             .map_err(|e| OciError::Auth(format!("invalid auth response: {}", e)))?;
-        let token = token_resp.into_token()
+        let token = token_resp
+            .into_token()
             .ok_or_else(|| OciError::Auth("no token in auth response".into()))?;
         Ok(token)
     } else {
         // Check ~/.docker/config.json for stored credentials
         if let Some(basic_auth) = read_docker_config_auth(&image_ref.registry) {
             let url = format!("https://{}/v2/", image_ref.registry);
-            let resp = client.get(&url).send().await
+            let resp = client
+                .get(&url)
+                .send()
+                .await
                 .map_err(|e| OciError::Http(format!("registry probe failed: {}", e)))?;
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-                if let Some(challenge) = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()) {
-                    if let Some(token_url) = parse_www_authenticate(challenge, &image_ref.repository) {
+                if let Some(challenge) = resp
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    if let Some(token_url) =
+                        parse_www_authenticate(challenge, &image_ref.repository)
+                    {
                         let resp = client
                             .get(&token_url)
                             .header("Authorization", format!("Basic {}", basic_auth))
@@ -211,8 +232,9 @@ async fn authenticate(
                             .map_err(|e| OciError::Auth(format!("token exchange failed: {}", e)))?
                             .error_for_status()
                             .map_err(|e| OciError::Auth(format!("token exchange failed: {}", e)))?;
-                        let token_resp: TokenResponse = resp.json().await
-                            .map_err(|e| OciError::Auth(format!("invalid token response: {}", e)))?;
+                        let token_resp: TokenResponse = resp.json().await.map_err(|e| {
+                            OciError::Auth(format!("invalid token response: {}", e))
+                        })?;
                         if let Some(token) = token_resp.into_token() {
                             return Ok(token);
                         }
@@ -248,12 +270,17 @@ async fn fetch_manifest(
         req = req.header("Authorization", format_auth_header(token));
     }
 
-    let resp = req.send().await
+    let resp = req
+        .send()
+        .await
         .map_err(|e| OciError::Http(format!("manifest fetch failed: {}", e)))?
         .error_for_status()
         .map_err(|e| OciError::Http(format!("manifest fetch failed: {}", e)))?;
-    Ok(resp.bytes().await
-        .map_err(|e| OciError::Http(format!("failed to read manifest: {}", e)))?.to_vec())
+    Ok(resp
+        .bytes()
+        .await
+        .map_err(|e| OciError::Http(format!("failed to read manifest: {}", e)))?
+        .to_vec())
 }
 
 async fn fetch_blob(
@@ -272,19 +299,28 @@ async fn fetch_blob(
         req = req.header("Authorization", format_auth_header(token));
     }
 
-    let resp = req.send().await
+    let resp = req
+        .send()
+        .await
         .map_err(|e| OciError::Http(format!("blob fetch failed: {}", e)))?
         .error_for_status()
         .map_err(|e| OciError::Http(format!("blob fetch failed: {}", e)))?;
-    Ok(resp.bytes().await
-        .map_err(|e| OciError::Http(format!("failed to read blob: {}", e)))?.to_vec())
+    Ok(resp
+        .bytes()
+        .await
+        .map_err(|e| OciError::Http(format!("failed to read blob: {}", e)))?
+        .to_vec())
 }
 
 fn resolve_platform_manifest(manifest_list_bytes: &[u8]) -> Result<String, OciError> {
     let list: ManifestList = serde_json::from_slice(manifest_list_bytes)
         .map_err(|e| OciError::ManifestParse(format!("invalid manifest list JSON: {}", e)))?;
 
-    let target_arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+    let target_arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
 
     // Exact match: linux + target architecture
     for entry in &list.manifests {
@@ -340,13 +376,16 @@ fn read_docker_config_auth(registry: &str) -> Option<String> {
     };
     let auths = config.auths?;
 
-    let auth_entry = auths.get(registry)
+    let auth_entry = auths
+        .get(registry)
         .or_else(|| auths.get(&format!("https://{}", registry)))
         .or_else(|| auths.get(&format!("https://{}/v2/", registry)))
         .or_else(|| auths.get(&format!("https://{}/v1/", registry)));
 
     let auth_str = auth_entry?.auth.as_deref()?;
-    if auth_str.is_empty() { return None; }
+    if auth_str.is_empty() {
+        return None;
+    }
     Some(auth_str.to_string())
 }
 

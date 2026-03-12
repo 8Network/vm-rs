@@ -17,10 +17,15 @@ use vm_rs::VmManager;
 /// Load test assets from environment. Returns None if not configured.
 fn test_assets() -> Option<(PathBuf, PathBuf)> {
     let kernel = std::env::var("VMRS_TEST_KERNEL").ok().map(PathBuf::from)?;
-    let initramfs = std::env::var("VMRS_TEST_INITRAMFS").ok().map(PathBuf::from)?;
+    let initramfs = std::env::var("VMRS_TEST_INITRAMFS")
+        .ok()
+        .map(PathBuf::from)?;
 
     if !kernel.exists() {
-        eprintln!("VMRS_TEST_KERNEL={} does not exist, skipping", kernel.display());
+        eprintln!(
+            "VMRS_TEST_KERNEL={} does not exist, skipping",
+            kernel.display()
+        );
         return None;
     }
     if !initramfs.exists() {

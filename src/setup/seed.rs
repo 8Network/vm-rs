@@ -110,8 +110,7 @@ pub fn create_seed_iso(iso_path: &Path, config: &SeedConfig<'_>) -> Result<(), S
     // Write network-config (v2)
     if !config.nics.is_empty() {
         let network_config = build_network_config(config);
-        std::fs::write(tmp_dir.join("network-config"), &network_config)
-            .map_err(SetupError::Io)?;
+        std::fs::write(tmp_dir.join("network-config"), &network_config).map_err(SetupError::Io)?;
     }
 
     // Create ISO
@@ -185,7 +184,8 @@ fn build_user_data(config: &SeedConfig<'_>) -> String {
     let ip_cmd = "hostname -I | awk '{print $1}'";
     ud.push_str(&format!(
         "  - echo \"{} $({})\"\n",
-        crate::config::READY_MARKER, ip_cmd
+        crate::config::READY_MARKER,
+        ip_cmd
     ));
 
     ud
@@ -484,7 +484,10 @@ mod tests {
             process: Some(ProcessConfig {
                 command: "/bin/app".into(),
                 workdir: None,
-                env: vec![("GOOD".into(), "ok".into()), ("BAD;rm".into(), "evil".into())],
+                env: vec![
+                    ("GOOD".into(), "ok".into()),
+                    ("BAD;rm".into(), "evil".into()),
+                ],
             }),
             volumes: vec![],
             healthcheck: None,

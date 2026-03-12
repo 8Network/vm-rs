@@ -19,14 +19,7 @@ fn build_frame(dst: [u8; 6], src: [u8; 6], payload: &[u8]) -> Vec<u8> {
 
 fn send_raw(fd: i32, data: &[u8]) -> isize {
     // SAFETY: Sending to our own socketpair fd.
-    unsafe {
-        libc::send(
-            fd,
-            data.as_ptr() as *const libc::c_void,
-            data.len(),
-            0,
-        )
-    }
+    unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), 0) }
 }
 
 fn recv_raw(fd: i32, buf: &mut [u8]) -> isize {
@@ -103,7 +96,11 @@ fn unicast_to_learned_mac() {
     assert_eq!(n_b, unicast.len() as isize, "B should receive unicast");
 
     let n_c = recv_raw(fd_c, &mut buf);
-    assert!(n_c <= 0, "C should NOT receive unicast destined for B, got {} bytes", n_c);
+    assert!(
+        n_c <= 0,
+        "C should NOT receive unicast destined for B, got {} bytes",
+        n_c
+    );
 
     switch.stop();
 }
@@ -124,7 +121,10 @@ fn different_networks_are_isolated() {
 
     let mut buf = vec![0u8; 1518];
     let n = recv_raw(fd_backend, &mut buf);
-    assert!(n <= 0, "backend network should NOT receive frames from frontend network");
+    assert!(
+        n <= 0,
+        "backend network should NOT receive frames from frontend network"
+    );
 
     switch.stop();
 }
@@ -248,11 +248,19 @@ fn multiple_networks_operate_independently() {
 
     // net-a: a2 should receive frame_a
     let n = recv_raw(fd_a2, &mut buf);
-    assert_eq!(n, frame_a.len() as isize, "a2 should receive net-a broadcast");
+    assert_eq!(
+        n,
+        frame_a.len() as isize,
+        "a2 should receive net-a broadcast"
+    );
 
     // net-b: b2 should receive frame_b
     let n = recv_raw(fd_b2, &mut buf);
-    assert_eq!(n, frame_b.len() as isize, "b2 should receive net-b broadcast");
+    assert_eq!(
+        n,
+        frame_b.len() as isize,
+        "b2 should receive net-b broadcast"
+    );
 
     // Cross-check: a2 should NOT get net-b's frame
     let n = recv_raw(fd_a2, &mut buf);

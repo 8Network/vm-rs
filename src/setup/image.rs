@@ -103,15 +103,11 @@ fn resolve_ubuntu(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
     Ok(vec![
         ImageAsset {
             filename: "vmlinuz",
-            url: format!(
-                "{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"
-            ),
+            url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"),
         },
         ImageAsset {
             filename: "initramfs",
-            url: format!(
-                "{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"
-            ),
+            url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"),
         },
         ImageAsset {
             filename: "disk.img",
@@ -126,9 +122,7 @@ fn resolve_alpine(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
         Arch::X86_64 => "x86_64",
     };
 
-    let base = format!(
-        "https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch_str}"
-    );
+    let base = format!("https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch_str}");
 
     Ok(vec![
         ImageAsset {
@@ -326,13 +320,9 @@ mod tests {
 
 async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| {
-            SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
-        })?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
+    })?;
 
     if !resp.status().is_success() {
         return Err(SetupError::AssetDownload(format!(
@@ -343,10 +333,7 @@ async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
     }
 
     let bytes = resp.bytes().await.map_err(|e| {
-        SetupError::AssetDownload(format!(
-            "failed to read response body from {}: {}",
-            url, e
-        ))
+        SetupError::AssetDownload(format!("failed to read response body from {}: {}", url, e))
     })?;
 
     std::fs::write(path, &bytes).map_err(SetupError::Io)?;

@@ -29,10 +29,7 @@ fn parse_ghcr_image() {
 #[test]
 fn parse_ecr_image() {
     let r = parse_image_ref("123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:v1.0");
-    assert_eq!(
-        r.registry,
-        "123456789012.dkr.ecr.us-east-1.amazonaws.com"
-    );
+    assert_eq!(r.registry, "123456789012.dkr.ecr.us-east-1.amazonaws.com");
     assert_eq!(r.repository, "my-app");
     assert_eq!(r.tag, "v1.0");
 }
@@ -49,7 +46,10 @@ async fn pull_alpine_image_from_dockerhub() {
 
     match result {
         Ok(manifest) => {
-            assert!(!manifest.layer_digests.is_empty(), "alpine should have layers");
+            assert!(
+                !manifest.layer_digests.is_empty(),
+                "alpine should have layers"
+            );
             assert!(
                 !manifest.config_digest.is_empty(),
                 "should have config digest"
@@ -159,16 +159,18 @@ async fn pull_nonexistent_image_fails() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let store = ImageStore::new(tmp.path()).expect("store");
 
-    let result =
-        vm_rs::oci::pull("library/this-image-does-not-exist-12345:v999", &store).await;
+    let result = vm_rs::oci::pull("library/this-image-does-not-exist-12345:v999", &store).await;
 
     match result {
         Err(e) => {
             let msg = e.to_string();
             // Should be an auth or HTTP error, not a panic
             assert!(
-                msg.contains("HTTP") || msg.contains("auth") || msg.contains("404")
-                    || msg.contains("UNAUTHORIZED") || msg.contains("NAME_UNKNOWN"),
+                msg.contains("HTTP")
+                    || msg.contains("auth")
+                    || msg.contains("404")
+                    || msg.contains("UNAUTHORIZED")
+                    || msg.contains("NAME_UNKNOWN"),
                 "expected HTTP/auth error, got: {}",
                 msg
             );

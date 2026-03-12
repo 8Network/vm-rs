@@ -59,7 +59,10 @@ impl VmManager {
     pub fn start(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
         // Check for duplicate
         {
-            let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+            let vms = self
+                .vms
+                .read()
+                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
             if let Some(existing) = vms.get(&config.name) {
                 if existing.state != VmState::Stopped {
                     return Err(VmError::BootFailed {
@@ -85,7 +88,10 @@ impl VmManager {
 
         // Track the VM
         {
-            let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+            let mut vms = self
+                .vms
+                .write()
+                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
             vms.insert(config.name.clone(), handle.clone());
         }
 
@@ -98,7 +104,10 @@ impl VmManager {
         self.driver.stop(&handle)?;
 
         // Update state
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = VmState::Stopped;
         }
@@ -110,7 +119,10 @@ impl VmManager {
         let handle = self.get_handle(name)?;
         self.driver.kill(&handle)?;
 
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = VmState::Stopped;
         }
@@ -124,7 +136,10 @@ impl VmManager {
     pub fn stop_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
         self.driver.stop(handle)?;
 
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(&handle.name) {
             h.state = VmState::Stopped;
         }
@@ -135,7 +150,10 @@ impl VmManager {
     pub fn kill_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
         self.driver.kill(handle)?;
 
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(&handle.name) {
             h.state = VmState::Stopped;
         }
@@ -148,7 +166,10 @@ impl VmManager {
         let state = self.driver.state(&handle)?;
 
         // Update cached state
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = state.clone();
         }
@@ -165,7 +186,10 @@ impl VmManager {
 
     /// List all tracked VMs.
     pub fn list(&self) -> Result<Vec<VmHandle>, VmError> {
-        let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let vms = self
+            .vms
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         Ok(vms.values().cloned().collect())
     }
 
@@ -177,7 +201,10 @@ impl VmManager {
         loop {
             if start.elapsed() > timeout {
                 let pending: Vec<String> = {
-                    let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                    let vms = self
+                        .vms
+                        .read()
+                        .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
                     vms.iter()
                         .filter(|(_, h)| !matches!(h.state, VmState::Running { .. }))
                         .map(|(name, _)| name.clone())
@@ -191,7 +218,10 @@ impl VmManager {
 
             let mut all_ready = true;
             let names: Vec<String> = {
-                let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                let vms = self
+                    .vms
+                    .read()
+                    .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
                 vms.keys().cloned().collect()
             };
 
@@ -264,12 +294,13 @@ impl VmManager {
     }
 
     fn get_handle(&self, name: &str) -> Result<VmHandle, VmError> {
-        let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        vms.get(name)
-            .cloned()
-            .ok_or_else(|| VmError::NotFound {
-                name: name.to_string(),
-            })
+        let vms = self
+            .vms
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        vms.get(name).cloned().ok_or_else(|| VmError::NotFound {
+            name: name.to_string(),
+        })
     }
 }
 

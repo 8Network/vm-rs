@@ -159,11 +159,9 @@ impl VmDriver for AppleVzDriver {
                 .caching_mode(VZDiskImageCachingMode::Automatic)
                 .sync_mode(VZDiskImageSynchronizationMode::Full)
                 .build()
-                .map_err(|e| {
-                    VmError::BootFailed {
-                        name: name.clone(),
-                        detail: format!("failed to attach root disk: code {}", e.code()),
-                    }
+                .map_err(|e| VmError::BootFailed {
+                    name: name.clone(),
+                    detail: format!("failed to attach root disk: code {}", e.code()),
                 })?;
             storage_devices.push(VZVirtioBlockDeviceConfiguration::new(root_attachment));
         }
@@ -173,11 +171,9 @@ impl VmDriver for AppleVzDriver {
                 .path(seed_path)
                 .read_only(true)
                 .build()
-                .map_err(|e| {
-                    VmError::BootFailed {
-                        name: name.clone(),
-                        detail: format!("failed to attach seed ISO: code {}", e.code()),
-                    }
+                .map_err(|e| VmError::BootFailed {
+                    name: name.clone(),
+                    detail: format!("failed to attach seed ISO: code {}", e.code()),
                 })?;
             storage_devices.push(VZVirtioBlockDeviceConfiguration::new(seed_attachment));
         }
@@ -227,8 +223,8 @@ impl VmDriver for AppleVzDriver {
         })?;
 
         // Create dispatch queue with unique label per VM
-        let label = std::ffi::CString::new(format!("rs.vm.{}", name))
-            .map_err(|e| VmError::BootFailed {
+        let label =
+            std::ffi::CString::new(format!("rs.vm.{}", name)).map_err(|e| VmError::BootFailed {
                 name: name.clone(),
                 detail: format!("invalid VM name for queue label: {}", e),
             })?;
@@ -243,7 +239,9 @@ impl VmDriver for AppleVzDriver {
 
         // Register for graceful shutdown
         {
-            let mut registry = VM_REGISTRY.lock().map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+            let mut registry = VM_REGISTRY
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
             registry.insert(name.to_string(), vm_leaked);
         }
 
@@ -287,20 +285,24 @@ impl VmDriver for AppleVzDriver {
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let registry = VM_REGISTRY.lock().map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-        let vm = registry.get(&handle.name).ok_or_else(|| VmError::NotFound {
-            name: handle.name.clone(),
-        })?;
+        let registry = VM_REGISTRY
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+        let vm = registry
+            .get(&handle.name)
+            .ok_or_else(|| VmError::NotFound {
+                name: handle.name.clone(),
+            })?;
 
         let mut vm_clone = (*vm).clone();
         // SAFETY: vm_clone is a valid VZVirtualMachine reference from the registry.
         unsafe {
-            vm_clone.request_stop_with_error().map_err(|e| {
-                VmError::StopFailed {
+            vm_clone
+                .request_stop_with_error()
+                .map_err(|e| VmError::StopFailed {
                     name: handle.name.clone(),
                     detail: format!("error code {}", e.code()),
-                }
-            })?;
+                })?;
         }
 
         Ok(())
@@ -309,14 +311,18 @@ impl VmDriver for AppleVzDriver {
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
         // Apple VZ doesn't have a force-kill API separate from stop.
         // Remove from registry — the leaked reference stays but the VM is abandoned.
-        let mut registry = VM_REGISTRY.lock().map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+        let mut registry = VM_REGISTRY
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
         registry.remove(&handle.name);
         tracing::warn!("force-killed VM '{}' (removed from registry)", handle.name);
         Ok(())
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let registry = VM_REGISTRY.lock().map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+        let registry = VM_REGISTRY
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
         if registry.contains_key(&handle.name) {
             // VM is in registry — check console log for readiness marker
             if let Some(ip) = check_ready_marker(&handle.serial_log) {
@@ -373,10 +379,7 @@ fn check_ready_marker(log_path: &Path) -> Option<String> {
 ///
 /// Blocks until either the marker is found or the stop flag is set.
 /// Returns the IP address if found.
-pub fn watch_for_ready(
-    log_path: &Path,
-    stop: &std::sync::atomic::AtomicBool,
-) -> Option<String> {
+pub fn watch_for_ready(log_path: &Path, stop: &std::sync::atomic::AtomicBool) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::atomic::Ordering;
 

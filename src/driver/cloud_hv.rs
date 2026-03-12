@@ -88,20 +88,25 @@ impl VmDriver for CloudHvDriver {
 
         // Memory — shared=on required when using VirtioFS
         if config.shared_dirs.is_empty() {
-            cmd.arg("--memory").arg(format!("size={}M", config.memory_mb));
+            cmd.arg("--memory")
+                .arg(format!("size={}M", config.memory_mb));
         } else {
-            cmd.arg("--memory").arg(format!("size={}M,shared=on", config.memory_mb));
+            cmd.arg("--memory")
+                .arg(format!("size={}M,shared=on", config.memory_mb));
         }
 
         // Disks: only attach if provided (initramfs boot needs no disks)
         if let Some(ref root_disk) = config.root_disk {
-            cmd.arg("--disk").arg(format!("path={}", root_disk.display()));
+            cmd.arg("--disk")
+                .arg(format!("path={}", root_disk.display()));
         }
         if let Some(ref seed_iso) = config.seed_iso {
-            cmd.arg("--disk").arg(format!("path={},readonly=on", seed_iso.display()));
+            cmd.arg("--disk")
+                .arg(format!("path={},readonly=on", seed_iso.display()));
         }
         if let Some(ref data_disk) = config.data_disk {
-            cmd.arg("--disk").arg(format!("path={}", data_disk.display()));
+            cmd.arg("--disk")
+                .arg(format!("path={}", data_disk.display()));
         }
 
         // Network
@@ -122,7 +127,8 @@ impl VmDriver for CloudHvDriver {
         }
 
         // Serial console → file
-        cmd.arg("--serial").arg(format!("file={}", config.serial_log.display()));
+        cmd.arg("--serial")
+            .arg(format!("file={}", config.serial_log.display()));
         cmd.arg("--console").arg("off");
 
         // VirtioFS shared directories via virtiofsd sidecar processes.
@@ -221,17 +227,26 @@ impl VmDriver for CloudHvDriver {
                 name: name.clone(),
                 detail: format!(
                     "cloud-hypervisor process (PID {}) exited immediately. Check {}",
-                    pid, vmm_log_path.display()
+                    pid,
+                    vmm_log_path.display()
                 ),
             });
         }
 
         // Track
         {
-            let mut vms = self.vms.lock().map_err(|e| {
-                VmError::Hypervisor(format!("lock poisoned: {}", e))
-            })?;
-            vms.insert(name.clone(), VmProcess { pid, tap_device: tap_name, virtiofsd_pids });
+            let mut vms = self
+                .vms
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+            vms.insert(
+                name.clone(),
+                VmProcess {
+                    pid,
+                    tap_device: tap_name,
+                    virtiofsd_pids,
+                },
+            );
         }
 
         Ok(VmHandle {
@@ -244,9 +259,10 @@ impl VmDriver for CloudHvDriver {
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("lock poisoned: {}", e))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         let process = vms.remove(&handle.name).ok_or_else(|| VmError::NotFound {
             name: handle.name.clone(),
         })?;
@@ -273,9 +289,10 @@ impl VmDriver for CloudHvDriver {
     }
 
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("lock poisoned: {}", e))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
         let (pid, virtiofsd_pids) = if let Some(process) = vms.remove(&handle.name) {
             cleanup_tap(&process.tap_device);
@@ -283,7 +300,9 @@ impl VmDriver for CloudHvDriver {
         } else if let Some(pid) = handle.pid {
             (pid, Vec::new())
         } else {
-            return Err(VmError::NotFound { name: handle.name.clone() });
+            return Err(VmError::NotFound {
+                name: handle.name.clone(),
+            });
         };
 
         // SAFETY: Sending SIGKILL to a PID we spawned.
@@ -303,9 +322,10 @@ impl VmDriver for CloudHvDriver {
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("lock poisoned: {}", e))
-        })?;
+        let vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
         let process = match vms.get(&handle.name) {
             Some(p) => p,
@@ -364,7 +384,8 @@ fn find_ch_binary() -> Result<PathBuf, VmError> {
 
     Err(VmError::InvalidConfig(
         "cloud-hypervisor binary not found on PATH or in /usr/bin, /usr/local/bin. \
-         Install from https://github.com/cloud-hypervisor/cloud-hypervisor/releases".into(),
+         Install from https://github.com/cloud-hypervisor/cloud-hypervisor/releases"
+            .into(),
     ))
 }
 
@@ -401,7 +422,11 @@ fn find_virtiofsd() -> Result<PathBuf, VmError> {
         {
             Ok(status) if status.success() => return Ok(PathBuf::from(name)),
             Ok(status) => {
-                tracing::warn!("virtiofsd candidate '{}' found but exited with {}", name, status);
+                tracing::warn!(
+                    "virtiofsd candidate '{}' found but exited with {}",
+                    name,
+                    status
+                );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Expected: candidate not at this location, try next

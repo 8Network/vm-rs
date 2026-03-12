@@ -3,7 +3,9 @@
 //! These tests create actual ISO files and verify their contents.
 //! Requires: hdiutil (macOS) or genisoimage/mkisofs (Linux).
 
-use vm_rs::setup::{create_seed_iso, HealthCheckConfig, NicConfig, ProcessConfig, SeedConfig, VolumeMountConfig};
+use vm_rs::setup::{
+    create_seed_iso, HealthCheckConfig, NicConfig, ProcessConfig, SeedConfig, VolumeMountConfig,
+};
 
 fn has_iso_tool() -> bool {
     #[cfg(target_os = "macos")]
