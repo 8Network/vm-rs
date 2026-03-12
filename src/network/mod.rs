@@ -6,7 +6,11 @@
 
 pub mod bridge;
 pub mod port_forward;
+
+#[cfg(unix)]
 pub mod switch;
 
 pub use port_forward::PortForwarder;
+
+#[cfg(unix)]
 pub use switch::NetworkSwitch;

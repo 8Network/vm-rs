@@ -344,6 +344,12 @@ impl VmManager {
             }
         }
 
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            // No CoW support — plain copy
+            std::fs::copy(base, target).map_err(VmError::Io)?;
+        }
+
         Ok(())
     }
 

@@ -40,11 +40,12 @@ sha2 = "0.10"
 # Tar archive (OCI layer extraction)
 tar = "0.4"
 
-# Process management + Unix primitives
-libc = "0.2"
-
 # Progress reporting (asset downloads)
 indicatif = "0.17"
+
+# Unix: process signals, socketpairs, poll
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # macOS: Apple Virtualization.framework (FFI absorbed from virtualization-rs)
 [target.'cfg(target_os = "macos")'.dependencies]

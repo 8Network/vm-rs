@@ -289,6 +289,15 @@ fn create_iso_image(iso_path: &Path, source_dir: &Path) -> Result<(), SetupError
         }
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        return Err(SetupError::IsoCreation(format!(
+            "seed ISO creation not yet supported on {}",
+            std::env::consts::OS
+        )));
+    }
+
+    #[allow(unreachable_code)]
     Ok(())
 }
 

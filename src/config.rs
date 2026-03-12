@@ -1,7 +1,9 @@
 //! VM configuration types — everything needed to boot and manage a VM.
 
-use std::os::unix::io::RawFd;
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 
 /// Readiness marker written to the serial console when the VM is ready.
 /// The full output is `VMRS_READY <ip_address>`.
@@ -85,6 +87,7 @@ pub struct VmConfig {
 pub enum NetworkAttachment {
     /// File descriptor pair for L2 switch port (macOS).
     /// The FD is the VM's end of a socketpair — the switch holds the other end.
+    #[cfg(unix)]
     SocketPairFd(RawFd),
     /// TAP device name (Linux).
     Tap { name: String, mac: Option<String> },
