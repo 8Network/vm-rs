@@ -31,7 +31,9 @@ use crate::ffi::apple_vz::{
         VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachmentBuilder,
         VZDiskImageSynchronizationMode, VZVirtioBlockDeviceConfiguration,
     },
-    virtual_machine::{VZVirtualMachine, VZVirtualMachineConfigurationBuilder},
+    virtual_machine::{
+        VZVirtualMachine, VZVirtualMachineConfigurationBuilder, VZVirtualMachineState,
+    },
 };
 
 use crate::config::{NetworkAttachment, VmConfig, VmHandle, VmState};
@@ -332,15 +334,33 @@ impl VmDriver for AppleVzDriver {
         let registry = VM_REGISTRY
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-        if registry.contains_key(&handle.name) {
-            // VM is in registry — check console log for readiness marker
-            if let Some(ip) = check_ready_marker(&handle.serial_log) {
-                Ok(VmState::Running { ip })
-            } else {
+        let vm = match registry.get(&handle.name) {
+            Some(vm) => *vm,
+            None => return Ok(VmState::Stopped),
+        };
+
+        // Query actual VZ framework state instead of assuming Running
+        // SAFETY: state() sends an ObjC message on the VM object we hold in the registry.
+        let vz_state = unsafe { vm.state() };
+        match vz_state {
+            VZVirtualMachineState::VZVirtualMachineStateStopped
+            | VZVirtualMachineState::VZVirtualMachineStateError => Ok(VmState::Stopped),
+            VZVirtualMachineState::VZVirtualMachineStateStarting => Ok(VmState::Starting),
+            VZVirtualMachineState::VZVirtualMachineStatePaused
+            | VZVirtualMachineState::VZVirtualMachineStatePausing
+            | VZVirtualMachineState::VZVirtualMachineStateResuming => {
+                // Report paused states as Starting (we don't have a Paused variant)
                 Ok(VmState::Starting)
             }
-        } else {
-            Ok(VmState::Stopped)
+            VZVirtualMachineState::VZVirtualMachineStateRunning => {
+                // VZ says Running — check console log for readiness marker with IP
+                if let Some(ip) = check_ready_marker(&handle.serial_log) {
+                    Ok(VmState::Running { ip })
+                } else {
+                    Ok(VmState::Starting)
+                }
+            }
+            VZVirtualMachineState::Other => Ok(VmState::Starting),
         }
     }
 }

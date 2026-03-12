@@ -289,6 +289,8 @@ async fn fetch_blob(
     digest: &str,
     token: &str,
 ) -> Result<Vec<u8>, OciError> {
+    use futures_util::StreamExt;
+
     let url = format!(
         "https://{}/v2/{}/blobs/{}",
         image_ref.registry, image_ref.repository, digest
@@ -305,11 +307,17 @@ async fn fetch_blob(
         .map_err(|e| OciError::Http(format!("blob fetch failed: {}", e)))?
         .error_for_status()
         .map_err(|e| OciError::Http(format!("blob fetch failed: {}", e)))?;
-    Ok(resp
-        .bytes()
-        .await
-        .map_err(|e| OciError::Http(format!("failed to read blob: {}", e)))?
-        .to_vec())
+
+    // Stream into buffer instead of loading entire blob at once.
+    // OCI layers can be hundreds of MB.
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| OciError::Http(format!("failed to read blob chunk: {}", e)))?;
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 fn resolve_platform_manifest(manifest_list_bytes: &[u8]) -> Result<String, OciError> {

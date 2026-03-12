@@ -19,13 +19,16 @@ use crate::driver::{VmDriver, VmError};
 // ---------------------------------------------------------------------------
 
 /// Metadata for a running Cloud Hypervisor VM process.
+///
+/// Holds the `Child` handle to prevent PID reuse: the kernel won't recycle
+/// the PID until we `wait()` on the child (or drop it, which reaps the zombie).
 struct VmProcess {
-    /// PID of the cloud-hypervisor process.
-    pid: u32,
+    /// The cloud-hypervisor child process handle.
+    child: std::process::Child,
     /// TAP device name (for cleanup on stop).
     tap_device: Option<String>,
-    /// virtiofsd sidecar PIDs (for VirtioFS shared dirs, cleaned up on stop).
-    virtiofsd_pids: Vec<u32>,
+    /// virtiofsd sidecar processes (for VirtioFS shared dirs, cleaned up on stop).
+    virtiofsd_children: Vec<std::process::Child>,
 }
 
 /// Cloud Hypervisor driver for Linux.
@@ -215,20 +218,16 @@ impl VmDriver for CloudHvDriver {
         let pid = process.id();
         tracing::info!(vm = %name, pid = pid, "Cloud Hypervisor process started");
 
-        // Collect virtiofsd PIDs for cleanup, then drop the Child handles.
-        // Dropping Child on Unix does NOT kill the process — it only closes our
-        // handle. The virtiofsd processes keep running and are killed via raw
-        // kill() in stop/cleanup using the saved PIDs.
-        let virtiofsd_pids: Vec<u32> = virtiofsd_children.iter().map(|c| c.id()).collect();
-        drop(virtiofsd_children);
-
         // Brief pause then check if process exited immediately (bad binary, permissions, etc.)
         std::thread::sleep(std::time::Duration::from_millis(100));
         // SAFETY: kill(pid, 0) checks if process exists without sending a signal.
         let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
         if !alive {
             // Clean up virtiofsd processes since VM failed
-            cleanup_virtiofsd(&virtiofsd_pids);
+            for mut c in virtiofsd_children {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
             return Err(VmError::BootFailed {
                 name: name.clone(),
                 detail: format!(
@@ -239,7 +238,8 @@ impl VmDriver for CloudHvDriver {
             });
         }
 
-        // Track
+        // Track — store Child handles to prevent PID reuse.
+        // The kernel keeps PIDs allocated while we hold an un-waited Child.
         {
             let mut vms = self
                 .vms
@@ -248,9 +248,9 @@ impl VmDriver for CloudHvDriver {
             vms.insert(
                 name.clone(),
                 VmProcess {
-                    pid,
+                    child: process,
                     tap_device: tap_name,
-                    virtiofsd_pids,
+                    virtiofsd_children,
                 },
             );
         }
@@ -269,28 +269,34 @@ impl VmDriver for CloudHvDriver {
             .vms
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        let process = vms.remove(&handle.name).ok_or_else(|| VmError::NotFound {
+        let mut process = vms.remove(&handle.name).ok_or_else(|| VmError::NotFound {
             name: handle.name.clone(),
         })?;
 
-        // SIGTERM → Cloud Hypervisor handles graceful ACPI shutdown
-        // SAFETY: Sending SIGTERM to a PID we spawned. PID validity confirmed by prior operations.
-        let ret = unsafe { libc::kill(process.pid as i32, libc::SIGTERM) };
+        let pid = process.child.id();
+
+        // SIGTERM → Cloud Hypervisor handles graceful ACPI shutdown.
+        // Safe from PID reuse: we hold the Child handle, so the PID can't be recycled.
+        // SAFETY: Sending SIGTERM to a PID we spawned and still hold a Child for.
+        let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if ret != 0 {
             let errno = std::io::Error::last_os_error();
             tracing::warn!(
                 vm = %handle.name,
-                pid = process.pid,
+                pid = pid,
                 error = %errno,
                 "SIGTERM failed (process may already be stopped)"
             );
         } else {
-            // Wait for process to exit (up to 10s)
-            wait_for_exit(process.pid, std::time::Duration::from_secs(10));
+            // Wait for process to exit (up to 10s), escalate to SIGKILL if needed
+            wait_for_exit(&mut process.child, std::time::Duration::from_secs(10));
         }
 
+        // Reap the child to release the PID
+        let _ = process.child.wait();
+
         cleanup_tap(&process.tap_device);
-        cleanup_virtiofsd(&process.virtiofsd_pids);
+        cleanup_virtiofsd(&mut process.virtiofsd_children);
         Ok(())
     }
 
@@ -300,55 +306,60 @@ impl VmDriver for CloudHvDriver {
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
-        let (pid, virtiofsd_pids) = if let Some(process) = vms.remove(&handle.name) {
+        if let Some(mut process) = vms.remove(&handle.name) {
+            // Use Child::kill() — safe from PID reuse because we hold the handle.
+            if let Err(e) = process.child.kill() {
+                tracing::warn!(
+                    vm = %handle.name,
+                    error = %e,
+                    "kill failed (process may already be stopped)"
+                );
+            }
+            // Reap to release PID
+            let _ = process.child.wait();
+
             cleanup_tap(&process.tap_device);
-            (process.pid, process.virtiofsd_pids)
+            cleanup_virtiofsd(&mut process.virtiofsd_children);
         } else if let Some(pid) = handle.pid {
-            (pid, Vec::new())
+            // Fallback: PID from handle (no Child — best-effort, inherently racy)
+            tracing::warn!(
+                vm = %handle.name,
+                pid = pid,
+                "killing by PID without Child handle (PID reuse possible)"
+            );
+            // SAFETY: Best-effort kill of a PID from the handle.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         } else {
             return Err(VmError::NotFound {
                 name: handle.name.clone(),
             });
-        };
-
-        // SAFETY: Sending SIGKILL to a PID we spawned.
-        let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        if ret != 0 {
-            let errno = std::io::Error::last_os_error();
-            tracing::warn!(
-                vm = %handle.name,
-                pid = pid,
-                error = %errno,
-                "SIGKILL failed (process may already be stopped)"
-            );
         }
-
-        cleanup_virtiofsd(&virtiofsd_pids);
         Ok(())
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let vms = self
+        let mut vms = self
             .vms
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
-        let process = match vms.get(&handle.name) {
+        let process = match vms.get_mut(&handle.name) {
             Some(p) => p,
             None => return Ok(VmState::Stopped),
         };
 
-        // SAFETY: kill(pid, 0) checks if process exists without sending a signal.
-        let alive = unsafe { libc::kill(process.pid as i32, 0) } == 0;
-        if !alive {
-            return Ok(VmState::Stopped);
-        }
-
-        // Process alive — check serial log for readiness marker
-        if let Some(ip) = check_ready_marker(&handle.serial_log) {
-            Ok(VmState::Running { ip })
-        } else {
-            Ok(VmState::Starting)
+        // Use try_wait() instead of kill(pid, 0) — safe from PID reuse
+        match process.child.try_wait() {
+            Ok(Some(_)) => Ok(VmState::Stopped),
+            Err(_) => Ok(VmState::Stopped),
+            Ok(None) => {
+                // Process alive — check serial log for readiness marker
+                if let Some(ip) = check_ready_marker(&handle.serial_log) {
+                    Ok(VmState::Running { ip })
+                } else {
+                    Ok(VmState::Starting)
+                }
+            }
         }
     }
 }
@@ -462,14 +473,15 @@ fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> bool {
     false
 }
 
-/// Kill virtiofsd sidecar processes.
-fn cleanup_virtiofsd(pids: &[u32]) {
-    for &pid in pids {
-        // SAFETY: Sending SIGKILL to PIDs we spawned.
-        let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        if ret == 0 {
-            tracing::debug!(pid = pid, "virtiofsd killed");
+/// Kill and reap virtiofsd sidecar processes.
+fn cleanup_virtiofsd(children: &mut Vec<std::process::Child>) {
+    for child in children.iter_mut() {
+        let pid = child.id();
+        if let Err(e) = child.kill() {
+            tracing::debug!(pid = pid, error = %e, "virtiofsd kill failed (may already be stopped)");
         }
+        let _ = child.wait();
+        tracing::debug!(pid = pid, "virtiofsd cleaned up");
     }
 }
 
@@ -494,25 +506,31 @@ fn check_ready_marker(log_path: &Path) -> Option<String> {
     }
 }
 
-/// Wait for a process to exit, polling with kill(pid, 0).
+/// Wait for a child process to exit via `try_wait()` polling.
 /// If the process doesn't exit within the timeout, escalates to SIGKILL.
-fn wait_for_exit(pid: u32, timeout: std::time::Duration) {
+/// Uses Child handle — safe from PID reuse.
+fn wait_for_exit(child: &mut std::process::Child, timeout: std::time::Duration) {
+    let pid = child.id();
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        // SAFETY: kill(pid, 0) only checks if the process exists.
-        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-        if !alive {
-            tracing::debug!(pid = pid, "process exited cleanly");
-            return;
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                tracing::debug!(pid = pid, "process exited cleanly");
+                return;
+            }
+            Ok(None) => {
+                // Still running
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                tracing::warn!(pid = pid, error = %e, "try_wait failed");
+                return;
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
     }
     tracing::warn!(pid = pid, elapsed_ms = %timeout.as_millis(), "process did not exit within timeout, sending SIGKILL");
-    // SAFETY: Sending SIGKILL to a PID we spawned and confirmed still exists.
-    let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    if ret != 0 {
-        let errno = std::io::Error::last_os_error();
-        tracing::warn!(pid = pid, error = %errno, "SIGKILL failed (process may have exited between check and kill)");
+    if let Err(e) = child.kill() {
+        tracing::warn!(pid = pid, error = %e, "SIGKILL failed (process may have exited)");
     }
 }
 

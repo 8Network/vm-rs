@@ -172,11 +172,20 @@ fi
 dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
 dropbearkey -t rsa     -f /etc/dropbear/dropbear_rsa_host_key     2>/dev/null
 
-# Start dropbear (background daemon, allow root login, no password auth)
-# Debug: log authorized_keys
-echo "[init] ssh: authorized_keys fingerprint: $(cat /root/.ssh/authorized_keys 2>/dev/null | awk '{print $1, $2}' | head -c 40)..."
+# Start dropbear SSH daemon.
+# -R = generate host keys on first run
+# -s = disable password logins (key-only when SSH key is provided)
+# -B = allow blank passwords (fallback when no SSH key — dev/debug only)
+DROPBEAR_OPTS="-R -p 22"
+if [ -n "$VM_SSH_KEY" ]; then
+    DROPBEAR_OPTS="$DROPBEAR_OPTS -s"
+    echo "[init] ssh: key-only auth (password login disabled)"
+else
+    DROPBEAR_OPTS="$DROPBEAR_OPTS -B"
+    echo "[init] ssh: WARNING blank password auth enabled (no SSH key provided)"
+fi
 
-if dropbear -R -B -p 22 2>/tmp/dropbear-start.log; then
+if dropbear $DROPBEAR_OPTS 2>/tmp/dropbear-start.log; then
     sleep 0.2
     if pidof dropbear >/dev/null 2>&1; then
         echo "[init] ssh: dropbear started on port 22 (pid $(pidof dropbear))"

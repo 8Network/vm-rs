@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use super::SetupError;
 
 // ---------------------------------------------------------------------------
@@ -172,6 +174,7 @@ pub async fn prepare_image(
         }
         tracing::info!(file = %asset.filename, url = %asset.url, "downloading");
         download_file(&asset.url, &path).await?;
+        verify_download(&path, asset.filename)?;
     }
 
     let kernel = image_dir.join("vmlinuz");
@@ -222,6 +225,45 @@ pub async fn prepare_image(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Verify a downloaded file: non-empty check + SHA-256 digest logging.
+///
+/// Rejects zero-byte downloads (indicates server error or truncated transfer).
+/// Logs the SHA-256 digest for manual verification and forensic auditing.
+fn verify_download(path: &Path, filename: &str) -> Result<(), SetupError> {
+    let metadata = std::fs::metadata(path).map_err(SetupError::Io)?;
+    if metadata.len() == 0 {
+        // Remove the empty file so it isn't treated as cached on retry
+        let _ = std::fs::remove_file(path);
+        return Err(SetupError::AssetDownload(format!(
+            "downloaded file is empty (0 bytes): {}",
+            filename
+        )));
+    }
+
+    // Compute SHA-256 for integrity auditing.
+    // Reads in 64KB chunks to avoid buffering large images.
+    let mut file = std::fs::File::open(path).map_err(SetupError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        use std::io::Read;
+        let n = file.read(&mut buf).map_err(SetupError::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    tracing::info!(
+        file = filename,
+        bytes = metadata.len(),
+        sha256 = %digest,
+        "download verified"
+    );
+
+    Ok(())
+}
+
 /// Convert a QCOW2 disk image to raw format.
 fn convert_to_raw(qcow2: &Path, raw: &Path) -> Result<(), SetupError> {
     tracing::info!(
@@ -249,6 +291,8 @@ fn convert_to_raw(qcow2: &Path, raw: &Path) -> Result<(), SetupError> {
 }
 
 async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
+    use tokio::io::AsyncWriteExt;
+
     let client = reqwest::Client::new();
     let resp = client.get(url).send().await.map_err(|e| {
         SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
@@ -262,14 +306,25 @@ async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
         )));
     }
 
-    let bytes = resp.bytes().await.map_err(|e| {
-        SetupError::AssetDownload(format!("failed to read response body from {}: {}", url, e))
-    })?;
+    // Stream to disk instead of buffering the whole response in memory.
+    // VM images can be hundreds of MB.
+    let mut file = tokio::fs::File::create(path).await.map_err(SetupError::Io)?;
+    let mut stream = resp.bytes_stream();
+    let mut total_bytes = 0u64;
 
-    std::fs::write(path, &bytes).map_err(SetupError::Io)?;
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            SetupError::AssetDownload(format!("failed to read response body from {}: {}", url, e))
+        })?;
+        file.write_all(&chunk).await.map_err(SetupError::Io)?;
+        total_bytes += chunk.len() as u64;
+    }
+    file.flush().await.map_err(SetupError::Io)?;
+
     tracing::info!(
         path = %path.display(),
-        bytes = bytes.len(),
+        bytes = total_bytes,
         "downloaded"
     );
     Ok(())
