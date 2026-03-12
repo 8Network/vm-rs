@@ -376,7 +376,12 @@ fn create_platform_driver() -> Result<Box<dyn VmDriver>, VmError> {
         Ok(Box::new(crate::driver::cloud_hv::CloudHvDriver::new()))
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(crate::driver::whp::WhpDriver::new()))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Err(VmError::Hypervisor(format!(
             "unsupported platform: {}",
