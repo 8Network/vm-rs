@@ -249,6 +249,33 @@ fn convert_to_raw(qcow2: &Path, raw: &Path) -> Result<(), SetupError> {
     Ok(())
 }
 
+async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
+    let client = reqwest::Client::new();
+    let resp = client.get(url).send().await.map_err(|e| {
+        SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(SetupError::AssetDownload(format!(
+            "HTTP {} for {}",
+            resp.status(),
+            url
+        )));
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| {
+        SetupError::AssetDownload(format!("failed to read response body from {}: {}", url, e))
+    })?;
+
+    std::fs::write(path, &bytes).map_err(SetupError::Io)?;
+    tracing::info!(
+        path = %path.display(),
+        bytes = bytes.len(),
+        "downloaded"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,31 +343,4 @@ mod tests {
         let assets = resolve_image(&spec).unwrap();
         assert!(assets[0].url.contains("amd64"));
     }
-}
-
-async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
-    let client = reqwest::Client::new();
-    let resp = client.get(url).send().await.map_err(|e| {
-        SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
-    })?;
-
-    if !resp.status().is_success() {
-        return Err(SetupError::AssetDownload(format!(
-            "HTTP {} for {}",
-            resp.status(),
-            url
-        )));
-    }
-
-    let bytes = resp.bytes().await.map_err(|e| {
-        SetupError::AssetDownload(format!("failed to read response body from {}: {}", url, e))
-    })?;
-
-    std::fs::write(path, &bytes).map_err(SetupError::Io)?;
-    tracing::info!(
-        path = %path.display(),
-        bytes = bytes.len(),
-        "downloaded"
-    );
-    Ok(())
 }

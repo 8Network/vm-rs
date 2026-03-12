@@ -27,7 +27,7 @@ impl VmManager {
     /// Typically `~/.vm-rs/vms/` for development or `/var/lib/vm-rs/` for production.
     pub fn new(base_dir: PathBuf) -> Result<Self, VmError> {
         let driver = create_platform_driver()?;
-        std::fs::create_dir_all(&base_dir).map_err(|e| VmError::Io(e))?;
+        std::fs::create_dir_all(&base_dir).map_err(VmError::Io)?;
         Ok(Self {
             driver,
             vms: RwLock::new(HashMap::new()),
@@ -37,7 +37,7 @@ impl VmManager {
 
     /// Create a VmManager with a specific driver (useful for testing).
     pub fn with_driver(driver: Box<dyn VmDriver>, base_dir: PathBuf) -> Result<Self, VmError> {
-        std::fs::create_dir_all(&base_dir).map_err(|e| VmError::Io(e))?;
+        std::fs::create_dir_all(&base_dir).map_err(VmError::Io)?;
         Ok(Self {
             driver,
             vms: RwLock::new(HashMap::new()),
@@ -75,7 +75,7 @@ impl VmManager {
 
         // Ensure VM directory exists
         let vm_dir = self.vm_dir(&config.name);
-        std::fs::create_dir_all(&vm_dir).map_err(|e| VmError::Io(e))?;
+        std::fs::create_dir_all(&vm_dir).map_err(VmError::Io)?;
 
         tracing::info!(
             vm = %config.name,
@@ -260,7 +260,7 @@ impl VmManager {
 
         // Ensure parent directory exists
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| VmError::Io(e))?;
+            std::fs::create_dir_all(parent).map_err(VmError::Io)?;
         }
 
         #[cfg(target_os = "macos")]
@@ -270,10 +270,10 @@ impl VmManager {
                 .arg(base)
                 .arg(target)
                 .status()
-                .map_err(|e| VmError::Io(e))?;
+                .map_err(VmError::Io)?;
             if !status.success() {
                 // Fallback to regular copy if APFS clone not supported
-                std::fs::copy(base, target).map_err(|e| VmError::Io(e))?;
+                std::fs::copy(base, target).map_err(VmError::Io)?;
             }
         }
 

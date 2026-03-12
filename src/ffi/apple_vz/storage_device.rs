@@ -51,6 +51,12 @@ pub struct VZDiskImageStorageDeviceAttachmentBuilder<Path, ReadOnly> {
     sync_mode: Option<VZDiskImageSynchronizationMode>,
 }
 
+impl Default for VZDiskImageStorageDeviceAttachmentBuilder<(), bool> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VZDiskImageStorageDeviceAttachmentBuilder<(), bool> {
     pub fn new() -> Self {
         VZDiskImageStorageDeviceAttachmentBuilder {
@@ -81,7 +87,7 @@ impl<Path, ReadOnly> VZDiskImageStorageDeviceAttachmentBuilder<Path, ReadOnly> {
     ) -> VZDiskImageStorageDeviceAttachmentBuilder<Path, bool> {
         VZDiskImageStorageDeviceAttachmentBuilder {
             path: self.path,
-            read_only: read_only,
+            read_only,
             caching_mode: self.caching_mode,
             sync_mode: self.sync_mode,
         }

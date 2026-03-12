@@ -37,6 +37,12 @@ pub struct VZVirtualMachineConfigurationBuilder {
     conf: VZVirtualMachineConfiguration,
 }
 
+impl Default for VZVirtualMachineConfigurationBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VZVirtualMachineConfigurationBuilder {
     pub fn new() -> Self {
         VZVirtualMachineConfigurationBuilder {
@@ -273,6 +279,8 @@ impl VZVirtualMachine {
         }
     }
 
+    /// # Safety
+    /// Must be called from the same dispatch queue that started the VM.
     pub unsafe fn request_stop_with_error(&mut self) -> Result<bool, NSError> {
         let mut error: Id = NIL;
         let ret: BOOL = msg_send![*self.0, requestStopWithError: &mut error];
@@ -290,6 +298,8 @@ impl VZVirtualMachine {
         }
     }
 
+    /// # Safety
+    /// Must be called from the same dispatch queue that owns the VM.
     pub unsafe fn state(&self) -> VZVirtualMachineState {
         let n: isize = msg_send![*self.0, state];
         match n {

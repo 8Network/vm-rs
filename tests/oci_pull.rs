@@ -101,7 +101,7 @@ async fn pull_busybox_and_verify_layers() {
         Ok(manifest) => {
             // busybox is typically 1 layer
             assert!(
-                manifest.layer_digests.len() >= 1,
+                !manifest.layer_digests.is_empty(),
                 "busybox should have at least 1 layer, got {}",
                 manifest.layer_digests.len()
             );

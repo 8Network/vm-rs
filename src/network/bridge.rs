@@ -31,7 +31,7 @@ pub fn ensure_bridge(name: &str, gateway_ip: &str, subnet_cidr: &str) -> Result<
     let cidr = format!(
         "{}/{}",
         gateway_ip,
-        subnet_cidr.split('/').last().unwrap_or("24")
+        subnet_cidr.split('/').next_back().unwrap_or("24")
     );
     if !addr_str.contains(&cidr) {
         run_ip(&["addr", "add", &cidr, "dev", name])?;

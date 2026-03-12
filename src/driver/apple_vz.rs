@@ -46,6 +46,12 @@ static VM_REGISTRY: std::sync::LazyLock<Mutex<HashMap<String, &'static VZVirtual
 /// Apple Virtualization.framework driver for macOS.
 pub struct AppleVzDriver;
 
+impl Default for AppleVzDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppleVzDriver {
     pub fn new() -> Self {
         AppleVzDriver
@@ -105,8 +111,8 @@ impl VmDriver for AppleVzDriver {
             .build();
 
         // Serial console → per-VM log file
-        let log_file = fs::File::create(&config.serial_log).map_err(|e| VmError::Io(e))?;
-        let null_file = fs::File::open("/dev/null").map_err(|e| VmError::Io(e))?;
+        let log_file = fs::File::create(&config.serial_log).map_err(VmError::Io)?;
+        let null_file = fs::File::open("/dev/null").map_err(VmError::Io)?;
 
         // SAFETY: into_raw_fd() transfers ownership; the fd is valid and open.
         let read_handle = unsafe { NSFileHandle::file_handle_with_fd(null_file.into_raw_fd()) };
@@ -346,7 +352,7 @@ fn resolve_path(path: &Path, label: &str) -> Result<String, VmError> {
         )));
     }
     fs::canonicalize(path)
-        .map_err(|e| VmError::Io(e))?
+        .map_err(VmError::Io)?
         .to_str()
         .ok_or_else(|| VmError::InvalidConfig(format!("non-UTF8 {} path", label)))
         .map(|s| s.to_string())

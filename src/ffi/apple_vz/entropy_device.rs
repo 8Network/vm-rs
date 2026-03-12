@@ -13,6 +13,12 @@ pub trait VZEntropyDeviceConfiguration {
 /// configure of entropy device
 pub struct VZVirtioEntropyDeviceConfiguration(StrongPtr);
 
+impl Default for VZVirtioEntropyDeviceConfiguration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VZVirtioEntropyDeviceConfiguration {
     pub fn new() -> VZVirtioEntropyDeviceConfiguration {
         unsafe {

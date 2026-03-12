@@ -44,15 +44,15 @@ fn test_base_dir() -> PathBuf {
     dir
 }
 
-fn make_config(name: &str, kernel: &PathBuf, initramfs: &PathBuf) -> VmConfig {
+fn make_config(name: &str, kernel: &std::path::Path, initramfs: &std::path::Path) -> VmConfig {
     let base = test_base_dir().join(name);
     std::fs::create_dir_all(&base).expect("failed to create VM dir");
 
     VmConfig {
         name: name.to_string(),
         namespace: "test".to_string(),
-        kernel: kernel.clone(),
-        initramfs: Some(initramfs.clone()),
+        kernel: kernel.to_path_buf(),
+        initramfs: Some(initramfs.to_path_buf()),
         root_disk: None,
         data_disk: None,
         seed_iso: None,

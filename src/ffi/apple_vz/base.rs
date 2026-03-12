@@ -37,7 +37,7 @@ impl<T> NSArray<T> {
                 msg_send![class!(NSArray), arrayWithObjects:objects.as_slice().as_ptr() count:objects.len()],
             );
             NSArray {
-                p: p,
+                p,
                 _phantom: PhantomData,
             }
         }
@@ -73,6 +73,10 @@ impl NSString {
         unsafe { msg_send![*self.0, lengthOfBytesUsingEncoding: UTF8_ENCODING] }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn as_str(&self) -> &str {
         unsafe {
             let bytes = {
@@ -81,7 +85,7 @@ impl NSString {
             };
             let len = self.len();
             let bytes = slice::from_raw_parts(bytes, len);
-            str::from_utf8(bytes).unwrap()
+            str::from_utf8(bytes).expect("NSString contained invalid UTF-8")
         }
     }
 }
@@ -131,6 +135,12 @@ impl NSURL {
 
 pub struct NSFileHandle(pub StrongPtr);
 
+impl Default for NSFileHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NSFileHandle {
     pub fn new() -> NSFileHandle {
         unsafe {
@@ -156,6 +166,9 @@ impl NSFileHandle {
         }
     }
 
+    /// # Safety
+    /// `fd` must be a valid, open file descriptor. The caller retains ownership —
+    /// the returned handle does NOT close the fd on drop (`closeOnDealloc: NO`).
     pub unsafe fn file_handle_with_fd(fd: i32) -> NSFileHandle {
         let alloc: Id = msg_send![class!(NSFileHandle), alloc];
         let p = StrongPtr::new(msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: NO]);

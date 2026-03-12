@@ -1,0 +1,8 @@
+# Clippy configuration for vm-rs
+#
+# This file prevents inheriting the parent monorepo's clippy.toml.
+# vm-rs is an open-source library with its own lint standards.
+
+# No disallowed methods — this is a library, not a service.
+# .ok() and .unwrap_or_default() are legitimate in library code
+# (e.g., best-effort config reading, iterator adapters).

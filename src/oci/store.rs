@@ -309,8 +309,7 @@ impl ImageStore {
 
                 // Handle whiteout files (.wh.*)
                 if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                    if filename.starts_with(".wh.") {
-                        let deleted_name = &filename[4..];
+                    if let Some(deleted_name) = filename.strip_prefix(".wh.") {
                         if deleted_name == ".wh..opq" {
                             if let Some(parent) = path.parent() {
                                 let full_parent = target.join(parent);
@@ -332,7 +331,7 @@ impl ImageStore {
                         } else if let Some(parent) = path.parent() {
                             let deleted_path = target.join(parent).join(deleted_name);
                             // Try file first, then directory — whiteout target could be either
-                            if let Err(_) = std::fs::remove_file(&deleted_path) {
+                            if std::fs::remove_file(&deleted_path).is_err() {
                                 if let Err(e) = std::fs::remove_dir_all(&deleted_path) {
                                     tracing::debug!(path = %deleted_path.display(), "whiteout target not found (may not exist in lower layers): {}", e);
                                 }
@@ -369,7 +368,7 @@ fn is_gzip(path: &Path) -> Result<bool, OciError> {
     let mut f = std::fs::File::open(path)?;
     let mut magic = [0u8; 2];
     use std::io::Read;
-    if f.read(&mut magic).map_err(|e| OciError::Io(e))? == 2 {
+    if f.read(&mut magic).map_err(OciError::Io)? == 2 {
         Ok(magic[0] == 0x1f && magic[1] == 0x8b)
     } else {
         Ok(false)

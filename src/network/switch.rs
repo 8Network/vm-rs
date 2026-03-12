@@ -79,6 +79,12 @@ pub struct NetworkSwitch {
     running: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl Default for NetworkSwitch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkSwitch {
     pub fn new() -> Self {
         Self {
@@ -105,7 +111,7 @@ impl NetworkSwitch {
         let mut networks = self
             .networks
             .lock()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("lock poisoned: {}", e)))?;
         networks
             .entry(network_id.to_string())
             .or_default()
@@ -114,7 +120,7 @@ impl NetworkSwitch {
         let mut mac_tables = self
             .mac_tables
             .write()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("lock poisoned: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("lock poisoned: {}", e)))?;
         mac_tables.entry(network_id.to_string()).or_default();
 
         Ok(vm_fd)
@@ -464,7 +470,7 @@ mod tests {
         switch.start().unwrap();
 
         // Build a minimal Ethernet frame: dst(6) + src(6) + ethertype(2) = 14 bytes
-        let mut frame = vec![0u8; 14];
+        let mut frame = [0u8; 14];
         // Broadcast destination
         frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
         // Source MAC
@@ -509,7 +515,7 @@ mod tests {
         switch.start().unwrap();
 
         // Broadcast frame from net-a
-        let mut frame = vec![0u8; 14];
+        let mut frame = [0u8; 14];
         frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
         frame[6..12].copy_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
         frame[12..14].copy_from_slice(&[0x08, 0x00]);

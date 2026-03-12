@@ -13,6 +13,12 @@ pub trait VZNetworkDeviceAttachment {
 /// configure of NAT network device attachment
 pub struct VZNATNetworkDeviceAttachment(StrongPtr);
 
+impl Default for VZNATNetworkDeviceAttachment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VZNATNetworkDeviceAttachment {
     pub fn new() -> VZNATNetworkDeviceAttachment {
         unsafe {
@@ -90,6 +96,12 @@ impl VZNetworkDeviceAttachment for VZFileHandleNetworkDeviceAttachment {
 
 /// MAC address
 pub struct VZMACAddress(pub StrongPtr);
+
+impl Default for VZMACAddress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl VZMACAddress {
     pub fn new() -> VZMACAddress {

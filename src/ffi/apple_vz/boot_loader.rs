@@ -26,6 +26,12 @@ pub struct VZLinuxBootLoaderBuilder<KernelURL, InitialRamdiskURL, CommandLine> {
     command_line: CommandLine,
 }
 
+impl Default for VZLinuxBootLoaderBuilder<(), (), ()> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VZLinuxBootLoaderBuilder<(), (), ()> {
     pub fn new() -> Self {
         VZLinuxBootLoaderBuilder {

@@ -25,6 +25,12 @@ pub struct VZFileHandleSerialPortAttachmentBuilder<R, W> {
     file_handle_for_writing: W,
 }
 
+impl Default for VZFileHandleSerialPortAttachmentBuilder<(), ()> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VZFileHandleSerialPortAttachmentBuilder<(), ()> {
     pub fn new() -> Self {
         VZFileHandleSerialPortAttachmentBuilder {
@@ -40,7 +46,7 @@ impl<R, W> VZFileHandleSerialPortAttachmentBuilder<R, W> {
         file_handle_for_reading: NSFileHandle,
     ) -> VZFileHandleSerialPortAttachmentBuilder<NSFileHandle, W> {
         VZFileHandleSerialPortAttachmentBuilder {
-            file_handle_for_reading: file_handle_for_reading,
+            file_handle_for_reading,
             file_handle_for_writing: self.file_handle_for_writing,
         }
     }
@@ -51,7 +57,7 @@ impl<R, W> VZFileHandleSerialPortAttachmentBuilder<R, W> {
     ) -> VZFileHandleSerialPortAttachmentBuilder<R, NSFileHandle> {
         VZFileHandleSerialPortAttachmentBuilder {
             file_handle_for_reading: self.file_handle_for_reading,
-            file_handle_for_writing: file_handle_for_writing,
+            file_handle_for_writing,
         }
     }
 }
