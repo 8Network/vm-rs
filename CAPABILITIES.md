@@ -13,8 +13,8 @@ macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 | Kill (force) | Supported | Supported | macOS: stopWithCompletionHandler (14+). Linux: SIGKILL |
 | Query state | Supported | Supported | Starting → Running → Stopped / Failed |
 | Reboot | Not wrapped | Planned | CH: `vm.reboot` or `ch-remote reboot` |
-| Pause / Resume | Not wrapped | Planned | VZ: pause/resume APIs. CH: `vm.pause` / `vm.resume` |
-| Save / Restore | Not wrapped | Planned | VZ: saveMachineStateTo/restoreMachineStateFrom. CH: snapshot |
+| Pause / Resume | Supported | Planned | VZ: pause/resume APIs. CH: `vm.pause` / `vm.resume` |
+| Save / Restore | Supported (FFI) | Planned | VZ: saveMachineStateTo/restoreMachineStateFrom (14+). CH: snapshot |
 | Delete/cleanup | Supported | Supported | Remove VM state and resources |
 | **CPU** | | | |
 | Set vCPU count | Supported | Supported | At boot time |
@@ -35,7 +35,7 @@ macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 | Disk resize | Not possible | Planned | CH: `vm.resize-disk` |
 | Disk CoW clone | Supported (APFS) | Supported (reflink) | Instant base image cloning |
 | Disk caching modes | Supported | Planned | Uncached / Cached / Auto |
-| NVMe storage | Not wrapped | Planned | VZ: VZNVMExpressControllerDevice (14+). CH: `--disk` |
+| NVMe storage | Supported (FFI) | Planned | VZ: VZNVMExpressControllerDeviceConfiguration (14+). CH: `--disk` |
 | NBD (network block) | Not wrapped | Not planned | VZ: VZNetworkBlockDeviceStorageDeviceAttachment (14+) |
 | Raw block device | Not wrapped | Not planned | VZ: VZDiskBlockDeviceStorageDeviceAttachment (14+) |
 | Disk rate limiting | Not possible | Planned | Token bucket throttle |
@@ -51,25 +51,25 @@ macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 | **Shared Directories** | | | |
 | VirtioFS | Supported (in-process) | Supported | macOS: native VZ. Linux: virtiofsd sidecar |
 | Read-only mounts | Supported | Supported | Immutable shared data |
-| Multiple dir shares | Not wrapped | Supported | VZ: VZMultipleDirectoryShare (12+) |
-| Rosetta (x86 on ARM) | Not wrapped | N/A | VZLinuxRosettaDirectoryShare (13+). Apple Silicon only |
+| Multiple dir shares | Supported (FFI) | Supported | VZ: VZMultipleDirectoryShare (12+) |
+| Rosetta (x86 on ARM) | Supported | N/A | VZLinuxRosettaDirectoryShare (13+). Apple Silicon only |
 | **Serial Console** | | | |
 | File output | Supported | Supported | Log serial to file |
 | Readiness detection | Supported | Supported | Parse `VMRS_READY` marker from console |
-| File attachment | Not wrapped | N/A | VZ: VZFileSerialPortAttachment (simpler than FileHandle) |
+| File attachment | Supported (FFI) | N/A | VZ: VZFileSerialPortAttachment (14+, simpler than FileHandle) |
 | **Entropy** | | | |
 | VirtIO RNG | Supported | Supported | /dev/random in guest |
 | **Inter-VM Communication** | | | |
-| vsock | Not wrapped | Planned | VZ: VZVirtioSocketDevice (11+). CH: CID-based |
+| vsock | Supported | Planned | VZ: VZVirtioSocketDevice (11+). CH: CID-based |
 | L2 switch (userspace) | Supported | N/A | macOS: learning bridge via socketpairs |
 | **Platform Configuration** | | | |
-| Generic platform | Not wrapped | N/A | VZGenericPlatformConfiguration (12+) |
-| Machine identifier | Not wrapped | N/A | VZGenericMachineIdentifier (13+). Persistent VM identity |
+| Generic platform | Supported | N/A | VZGenericPlatformConfiguration (12+) |
+| Machine identifier | Supported | N/A | VZGenericMachineIdentifier (13+). Persistent VM identity |
 | Nested virtualization | Not wrapped | N/A | macOS 15+: VZGenericPlatformConfiguration.nestedVirtualizationEnabled |
 | macOS guest boot | Not wrapped | N/A | VZMacOSBootLoader + VZMacPlatformConfiguration |
 | **Boot Modes** | | | |
 | Direct Linux boot | Supported | Supported | VZLinuxBootLoader / --kernel |
-| UEFI boot | Not wrapped | Planned | VZ: VZEFIBootLoader + VZEFIVariableStore (13+) |
+| UEFI boot | Supported | Planned | VZ: VZEFIBootLoader + VZEFIVariableStore (13+) |
 | **Security** | | | |
 | TPM | Not wrapped | Planned | Virtual Trusted Platform Module |
 | Entitlement signing | Supported | N/A | `com.apple.security.virtualization` |
@@ -90,40 +90,44 @@ macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 
 ## What to Implement Next (Priority Order)
 
-### P0 — Critical for reliability
+### P0 — Critical for reliability (RESOLVED)
 
-These are correctness bugs that affect the existing "Supported" features:
+All P0 items have been addressed in the current codebase:
 
-1. **VmManager::start() race condition** — duplicate-name check and boot are not atomic. Two concurrent calls can boot the same name twice, orphaning one VM.
-2. **NetworkSwitch FD use-after-close** — forwarding thread can read/write closed FDs after stop/drop. FD numbers are reusable, so this can corrupt unrelated resources.
-3. **Linux kill_by_handle PID reuse** — falls back to raw PID kill without verifying process identity. Can kill unrelated processes.
-4. **Image download OOM** — large images are fully buffered in memory before writing to disk. Should stream.
+1. ~~**VmManager::start() race condition**~~ — **Fixed**: write lock held across duplicate check + boot + insert.
+2. ~~**NetworkSwitch FD use-after-close**~~ — **Fixed**: `stop()` joins forwarding thread before Drop closes FDs.
+3. ~~**Linux kill_by_handle PID reuse**~~ — **Mitigated**: `Child` handle prevents PID reuse; raw PID fallback is documented and warned.
+4. ~~**Image download OOM**~~ — **Fixed**: uses `bytes_stream()` for streaming downloads.
 
-### P1 — Critical for usability
+### P1 — Critical for usability (DONE — macOS)
 
-These are the highest-value missing features for a headless Linux VM library:
+1. ~~**vsock (VZVirtioSocketDevice)**~~ — **Done**: Full FFI (config + runtime + connect + listen + connection FD). Wired into driver via `VmConfig::vsock`. Enable with `vsock: true`.
 
-1. **vsock (VZVirtioSocketDevice)** — THE primary host↔guest communication channel. Available since macOS 11.0. Low-latency, no network setup, bidirectional FD-based I/O. Use for: agent commands, health checks, file transfer. FFI already has `VZSocketDeviceConfiguration` trait but no concrete implementation.
+2. **Cloud Hypervisor API mode** — Switch from CLI-only to API socket mode. Required for all "Planned" CH features (hotplug, resize, pause, reboot, metrics). Single biggest unlock for Linux capabilities. **Still TODO**.
 
-2. **Cloud Hypervisor API mode** — Switch from CLI-only to API socket mode. Required for all "Planned" CH features (hotplug, resize, pause, reboot, metrics). Single biggest unlock for Linux capabilities.
+3. ~~**VZGenericPlatformConfiguration + VZGenericMachineIdentifier**~~ — **Done**: Auto-configured on every boot. Machine ID persisted in `VmHandle::machine_id` for caller to save/restore via `VmConfig::machine_id`.
 
-3. **VZGenericPlatformConfiguration + VZGenericMachineIdentifier** — Persistent VM identity across reboots. Required for proper machine identification by guests.
+4. ~~**UEFI boot (VZEFIBootLoader)**~~ — **Done**: Set `VmConfig::efi_variable_store` to enable. Auto-creates or opens the variable store file.
 
-4. **UEFI boot (VZEFIBootLoader)** — Required for booting arbitrary distro ISOs and UEFI-only images. Available since macOS 13.0.
+### P2 — Valuable enhancements (DONE — macOS)
 
-### P2 — Valuable enhancements
+5. ~~**Rosetta (VZLinuxRosettaDirectoryShare)**~~ — **Done**: Enable with `VmConfig::rosetta: true`. Auto-checks availability, adds VirtioFS share at tag "rosetta".
 
-5. **Rosetta (VZLinuxRosettaDirectoryShare)** — Run x86_64 binaries on ARM64 Linux guests. Critical for Apple Silicon compatibility. macOS 13+.
+6. ~~**Pause / Resume**~~ — **Done**: `VmDriver::pause()` / `resume()` + `VmManager::pause()` / `resume()`. Apple VZ fully implemented. `VmState::Paused` added.
 
-6. **Pause / Resume** — VZ has native `pause()` / `resume()` APIs. CH has `vm.pause` / `vm.resume`. Low-effort to implement on both.
+7. ~~**Save / Restore (VM snapshots)**~~ — **Done (FFI)**: `VZVirtualMachine::save_machine_state_to_url()` / `restore_machine_state_from_url()` wrapped. Higher-level driver integration can be added when needed.
 
-7. **Save / Restore (VM snapshots)** — VZ: `saveMachineStateTo` / `restoreMachineStateFrom`. CH: `vm.snapshot` / `vm.restore`. Full VM hibernation to disk.
+8. ~~**Multiple directory shares**~~ — **Done (FFI)**: `VZMultipleDirectoryShare` wrapped. Takes a map of tag → `VZSharedDirectory` pairs.
 
-8. **Multiple directory shares** — VZ: `VZMultipleDirectoryShare` allows multiple host dirs under one VirtioFS device. Cleaner than one device per share.
+9. ~~**NVMe storage**~~ — **Done (FFI)**: `VZNVMExpressControllerDeviceConfiguration` wrapped. Same attachment API as VirtioBlock.
 
-9. **NVMe storage** — VZ: `VZNVMExpressControllerDeviceConfiguration` (14+). Better performance than VirtioBlock for I/O-heavy workloads.
+10. ~~**VZFileSerialPortAttachment**~~ — **Done (FFI)**: Wrapped. Takes a file path + append flag. Simpler than the FileHandle approach.
 
-10. **VZFileSerialPortAttachment** — Simpler serial logging (direct file URL, no FileHandle/fd management).
+### Remaining work
+
+1. **Cloud Hypervisor API mode** (P1) — the only P1 item not yet done. Requires HTTP-over-Unix-socket client for `ch-remote` equivalent.
+2. **CH pause/resume** — needs API mode first.
+3. **Wire NVMe, multiple dir shares, file serial attachment into driver** — FFI is done but not yet wired into the Apple VZ driver's boot path. Easy to add when needed.
 
 ## Driver Architecture
 
@@ -209,7 +213,7 @@ Our FFI bindings (absorbed from virtualization-rs, MIT license) wrap:
 |---|---|---|---|
 | VZLinuxBootLoader | Yes | Yes | Working |
 | VZVirtualMachineConfiguration | Yes | Yes | Working |
-| VZVirtualMachine | Yes | Yes | Working (start, stop, kill, state) |
+| VZVirtualMachine | Yes | Yes | Working (start, stop, kill, state, pause, resume, save, restore) |
 | VZVirtioBlockDeviceConfiguration | Yes | Yes | Working |
 | VZDiskImageStorageDeviceAttachment | Yes | Yes | Working (with caching/sync modes) |
 | VZVirtioNetworkDeviceConfiguration | Yes | Yes | Working |
@@ -224,20 +228,20 @@ Our FFI bindings (absorbed from virtualization-rs, MIT license) wrap:
 | VZSingleDirectoryShare | Yes | Yes | Working |
 | VZSharedDirectory | Yes | Yes | Working |
 | VZMACAddress | Yes | Yes | Working (fixed retain/release) |
-| VZSocketDeviceConfiguration (trait) | Yes | No | Trait only, no concrete impl |
+| VZSocketDeviceConfiguration (trait) | Yes | Yes | Working with concrete VZVirtioSocketDeviceConfiguration |
+| VZVirtioSocketDeviceConfiguration | Yes | Yes | Working — vsock config |
+| VZVirtioSocketDevice | Yes | Yes | Working — runtime connect/listen |
+| VZVirtioSocketListener | Yes | Yes | Working — accept guest connections |
+| VZVirtioSocketConnection | Yes | Yes | Working — FD-based bidirectional I/O |
+| VZGenericPlatformConfiguration | Yes | Yes | Working — Linux VM platform (12+) |
+| VZGenericMachineIdentifier | Yes | Yes | Working — persistent VM identity (13+) |
+| VZEFIBootLoader | Yes | Yes | Working — UEFI boot (13+) |
+| VZEFIVariableStore | Yes | Yes | Working — UEFI NVRAM (13+) |
+| VZLinuxRosettaDirectoryShare | Yes | Yes | Working — x86 on ARM translation (13+) |
+| VZMultipleDirectoryShare | Yes | No | Working — multi-dir VirtioFS (12+) |
+| VZFileSerialPortAttachment | Yes | No | Working — simpler serial logging (14+) |
+| VZNVMExpressControllerDeviceConfiguration | Yes | No | Working — NVMe storage (14+) |
 | **Not yet wrapped** | | | |
-| VZVirtioSocketDeviceConfiguration | No | — | P1: vsock config |
-| VZVirtioSocketDevice | No | — | P1: vsock runtime (connect, listen) |
-| VZVirtioSocketListener | No | — | P1: accept guest connections |
-| VZVirtioSocketConnection | No | — | P1: FD-based bidirectional I/O |
-| VZGenericPlatformConfiguration | No | — | P1: Linux VM platform |
-| VZGenericMachineIdentifier | No | — | P1: persistent VM identity |
-| VZEFIBootLoader | No | — | P1: UEFI boot |
-| VZEFIVariableStore | No | — | P1: UEFI NVRAM |
-| VZLinuxRosettaDirectoryShare | No | — | P2: x86 on ARM translation |
-| VZMultipleDirectoryShare | No | — | P2: multi-dir VirtioFS |
-| VZFileSerialPortAttachment | No | — | P2: simpler serial logging |
-| VZNVMExpressControllerDeviceConfiguration | No | — | P2: NVMe storage (14+) |
 | VZMacOSBootLoader | No | — | Not planned (macOS guest) |
 | VZMacPlatformConfiguration | No | — | Not planned (macOS guest) |
 | VZGraphicsDeviceConfiguration | No | — | Not planned (headless) |

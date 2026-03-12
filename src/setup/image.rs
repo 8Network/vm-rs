@@ -59,7 +59,8 @@ pub struct PreparedImage {
     /// Path to the initramfs (if the distro provides one).
     pub initramfs: Option<PathBuf>,
     /// Path to the root disk image (raw format, ready for CoW cloning).
-    pub disk: PathBuf,
+    /// `None` for diskless distros (e.g., Alpine netboot with tmpfs rootfs).
+    pub disk: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,8 @@ pub struct PreparedImage {
 struct ImageAsset {
     filename: &'static str,
     url: String,
+    /// Expected SHA-256 hex digest for verification. `None` means log-only (no comparison).
+    expected_sha256: Option<&'static str>,
 }
 
 /// Resolve an image spec to download URLs.
@@ -106,14 +109,17 @@ fn resolve_ubuntu(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
         ImageAsset {
             filename: "vmlinuz",
             url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"),
+            expected_sha256: None,
         },
         ImageAsset {
             filename: "initramfs",
             url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"),
+            expected_sha256: None,
         },
         ImageAsset {
             filename: "disk.img",
             url: format!("{base}/ubuntu-{version}-server-cloudimg-{arch_str}.img"),
+            expected_sha256: None,
         },
     ])
 }
@@ -133,10 +139,12 @@ fn resolve_alpine(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
         ImageAsset {
             filename: "vmlinuz",
             url: format!("{base}/netboot/vmlinuz-virt"),
+            expected_sha256: None,
         },
         ImageAsset {
             filename: "initramfs",
             url: format!("{base}/netboot/initramfs-virt"),
+            expected_sha256: None,
         },
     ])
 }
@@ -174,7 +182,7 @@ pub async fn prepare_image(
         }
         tracing::info!(file = %asset.filename, url = %asset.url, "downloading");
         download_file(&asset.url, &path).await?;
-        verify_download(&path, asset.filename)?;
+        verify_download(&path, asset.filename, asset.expected_sha256)?;
     }
 
     let kernel = image_dir.join("vmlinuz");
@@ -185,7 +193,15 @@ pub async fn prepare_image(
         None
     };
 
-    // On macOS, Apple VZ needs raw disk images — convert from QCOW2 if needed
+    if !kernel.exists() {
+        return Err(SetupError::AssetDownload(format!(
+            "kernel not found after download: {}",
+            kernel.display()
+        )));
+    }
+
+    // On macOS, Apple VZ needs raw disk images — convert from QCOW2 if needed.
+    // Disk is optional: diskless distros (e.g., Alpine netboot) have no disk asset.
     let disk_downloaded = image_dir.join("disk.img");
     let disk = if cfg!(target_os = "macos") {
         let raw_path = image_dir.join("disk.raw");
@@ -193,26 +209,17 @@ pub async fn prepare_image(
             convert_to_raw(&disk_downloaded, &raw_path)?;
         }
         if raw_path.exists() {
-            raw_path
+            Some(raw_path)
+        } else if disk_downloaded.exists() {
+            Some(disk_downloaded)
         } else {
-            disk_downloaded
+            None
         }
+    } else if disk_downloaded.exists() {
+        Some(disk_downloaded)
     } else {
-        disk_downloaded
+        None
     };
-
-    if !kernel.exists() {
-        return Err(SetupError::AssetDownload(format!(
-            "kernel not found after download: {}",
-            kernel.display()
-        )));
-    }
-    if !disk.exists() {
-        return Err(SetupError::AssetDownload(format!(
-            "disk image not found after download: {}",
-            disk.display()
-        )));
-    }
 
     Ok(PreparedImage {
         kernel,
@@ -225,22 +232,30 @@ pub async fn prepare_image(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Verify a downloaded file: non-empty check + SHA-256 digest logging.
+/// Verify a downloaded file: non-empty check + SHA-256 digest verification.
 ///
 /// Rejects zero-byte downloads (indicates server error or truncated transfer).
-/// Logs the SHA-256 digest for manual verification and forensic auditing.
-fn verify_download(path: &Path, filename: &str) -> Result<(), SetupError> {
+/// When `expected_sha256` is `Some`, the computed digest is compared and an error
+/// is returned on mismatch. When `None`, the digest is logged for manual auditing only.
+fn verify_download(
+    path: &Path,
+    filename: &str,
+    expected_sha256: Option<&str>,
+) -> Result<(), SetupError> {
     let metadata = std::fs::metadata(path).map_err(SetupError::Io)?;
     if metadata.len() == 0 {
         // Remove the empty file so it isn't treated as cached on retry
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path).map_err(|e| {
+            tracing::error!(path = %path.display(), "failed to remove empty download: {e}");
+            SetupError::Io(e)
+        })?;
         return Err(SetupError::AssetDownload(format!(
             "downloaded file is empty (0 bytes): {}",
             filename
         )));
     }
 
-    // Compute SHA-256 for integrity auditing.
+    // Compute SHA-256 for integrity verification.
     // Reads in 64KB chunks to avoid buffering large images.
     let mut file = std::fs::File::open(path).map_err(SetupError::Io)?;
     let mut hasher = Sha256::new();
@@ -254,6 +269,16 @@ fn verify_download(path: &Path, filename: &str) -> Result<(), SetupError> {
         hasher.update(&buf[..n]);
     }
     let digest = format!("{:x}", hasher.finalize());
+
+    if let Some(expected) = expected_sha256 {
+        if digest != expected {
+            return Err(SetupError::AssetDownload(format!(
+                "SHA-256 mismatch for {}: expected {}, got {}",
+                filename, expected, digest
+            )));
+        }
+    }
+
     tracing::info!(
         file = filename,
         bytes = metadata.len(),
@@ -291,6 +316,33 @@ fn convert_to_raw(qcow2: &Path, raw: &Path) -> Result<(), SetupError> {
 }
 
 async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
+    // Write to a sibling temp file so interrupted downloads cannot poison the cache.
+    // The final atomic rename only happens after fsync succeeds.
+    let filename = path
+        .file_name()
+        .map(|n| format!(".{}.tmp", n.to_string_lossy()))
+        .unwrap_or_else(|| ".download.tmp".into());
+    let tmp_path = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(&filename);
+
+    let result = download_file_to_tmp(url, path, &tmp_path).await;
+    if result.is_err() {
+        if tmp_path.exists() {
+            if let Err(e) = std::fs::remove_file(&tmp_path) {
+                tracing::warn!(path = %tmp_path.display(), "failed to clean up temp download: {e}");
+            }
+        }
+    }
+    result
+}
+
+async fn download_file_to_tmp(
+    url: &str,
+    final_path: &Path,
+    tmp_path: &Path,
+) -> Result<(), SetupError> {
     use tokio::io::AsyncWriteExt;
 
     let client = reqwest::Client::new();
@@ -308,7 +360,7 @@ async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
 
     // Stream to disk instead of buffering the whole response in memory.
     // VM images can be hundreds of MB.
-    let mut file = tokio::fs::File::create(path)
+    let mut file = tokio::fs::File::create(tmp_path)
         .await
         .map_err(SetupError::Io)?;
     let mut stream = resp.bytes_stream();
@@ -323,9 +375,15 @@ async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
         total_bytes += chunk.len() as u64;
     }
     file.flush().await.map_err(SetupError::Io)?;
+    // fsync so the data is durable before we expose it via rename
+    file.sync_all().await.map_err(SetupError::Io)?;
+    drop(file);
+
+    // Atomic rename: the final path is either intact or absent — never partial.
+    std::fs::rename(tmp_path, final_path).map_err(SetupError::Io)?;
 
     tracing::info!(
-        path = %path.display(),
+        path = %final_path.display(),
         bytes = total_bytes,
         "downloaded"
     );

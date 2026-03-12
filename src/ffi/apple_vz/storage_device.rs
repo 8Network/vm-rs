@@ -199,3 +199,38 @@ impl VZStorageDeviceConfiguration for VZVirtioBlockDeviceConfiguration {
         *self.0
     }
 }
+
+// ─── NVMe Storage (macOS 14+) ──────────────────────────────────────────
+
+/// NVMe storage device configuration (macOS 14+).
+///
+/// Provides better I/O performance than VirtioBlock for storage-intensive workloads.
+/// Uses the same `VZDiskImageStorageDeviceAttachment` as VirtioBlock.
+///
+/// # Examples
+///
+/// ```ignore
+/// let attachment = VZDiskImageStorageDeviceAttachmentBuilder::new()
+///     .path("/path/to/disk.img")
+///     .read_only(false)
+///     .build()
+///     .expect("disk attachment");
+/// let nvme = VZNVMExpressControllerDeviceConfiguration::new(attachment);
+/// ```
+pub struct VZNVMExpressControllerDeviceConfiguration(StrongPtr);
+
+impl VZNVMExpressControllerDeviceConfiguration {
+    pub fn new<T: VZStorageDeviceAttachment>(attachment: T) -> Self {
+        unsafe {
+            let alloc: Id = msg_send![class!(VZNVMExpressControllerDeviceConfiguration), alloc];
+            let p = StrongPtr::new(msg_send![alloc, initWithAttachment:attachment.id()]);
+            VZNVMExpressControllerDeviceConfiguration(p)
+        }
+    }
+}
+
+impl VZStorageDeviceConfiguration for VZNVMExpressControllerDeviceConfiguration {
+    fn id(&self) -> Id {
+        *self.0
+    }
+}

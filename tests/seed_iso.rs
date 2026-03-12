@@ -89,7 +89,8 @@ fn create_full_config_seed_iso() {
             },
         ],
         process: Some(ProcessConfig {
-            command: "/usr/bin/nginx -g 'daemon off;'".to_string(),
+            command: "/usr/bin/nginx".to_string(),
+            args: vec!["-g".to_string(), "daemon off;".to_string()],
             workdir: Some("/var/www".to_string()),
             env: vec![
                 ("PORT".to_string(), "8080".to_string()),

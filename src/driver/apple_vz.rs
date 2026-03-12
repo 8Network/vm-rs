@@ -21,22 +21,23 @@ use block::{Block, ConcreteBlock};
 use objc::rc::StrongPtr;
 
 use crate::ffi::apple_vz::{
-    base::{
-        dispatch_async, dispatch_queue_create, Id, NSError, NSFileHandle, NIL,
-    },
-    boot_loader::VZLinuxBootLoaderBuilder,
+    base::{dispatch_async, dispatch_queue_create, Id, NSError, NSFileHandle, NIL},
+    boot_loader::{VZEFIBootLoader, VZEFIVariableStore, VZLinuxBootLoaderBuilder},
     entropy_device::VZVirtioEntropyDeviceConfiguration,
     memory_device::VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
     network_device::{
         VZFileHandleNetworkDeviceAttachment, VZMACAddress, VZNATNetworkDeviceAttachment,
         VZVirtioNetworkDeviceConfiguration,
     },
+    platform::{VZGenericMachineIdentifier, VZGenericPlatformConfiguration},
     serial_port::{
         VZFileHandleSerialPortAttachmentBuilder, VZVirtioConsoleDeviceSerialPortConfiguration,
     },
     shared_directory::{
-        VZSharedDirectory, VZSingleDirectoryShare, VZVirtioFileSystemDeviceConfiguration,
+        VZLinuxRosettaAvailability, VZLinuxRosettaDirectoryShare, VZSharedDirectory,
+        VZSingleDirectoryShare, VZVirtioFileSystemDeviceConfiguration,
     },
+    socket_device::VZVirtioSocketDeviceConfiguration,
     storage_device::{
         VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachmentBuilder,
         VZDiskImageSynchronizationMode, VZVirtioBlockDeviceConfiguration,
@@ -50,8 +51,12 @@ use crate::config::{NetworkAttachment, VmConfig, VmHandle, VmState};
 use crate::driver::{VmDriver, VmError};
 
 /// Per-VM state stored in the global registry.
+///
+/// The `VZVirtualMachine` must stay alive for the VM to keep running.
+/// We store it in a `Pin<Box<>>` to prevent moves and ensure stable
+/// memory addresses for ObjC reference counting.
 struct VmEntry {
-    vm: &'static VZVirtualMachine,
+    vm: std::pin::Pin<Box<VZVirtualMachine>>,
     queue: Id, // GCD dispatch queue for this VM
 }
 
@@ -113,9 +118,16 @@ impl VmDriver for AppleVzDriver {
             .map(|p| resolve_path(p, "seed ISO"))
             .transpose()?;
 
-        let initrd = initrd_abs.ok_or_else(|| {
-            VmError::InvalidConfig("initramfs is required for Apple VZ boot".into())
-        })?;
+        let use_uefi = config.efi_variable_store.is_some();
+
+        // For direct Linux boot, initramfs is required
+        if !use_uefi && initrd_abs.is_none() {
+            return Err(VmError::InvalidConfig(
+                "initramfs is required for direct Linux boot on Apple VZ".into(),
+            ));
+        }
+
+        let initrd = initrd_abs;
 
         let default_cmdline = if disk_abs.is_some() {
             "console=hvc0 root=/dev/vda1 rw ds=nocloud"
@@ -146,6 +158,12 @@ impl VmDriver for AppleVzDriver {
             .map_err(VmError::Io)?
             .into_raw_fd();
 
+        // New capability flags
+        let enable_vsock = config.vsock;
+        let enable_rosetta = config.rosetta;
+        let machine_id_bytes = config.machine_id.clone();
+        let efi_store_path = config.efi_variable_store.clone();
+
         // ── Step 2: Create GCD queue (C function, no ObjC autorelease) ──
 
         let label =
@@ -162,13 +180,17 @@ impl VmDriver for AppleVzDriver {
         // autoreleased objects stay on the queue's thread — never polluting
         // the caller's TLS pool. This prevents SIGSEGV at thread exit.
 
-        let (tx, rx) = std::sync::mpsc::channel::<Result<VmHandle, VmError>>();
+        type BootResult = Result<
+            (VmHandle, std::sync::mpsc::Receiver<Result<(), String>>),
+            VmError,
+        >;
+        let (tx, rx) = std::sync::mpsc::channel::<BootResult>();
         let name_q = name.clone();
         let namespace_q = namespace.clone();
         let serial_log_q = serial_log.clone();
 
         let boot_block = ConcreteBlock::new(move || {
-            let result = (|| -> Result<VmHandle, VmError> {
+            let result = (|| -> Result<(VmHandle, std::sync::mpsc::Receiver<Result<(), String>>), VmError> {
                 // Check VZ support (ObjC class method)
                 if !VZVirtualMachine::supported() {
                     return Err(VmError::Hypervisor(
@@ -176,19 +198,73 @@ impl VmDriver for AppleVzDriver {
                     ));
                 }
 
-                // Boot loader — direct Linux boot
-                let boot_loader = VZLinuxBootLoaderBuilder::new()
-                    .kernel_url(&kernel_abs)
-                    .initial_ramdisk_url(&initrd)
-                    .command_line(&cmdline)
-                    .build();
+                // ── Boot loader ──
 
-                // Serial console → per-VM log file
+                let boot_loader_id: Id = if let Some(ref efi_path) = efi_store_path {
+                    // UEFI boot (macOS 13+)
+                    let efi_path_str = efi_path.to_str().ok_or_else(|| {
+                        VmError::InvalidConfig("non-UTF8 EFI variable store path".into())
+                    })?;
+                    let store = if efi_path.exists() {
+                        VZEFIVariableStore::open(efi_path_str).map_err(|e| {
+                            VmError::BootFailed {
+                                name: name_q.clone(),
+                                detail: format!(
+                                    "failed to open EFI variable store: code {}",
+                                    e.code()
+                                ),
+                            }
+                        })?
+                    } else {
+                        VZEFIVariableStore::create(efi_path_str).map_err(|e| {
+                            VmError::BootFailed {
+                                name: name_q.clone(),
+                                detail: format!(
+                                    "failed to create EFI variable store: code {}",
+                                    e.code()
+                                ),
+                            }
+                        })?
+                    };
+                    let efi_loader = VZEFIBootLoader::new(&store);
+                    use crate::ffi::apple_vz::boot_loader::VZBootLoader;
+                    efi_loader.id()
+                } else {
+                    // Direct Linux boot
+                    let initrd_str = initrd.as_deref().ok_or_else(|| {
+                        VmError::InvalidConfig("initramfs required for Linux boot".into())
+                    })?;
+                    let loader = VZLinuxBootLoaderBuilder::new()
+                        .kernel_url(&kernel_abs)
+                        .initial_ramdisk_url(initrd_str)
+                        .command_line(&cmdline)
+                        .build();
+                    use crate::ffi::apple_vz::boot_loader::VZBootLoader;
+                    loader.id()
+                };
+
+                // ── Platform configuration (macOS 12+) ──
+
+                let mut platform = VZGenericPlatformConfiguration::new();
+                let machine_id = if let Some(ref bytes) = machine_id_bytes {
+                    VZGenericMachineIdentifier::from_data(bytes).unwrap_or_else(|| {
+                        tracing::warn!(
+                            vm = %name_q,
+                            "invalid machine_id bytes, generating new identifier"
+                        );
+                        VZGenericMachineIdentifier::new()
+                    })
+                } else {
+                    VZGenericMachineIdentifier::new()
+                };
+                let machine_id_data = machine_id.data_representation();
+                platform.set_machine_identifier(&machine_id);
+
+                // ── Serial console → per-VM log file ──
+
                 // SAFETY: fds are valid (opened on caller thread, ownership transferred here).
-                let read_handle =
-                    unsafe { NSFileHandle::file_handle_with_fd_owned(null_fd) };
-                let write_handle =
-                    unsafe { NSFileHandle::file_handle_with_fd_owned(log_fd) };
+                let read_handle = unsafe { NSFileHandle::file_handle_with_fd_owned(null_fd) };
+                let write_handle = unsafe { NSFileHandle::file_handle_with_fd_owned(log_fd) };
                 let serial_attachment = VZFileHandleSerialPortAttachmentBuilder::new()
                     .file_handle_for_reading(read_handle)
                     .file_handle_for_writing(write_handle)
@@ -200,11 +276,12 @@ impl VmDriver for AppleVzDriver {
                 let memory_balloon =
                     VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new();
 
+                // ── Network devices ──
+
                 // NIC 1: NAT
                 let nat_attachment = VZNATNetworkDeviceAttachment::new();
                 let mut nat_nic = VZVirtioNetworkDeviceConfiguration::new(nat_attachment);
-                nat_nic
-                    .set_mac_address(VZMACAddress::random_locally_administered_address());
+                nat_nic.set_mac_address(VZMACAddress::random_locally_administered_address());
                 let mut network_devices = vec![nat_nic];
 
                 // NIC 2+: FileHandle per network
@@ -215,8 +292,7 @@ impl VmDriver for AppleVzDriver {
                             unsafe { NSFileHandle::file_handle_with_fd_borrowed(*fd) };
                         let fh_attachment =
                             VZFileHandleNetworkDeviceAttachment::new(file_handle);
-                        let mut nic =
-                            VZVirtioNetworkDeviceConfiguration::new(fh_attachment);
+                        let mut nic = VZVirtioNetworkDeviceConfiguration::new(fh_attachment);
                         nic.set_mac_address(
                             VZMACAddress::random_locally_administered_address(),
                         );
@@ -224,7 +300,8 @@ impl VmDriver for AppleVzDriver {
                     }
                 }
 
-                // Disks
+                // ── Disks ──
+
                 let mut storage_devices: Vec<VZVirtioBlockDeviceConfiguration> = Vec::new();
                 if let Some(ref disk_path) = disk_abs {
                     let root_attachment = VZDiskImageStorageDeviceAttachmentBuilder::new()
@@ -259,7 +336,8 @@ impl VmDriver for AppleVzDriver {
                         .push(VZVirtioBlockDeviceConfiguration::new(seed_attachment));
                 }
 
-                // VirtioFS shared directories
+                // ── VirtioFS shared directories ──
+
                 let mut vz_shared_dirs: Vec<VZVirtioFileSystemDeviceConfiguration> =
                     Vec::new();
                 for vol in &shared_dirs {
@@ -274,19 +352,69 @@ impl VmDriver for AppleVzDriver {
                     vz_shared_dirs.push(fs_device);
                 }
 
-                // Assemble VM configuration
+                // ── Rosetta x86_64 translation (macOS 13+, Apple Silicon) ──
+
+                if enable_rosetta {
+                    match VZLinuxRosettaDirectoryShare::availability() {
+                        VZLinuxRosettaAvailability::Installed => {
+                            let rosetta = VZLinuxRosettaDirectoryShare::new();
+                            let mut fs_device =
+                                VZVirtioFileSystemDeviceConfiguration::new("rosetta");
+                            fs_device.set_share(rosetta);
+                            vz_shared_dirs.push(fs_device);
+                            tracing::info!(vm = %name_q, "Rosetta x86_64 translation enabled");
+                        }
+                        VZLinuxRosettaAvailability::NotInstalled => {
+                            return Err(VmError::InvalidConfig(
+                                "Rosetta is supported but not installed. Run: \
+                                 softwareupdate --install-rosetta"
+                                    .into(),
+                            ));
+                        }
+                        VZLinuxRosettaAvailability::NotSupported => {
+                            return Err(VmError::InvalidConfig(
+                                "Rosetta is not supported on this machine \
+                                 (requires Apple Silicon)"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+
+                // ── vsock device ──
+
+                let vsock_devices = if enable_vsock {
+                    vec![VZVirtioSocketDeviceConfiguration::new()]
+                } else {
+                    vec![]
+                };
+
+                // ── Assemble VM configuration ──
+
+                // Boot loader — use a wrapper struct to pass the raw Id
+                struct RawBootLoader(Id);
+                impl crate::ffi::apple_vz::boot_loader::VZBootLoader for RawBootLoader {
+                    fn id(&self) -> Id {
+                        self.0
+                    }
+                }
+
                 let mut builder = VZVirtualMachineConfigurationBuilder::new()
-                    .boot_loader(boot_loader)
+                    .boot_loader(RawBootLoader(boot_loader_id))
                     .cpu_count(cpus)
                     .memory_size(memory_bytes)
                     .entropy_devices(vec![entropy])
                     .memory_balloon_devices(vec![memory_balloon])
                     .network_devices(network_devices)
                     .serial_ports(vec![serial])
-                    .storage_devices(storage_devices);
+                    .storage_devices(storage_devices)
+                    .platform(platform);
 
                 if !vz_shared_dirs.is_empty() {
                     builder = builder.directory_sharing_devices(vz_shared_dirs);
+                }
+                if !vsock_devices.is_empty() {
+                    builder = builder.socket_devices(vsock_devices);
                 }
 
                 let vm_config = builder.build();
@@ -305,11 +433,10 @@ impl VmDriver for AppleVzDriver {
 
                 // Create VM on this queue
                 let vm = VZVirtualMachine::new(vm_config, queue);
+                let vm_boxed = Box::pin(vm);
 
-                // Box::leak: keep VZVirtualMachine alive for the process lifetime.
-                let vm_leaked: &'static VZVirtualMachine = Box::leak(Box::new(vm));
-
-                // Register for graceful shutdown
+                // Register VM — the Pin<Box<>> keeps it alive and at a
+                // stable address. Removing from registry drops the VM.
                 {
                     let mut registry = VM_REGISTRY.lock().map_err(|e| {
                         VmError::Hypervisor(format!("VM registry lock poisoned: {}", e))
@@ -317,38 +444,75 @@ impl VmDriver for AppleVzDriver {
                     registry.insert(
                         name_q.clone(),
                         VmEntry {
-                            vm: vm_leaked,
+                            vm: vm_boxed,
                             queue,
                         },
                     );
                 }
 
-                // Start VM (we're already on the VM's dispatch queue)
+                // SAFETY: We need a &VZVirtualMachine for the start call.
+                // The VM is pinned in the registry and won't move or be
+                // dropped while we hold the registry lock (released above).
+                // The GCD queue keeps a reference via ObjC retain count.
+                let vm_ref: &VZVirtualMachine = {
+                    let registry = VM_REGISTRY.lock().map_err(|e| {
+                        VmError::Hypervisor(format!("VM registry lock poisoned: {}", e))
+                    })?;
+                    let entry = registry.get(&name_q).ok_or_else(|| {
+                        VmError::Hypervisor("VM disappeared from registry".into())
+                    })?;
+                    // SAFETY: Pointer is stable because Pin<Box<>> prevents
+                    // moves. The VM lives as long as it's in the registry.
+                    unsafe { &*((&*entry.vm) as *const VZVirtualMachine) }
+                };
+
+                // Start VM (we're already on the VM's dispatch queue).
+                // Wait for the start completion handler to confirm the VM
+                // actually started — do not return success prematurely.
+                let (start_tx, start_rx) =
+                    std::sync::mpsc::channel::<Result<(), String>>();
                 let name_for_err = name_q.clone();
                 let completion_handler = ConcreteBlock::new(move |err: Id| {
                     if err == NIL {
                         tracing::info!("VM '{}' started successfully", name_for_err);
+                        let _ = start_tx.send(Ok(()));
                     } else {
                         // SAFETY: err is a valid NSError from the framework.
                         let error = unsafe { NSError(StrongPtr::retain(err)) };
+                        let detail = format!("start error code {}", error.code());
                         tracing::error!(
-                            "VM '{}' start FAILED (error code {})",
+                            "VM '{}' start FAILED: {}",
                             name_for_err,
-                            error.code()
+                            detail
                         );
+                        let _ = start_tx.send(Err(detail));
                     }
                 });
                 let completion_handler = completion_handler.copy();
                 let completion_handler: &Block<(Id,), ()> = &completion_handler;
-                vm_leaked.start_with_completion_handler(completion_handler);
+                vm_ref.start_with_completion_handler(completion_handler);
 
-                Ok(VmHandle {
-                    name: name_q.clone(),
-                    namespace: namespace_q.clone(),
-                    state: VmState::Starting,
-                    pid: None, // Apple VZ runs in-process, no separate PID
-                    serial_log: serial_log_q.clone(),
-                })
+                // The completion handler fires asynchronously on this same
+                // GCD queue, so we must return from this block first.
+                // The outer recv on `rx` handles the boot() result; we
+                // stash start_rx in a second channel read below.
+                //
+                // Since we're inside the GCD block, we can't block here
+                // waiting for start_rx (the completion runs on this queue).
+                // Instead, pass start_rx out through the boot result so
+                // the caller thread can wait for it.
+
+                Ok((
+                    VmHandle {
+                        name: name_q.clone(),
+                        namespace: namespace_q.clone(),
+                        state: VmState::Starting,
+                        pid: None, // Apple VZ runs in-process, no separate PID
+                        serial_log: serial_log_q.clone(),
+                        machine_id: Some(machine_id_data),
+                    },
+                    start_rx,
+                ))
             })();
 
             let _ = tx.send(result);
@@ -363,16 +527,44 @@ impl VmDriver for AppleVzDriver {
 
         // ── Step 4: Wait for result ──
 
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(result) => {
-                // Give the VM a moment to fire the start completion handler
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                result
+        // Wait for the GCD block to finish configuration + start call
+        let (handle, start_rx) =
+            match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(VmError::BootFailed {
+                        name,
+                        detail: "boot timed out after 10s (GCD block did not execute)"
+                            .into(),
+                    })
+                }
+            };
+
+        // Now wait for the actual start completion handler to confirm the
+        // VM started. This fires asynchronously on the GCD queue.
+        match start_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(())) => Ok(handle),
+            Ok(Err(detail)) => {
+                // VM start failed — remove from registry
+                if let Ok(mut registry) = VM_REGISTRY.lock() {
+                    registry.remove(&handle.name);
+                }
+                Err(VmError::BootFailed {
+                    name: handle.name,
+                    detail,
+                })
             }
-            Err(_) => Err(VmError::BootFailed {
-                name,
-                detail: "boot timed out after 10s (GCD block did not execute)".into(),
-            }),
+            Err(_) => {
+                // Timeout waiting for start confirmation — VM may still
+                // be starting (large kernels, slow disks). Return the
+                // handle in Starting state; caller can poll state().
+                tracing::warn!(
+                    vm = %handle.name,
+                    "start completion handler did not fire within 30s, \
+                     VM may still be starting"
+                );
+                Ok(handle)
+            }
         }
     }
 
@@ -508,12 +700,14 @@ impl VmDriver for AppleVzDriver {
             // SAFETY: called on the VM's dispatch queue; vm is a valid leaked reference.
             let vz_state = unsafe { vm.state() };
             let result = match vz_state {
-                VZVirtualMachineState::VZVirtualMachineStateStopped
-                | VZVirtualMachineState::VZVirtualMachineStateError => VmState::Stopped,
+                VZVirtualMachineState::VZVirtualMachineStateStopped => VmState::Stopped,
+                VZVirtualMachineState::VZVirtualMachineStateError => VmState::Failed {
+                    reason: "VZ framework reported error state".into(),
+                },
                 VZVirtualMachineState::VZVirtualMachineStateStarting => VmState::Starting,
-                VZVirtualMachineState::VZVirtualMachineStatePaused
-                | VZVirtualMachineState::VZVirtualMachineStatePausing
-                | VZVirtualMachineState::VZVirtualMachineStateResuming => VmState::Starting,
+                VZVirtualMachineState::VZVirtualMachineStatePaused => VmState::Paused,
+                VZVirtualMachineState::VZVirtualMachineStatePausing
+                | VZVirtualMachineState::VZVirtualMachineStateResuming => VmState::Paused,
                 VZVirtualMachineState::VZVirtualMachineStateRunning => {
                     if let Some(ip) = check_ready_marker(&serial_log) {
                         VmState::Running { ip }
@@ -538,6 +732,119 @@ impl VmDriver for AppleVzDriver {
             Err(_) => Err(VmError::Hypervisor("state query timed out after 5s".into())),
         }
     }
+
+    fn pause(&self, handle: &VmHandle) -> Result<(), VmError> {
+        let (vm, queue) = get_vm_and_queue(&handle.name)?;
+        let name = handle.name.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let pause_block = ConcreteBlock::new(move || {
+            // SAFETY: called on the VM's dispatch queue.
+            let can = unsafe { vm.can_pause() };
+            if !can {
+                let _ = tx.send(Err("VM is not in a state that can be paused".into()));
+                return;
+            }
+
+            let tx_inner = tx.clone();
+            let name_inner = name.clone();
+            let completion = ConcreteBlock::new(move |err: Id| {
+                if err == NIL {
+                    tracing::info!("VM '{}' paused", name_inner);
+                    let _ = tx_inner.send(Ok(()));
+                } else {
+                    let error = unsafe { NSError(StrongPtr::retain(err)) };
+                    let _ = tx_inner.send(Err(format!("pause error code {}", error.code())));
+                }
+            });
+            let completion = completion.copy();
+            let completion: &Block<(Id,), ()> = &completion;
+            vm.pause_with_completion_handler(completion);
+        });
+        let pause_block = pause_block.copy();
+        let pause_block: &Block<(), ()> = &pause_block;
+
+        unsafe {
+            dispatch_async(queue, pause_block);
+        }
+
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(detail)) => Err(VmError::Hypervisor(format!(
+                "pause failed for '{}': {}",
+                handle.name, detail
+            ))),
+            Err(_) => Err(VmError::Hypervisor(format!(
+                "pause timed out for '{}'",
+                handle.name
+            ))),
+        }
+    }
+
+    fn resume(&self, handle: &VmHandle) -> Result<(), VmError> {
+        let (vm, queue) = get_vm_and_queue(&handle.name)?;
+        let name = handle.name.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let resume_block = ConcreteBlock::new(move || {
+            // SAFETY: called on the VM's dispatch queue.
+            let can = unsafe { vm.can_resume() };
+            if !can {
+                let _ = tx.send(Err("VM is not in a state that can be resumed".into()));
+                return;
+            }
+
+            let tx_inner = tx.clone();
+            let name_inner = name.clone();
+            let completion = ConcreteBlock::new(move |err: Id| {
+                if err == NIL {
+                    tracing::info!("VM '{}' resumed", name_inner);
+                    let _ = tx_inner.send(Ok(()));
+                } else {
+                    let error = unsafe { NSError(StrongPtr::retain(err)) };
+                    let _ = tx_inner.send(Err(format!("resume error code {}", error.code())));
+                }
+            });
+            let completion = completion.copy();
+            let completion: &Block<(Id,), ()> = &completion;
+            vm.resume_with_completion_handler(completion);
+        });
+        let resume_block = resume_block.copy();
+        let resume_block: &Block<(), ()> = &resume_block;
+
+        unsafe {
+            dispatch_async(queue, resume_block);
+        }
+
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(detail)) => Err(VmError::Hypervisor(format!(
+                "resume failed for '{}': {}",
+                handle.name, detail
+            ))),
+            Err(_) => Err(VmError::Hypervisor(format!(
+                "resume timed out for '{}'",
+                handle.name
+            ))),
+        }
+    }
+}
+
+/// Extract a raw pointer to the VM and the queue from the registry.
+///
+/// SAFETY: The returned pointer is valid as long as the VM remains in the
+/// registry. The caller must not hold it across operations that could remove
+/// the VM from the registry.
+fn get_vm_and_queue(name: &str) -> Result<(*const VZVirtualMachine, Id), VmError> {
+    let registry = VM_REGISTRY
+        .lock()
+        .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+    let entry = registry.get(name).ok_or_else(|| VmError::NotFound {
+        name: name.to_string(),
+    })?;
+    // SAFETY: Pin<Box<>> ensures stable address. Pointer valid while in registry.
+    let vm_ptr: *const VZVirtualMachine = &*entry.vm;
+    Ok((vm_ptr, entry.queue))
 }
 
 /// Resolve a path to an absolute string (required by Apple VZ framework).

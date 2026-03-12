@@ -261,6 +261,7 @@ impl VmDriver for CloudHvDriver {
             state: VmState::Starting,
             pid: Some(pid),
             serial_log: config.serial_log.clone(),
+            machine_id: None,
         })
     }
 

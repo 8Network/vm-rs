@@ -65,6 +65,7 @@ impl VmDriver for MockDriver {
             },
             pid: Some(99999),
             serial_log: config.serial_log.clone(),
+            machine_id: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
         };
 
         self.vms.lock().unwrap().insert(
@@ -112,6 +113,44 @@ impl VmDriver for MockDriver {
             None => Ok(VmState::Stopped),
         }
     }
+
+    fn pause(&self, handle: &VmHandle) -> Result<(), VmError> {
+        let mut vms = self.vms.lock().unwrap();
+        match vms.get_mut(&handle.name) {
+            Some(vm) => {
+                if !matches!(vm.state, VmState::Running { .. }) {
+                    return Err(VmError::Hypervisor(
+                        "can only pause a running VM".into(),
+                    ));
+                }
+                vm.state = VmState::Paused;
+                Ok(())
+            }
+            None => Err(VmError::NotFound {
+                name: handle.name.clone(),
+            }),
+        }
+    }
+
+    fn resume(&self, handle: &VmHandle) -> Result<(), VmError> {
+        let mut vms = self.vms.lock().unwrap();
+        match vms.get_mut(&handle.name) {
+            Some(vm) => {
+                if vm.state != VmState::Paused {
+                    return Err(VmError::Hypervisor(
+                        "can only resume a paused VM".into(),
+                    ));
+                }
+                vm.state = VmState::Running {
+                    ip: "10.0.0.99".into(),
+                };
+                Ok(())
+            }
+            None => Err(VmError::NotFound {
+                name: handle.name.clone(),
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +181,10 @@ fn make_config(name: &str) -> VmConfig {
         serial_log: tmp.join("serial.log"),
         cmdline: None,
         netns: None,
+        vsock: false,
+        machine_id: None,
+        efi_variable_store: None,
+        rosetta: false,
     }
 }
 
@@ -343,4 +386,182 @@ fn wait_all_ready_succeeds_when_all_running() {
     manager
         .wait_all_ready(5)
         .expect("wait_all_ready should succeed");
+}
+
+// ─── Pause / Resume tests ───────────────────────────────────────────────
+
+#[test]
+fn pause_running_vm_transitions_to_paused() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let config = make_config("mock-pause");
+    manager.start(&config).expect("boot");
+
+    manager.pause("mock-pause").expect("pause should succeed");
+    let state = manager.state("mock-pause").expect("state");
+    assert_eq!(state, VmState::Paused, "VM should be paused");
+}
+
+#[test]
+fn resume_paused_vm_returns_to_running() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let config = make_config("mock-resume");
+    manager.start(&config).expect("boot");
+    manager.pause("mock-resume").expect("pause");
+
+    manager.resume("mock-resume").expect("resume should succeed");
+
+    // After resume, the manager sets state to Starting (waiting for ready marker).
+    // But the mock driver already set it to Running internally.
+    // The next state() call will pick up Running from the driver.
+    let state = manager.state("mock-resume").expect("state");
+    assert!(
+        matches!(state, VmState::Running { .. }),
+        "VM should be running after resume, got: {}",
+        state
+    );
+}
+
+#[test]
+fn pause_nonexistent_vm_fails() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let result = manager.pause("ghost-vm");
+    assert!(result.is_err(), "pause on nonexistent VM should fail");
+}
+
+#[test]
+fn resume_nonexistent_vm_fails() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let result = manager.resume("ghost-vm");
+    assert!(result.is_err(), "resume on nonexistent VM should fail");
+}
+
+#[test]
+fn pause_stopped_vm_fails() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let config = make_config("mock-pause-stopped");
+    manager.start(&config).expect("boot");
+    manager.stop("mock-pause-stopped").expect("stop");
+
+    let result = manager.pause("mock-pause-stopped");
+    assert!(result.is_err(), "pause on stopped VM should fail");
+}
+
+#[test]
+fn resume_running_vm_fails() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let config = make_config("mock-resume-running");
+    manager.start(&config).expect("boot");
+
+    let result = manager.resume("mock-resume-running");
+    assert!(result.is_err(), "resume on already running VM should fail");
+}
+
+#[test]
+fn pause_resume_cycle() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let config = make_config("mock-cycle");
+    manager.start(&config).expect("boot");
+
+    // Pause → verify paused → resume → verify running
+    manager.pause("mock-cycle").expect("pause");
+    assert_eq!(
+        manager.state("mock-cycle").expect("state"),
+        VmState::Paused
+    );
+
+    manager.resume("mock-cycle").expect("resume");
+    let state = manager.state("mock-cycle").expect("state");
+    assert!(matches!(state, VmState::Running { .. }));
+
+    // Can pause again after resume
+    manager.pause("mock-cycle").expect("second pause");
+    assert_eq!(
+        manager.state("mock-cycle").expect("state"),
+        VmState::Paused
+    );
+}
+
+// ─── Machine ID tests ──────────────────────────────────────────────────
+
+#[test]
+fn boot_returns_machine_id() {
+    let driver = MockDriver::new();
+    let manager = make_manager(driver);
+
+    let config = make_config("mock-machine-id");
+    let handle = manager.start(&config).expect("boot");
+
+    assert!(
+        handle.machine_id.is_some(),
+        "boot should return a machine_id"
+    );
+    assert_eq!(
+        handle.machine_id.unwrap(),
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        "machine_id should match mock"
+    );
+}
+
+// ─── Config new fields tests ────────────────────────────────────────────
+
+#[test]
+fn config_new_fields_default_values() {
+    let config = make_config("mock-defaults");
+    assert!(!config.vsock, "vsock should default to false");
+    assert!(config.machine_id.is_none(), "machine_id should default to None");
+    assert!(
+        config.efi_variable_store.is_none(),
+        "efi_variable_store should default to None"
+    );
+    assert!(!config.rosetta, "rosetta should default to false");
+}
+
+#[test]
+fn config_vsock_enabled() {
+    let mut config = make_config("mock-vsock");
+    config.vsock = true;
+    assert!(config.vsock);
+}
+
+#[test]
+fn config_machine_id_roundtrip() {
+    let mut config = make_config("mock-mid");
+    let id = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    config.machine_id = Some(id.clone());
+    assert_eq!(config.machine_id.unwrap(), id);
+}
+
+#[test]
+fn config_efi_variable_store() {
+    let mut config = make_config("mock-uefi");
+    config.efi_variable_store = Some(std::path::PathBuf::from("/tmp/nvram.bin"));
+    assert!(config.efi_variable_store.is_some());
+}
+
+// ─── VmState::Paused equality and display ──────────────────────────────
+
+#[test]
+fn paused_state_display() {
+    assert_eq!(VmState::Paused.to_string(), "paused");
+}
+
+#[test]
+fn paused_state_equality() {
+    assert_eq!(VmState::Paused, VmState::Paused);
+    assert_ne!(VmState::Paused, VmState::Stopped);
+    assert_ne!(VmState::Paused, VmState::Starting);
 }

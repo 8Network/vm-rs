@@ -82,6 +82,10 @@ fn make_config(name: &str, kernel: &std::path::Path, initramfs: &std::path::Path
         serial_log: base.join("serial.log"),
         cmdline: Some(console.to_string()),
         netns: None,
+        vsock: false,
+        machine_id: None,
+        efi_variable_store: None,
+        rosetta: false,
     }
 }
 

@@ -85,6 +85,7 @@ impl VmManager {
             state: VmState::Starting,
             pid: None,
             serial_log: config.serial_log.clone(),
+            machine_id: None,
         };
         vms.insert(config.name.clone(), placeholder);
 
@@ -197,6 +198,36 @@ impl VmManager {
             h.state = state.clone();
         }
         Ok(state)
+    }
+
+    /// Pause a running VM (suspends execution, preserves memory).
+    pub fn pause(&self, name: &str) -> Result<(), VmError> {
+        let handle = self.get_handle(name)?;
+        self.driver.pause(&handle)?;
+
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        if let Some(h) = vms.get_mut(name) {
+            h.state = VmState::Paused;
+        }
+        Ok(())
+    }
+
+    /// Resume a paused VM.
+    pub fn resume(&self, name: &str) -> Result<(), VmError> {
+        let handle = self.get_handle(name)?;
+        self.driver.resume(&handle)?;
+
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        if let Some(h) = vms.get_mut(name) {
+            h.state = VmState::Starting; // Will transition to Running once ready marker appears
+        }
+        Ok(())
     }
 
     /// Get the IP address of a running VM.

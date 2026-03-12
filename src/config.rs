@@ -9,7 +9,7 @@ pub const READY_MARKER: &str = "VMRS_READY";
 
 /// Everything needed to boot a VM.
 ///
-/// Two boot modes are supported:
+/// Three boot modes are supported:
 ///
 /// **Initramfs boot** (fast, stateless):
 ///   Set `kernel` + `initramfs` + `cmdline` + `shared_dirs`. Leave `root_disk`
@@ -19,13 +19,18 @@ pub const READY_MARKER: &str = "VMRS_READY";
 /// **Cloud-init boot** (traditional, disk-based):
 ///   Set `kernel` + `root_disk` + `seed_iso`. Cloud-init reads its config from
 ///   the seed ISO (NoCloud datasource). Requires a base disk image.
+///
+/// **UEFI boot** (macOS 13+ / Cloud Hypervisor):
+///   Set `efi_variable_store` to enable UEFI boot. Required for booting
+///   arbitrary distro ISOs and UEFI-only images. The variable store persists
+///   UEFI NVRAM across reboots.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     /// Unique name for this VM.
     pub name: String,
     /// Namespace (logical grouping, e.g., stack name).
     pub namespace: String,
-    /// Path to the kernel image.
+    /// Path to the kernel image (required for direct Linux boot, ignored for UEFI).
     pub kernel: PathBuf,
     /// Path to initramfs (required for initramfs boot, optional for cloud-init boot).
     pub initramfs: Option<PathBuf>,
@@ -50,6 +55,29 @@ pub struct VmConfig {
     /// Linux network namespace to run the VM in (optional).
     /// When set, the VMM process is spawned inside `ip netns exec <netns>`.
     pub netns: Option<String>,
+
+    // ─── New capabilities ───────────────────────────────────────────────
+
+    /// Enable vsock device for host↔guest communication (default: false).
+    ///
+    /// vsock provides bidirectional, FD-based I/O without network setup.
+    /// Use for agent commands, health checks, and file transfer.
+    pub vsock: bool,
+    /// Persistent machine identifier bytes (default: None = generate new).
+    ///
+    /// Save `VmHandle::machine_id` after first boot and pass it back here
+    /// on subsequent boots to maintain stable VM identity.
+    pub machine_id: Option<Vec<u8>>,
+    /// Path to EFI variable store for UEFI boot (default: None = Linux boot).
+    ///
+    /// If the file exists, it's opened; if not, it's created.
+    /// Required for booting arbitrary distro ISOs and UEFI-only images.
+    pub efi_variable_store: Option<PathBuf>,
+    /// Enable Rosetta x86_64-to-ARM64 translation (default: false).
+    ///
+    /// macOS 13+ / Apple Silicon only. Adds a VirtioFS share at tag "rosetta".
+    /// Guest must register the binary with binfmt_misc after mounting.
+    pub rosetta: bool,
 }
 
 /// Network attachment for a VM.
@@ -86,6 +114,11 @@ pub struct VmHandle {
     pub pid: Option<u32>,
     /// Serial console log path.
     pub serial_log: PathBuf,
+    /// Machine identifier bytes (for persistence across reboots).
+    ///
+    /// Save this after first boot and pass back via `VmConfig::machine_id`
+    /// on subsequent boots to maintain stable VM identity.
+    pub machine_id: Option<Vec<u8>>,
 }
 
 /// VM lifecycle state.
@@ -98,6 +131,8 @@ pub enum VmState {
         /// IP address assigned to the VM.
         ip: String,
     },
+    /// VM execution is suspended (memory preserved).
+    Paused,
     /// VM was stopped gracefully.
     Stopped,
     /// VM failed to boot or crashed.
@@ -112,6 +147,7 @@ impl std::fmt::Display for VmState {
         match self {
             VmState::Starting => write!(f, "starting"),
             VmState::Running { ip } => write!(f, "running ({})", ip),
+            VmState::Paused => write!(f, "paused"),
             VmState::Stopped => write!(f, "stopped"),
             VmState::Failed { reason } => write!(f, "failed: {}", reason),
         }
@@ -133,6 +169,11 @@ mod tests {
             ip: "10.0.1.2".into(),
         };
         assert_eq!(state.to_string(), "running (10.0.1.2)");
+    }
+
+    #[test]
+    fn vm_state_display_paused() {
+        assert_eq!(VmState::Paused.to_string(), "paused");
     }
 
     #[test]

@@ -193,6 +193,25 @@ impl NSFileHandle {
 pub struct NSDictionary(pub StrongPtr);
 
 impl NSDictionary {
+    /// Create an NSDictionary from key-value pairs.
+    ///
+    /// # Safety
+    /// All `Id` values in `pairs` must be valid, retained Objective-C objects.
+    pub fn from_pairs(pairs: &[(Id, Id)]) -> NSDictionary {
+        unsafe {
+            let keys: Vec<Id> = pairs.iter().map(|(k, _)| *k).collect();
+            let values: Vec<Id> = pairs.iter().map(|(_, v)| *v).collect();
+            // dictionaryWithObjects:forKeys:count: is a factory method returning autoreleased (+0).
+            let p = StrongPtr::retain(msg_send![
+                class!(NSDictionary),
+                dictionaryWithObjects:values.as_ptr()
+                forKeys:keys.as_ptr()
+                count:pairs.len()
+            ]);
+            NSDictionary(p)
+        }
+    }
+
     pub fn all_keys<T>(&self) -> NSArray<T> {
         unsafe {
             NSArray {
@@ -284,5 +303,22 @@ impl NSError {
         println!("localizedRecoverySuggestion : {}", safe_str(&suggestion));
         let anchor = self.help_anchor();
         println!("helpAnchor : {}", safe_str(&anchor));
+    }
+
+    /// Create a synthetic NSError with a domain and description.
+    ///
+    /// Used when an ObjC API returns nil without an error object (macOS 16+).
+    pub fn from_description(domain: &str, description: &str) -> Self {
+        unsafe {
+            let ns_domain = NSString::new(domain);
+            let ns_desc = NSString::new(description);
+            let desc_key = NSString::new("NSLocalizedDescription");
+            let user_info =
+                NSDictionary::from_pairs(&[(*desc_key.0, *ns_desc.0)]);
+            let p: Id = msg_send![class!(NSError), errorWithDomain:*ns_domain.0
+                                                   code:(-1isize)
+                                                   userInfo:*user_info.0];
+            NSError(StrongPtr::retain(p))
+        }
     }
 }

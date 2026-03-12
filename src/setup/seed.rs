@@ -45,8 +45,10 @@ pub struct NicConfig {
 /// Process to start inside the VM after boot.
 #[derive(Debug, Clone)]
 pub struct ProcessConfig {
-    /// Command to execute.
+    /// Program to execute (path or name, no shell interpretation).
     pub command: String,
+    /// Arguments to pass to the program (separate from command for safe quoting).
+    pub args: Vec<String>,
     /// Working directory.
     pub workdir: Option<String>,
     /// Environment variables.
@@ -135,14 +137,25 @@ fn build_user_data(config: &SeedConfig<'_>) -> String {
     ud.push_str("disable_root: false\n");
     ud.push_str("runcmd:\n");
 
-    // Mount VirtioFS volumes
+    // Mount VirtioFS volumes — use YAML array syntax so no shell quoting is needed
+    // for most arguments, and explicitly quote paths/tags that may contain special chars.
     for vol in &config.volumes {
-        ud.push_str(&format!(
-            "  - mkdir -p {mount} && mount -t virtiofs {tag} {mount}{ro}\n",
-            mount = vol.mount_point,
-            tag = vol.tag,
-            ro = if vol.read_only { " -o ro" } else { "" },
-        ));
+        let mount = shell_quote(&vol.mount_point);
+        let tag = shell_quote(&vol.tag);
+        ud.push_str(&format!("  - [\"mkdir\", \"-p\", {}]\n", mount));
+        if vol.read_only {
+            ud.push_str(&format!(
+                "  - [\"mount\", \"-t\", \"virtiofs\", {tag}, {mount}, \"-o\", \"ro\"]\n",
+                tag = tag,
+                mount = mount,
+            ));
+        } else {
+            ud.push_str(&format!(
+                "  - [\"mount\", \"-t\", \"virtiofs\", {tag}, {mount}]\n",
+                tag = tag,
+                mount = mount,
+            ));
+        }
     }
 
     // Extra hosts — validate to prevent shell injection
@@ -154,29 +167,47 @@ fn build_user_data(config: &SeedConfig<'_>) -> String {
         ud.push_str(&format!("  - echo '{} {}' >> /etc/hosts\n", ip, host));
     }
 
-    // Start process
+    // Start process — use YAML array syntax with each argument as a separate quoted element.
+    // env exports use `sh -c` with fully quoted assignment to avoid eval of values.
     if let Some(ref proc) = config.process {
         for (k, v) in &proc.env {
             if !is_safe_env_name(k) {
                 tracing::error!(name = %k, "rejecting unsafe environment variable name");
                 continue;
             }
-            ud.push_str(&format!("  - export {}={}\n", k, shell_quote(v)));
+            ud.push_str(&format!(
+                "  - [\"sh\", \"-c\", \"export {}={}\"]\n",
+                k,
+                shell_quote(v)
+            ));
         }
+        // Build the exec array: program followed by each arg, all shell-quoted.
+        let quoted_cmd = shell_quote(&proc.command);
+        let quoted_args: Vec<String> = proc.args.iter().map(|a| shell_quote(a)).collect();
         if let Some(ref wd) = proc.workdir {
-            ud.push_str(&format!("  - cd {} && {}\n", shell_quote(wd), proc.command));
+            // Change to workdir then exec — use sh -c so cd applies to exec.
+            let mut exec_parts = vec![quoted_cmd.clone()];
+            exec_parts.extend(quoted_args.clone());
+            let exec_str = exec_parts.join(" ");
+            ud.push_str(&format!(
+                "  - [\"sh\", \"-c\", \"cd {} && exec {}\"]\n",
+                shell_quote(wd),
+                exec_str,
+            ));
         } else {
-            ud.push_str(&format!("  - {}\n", proc.command));
+            // No workdir: YAML list directly (cloud-init passes args without shell).
+            let mut entries = vec![quoted_cmd];
+            entries.extend(quoted_args);
+            ud.push_str(&format!("  - [{}]\n", entries.join(", ")));
         }
     }
 
-    // Health check
+    // Health check — use sh -c with fully quoted command string.
     if let Some(ref hc) = config.healthcheck {
+        let quoted_hc_cmd = shell_quote(&hc.command);
         ud.push_str(&format!(
-            "  - while true; do {} > /tmp/vmrs-health 2>&1 && \
-             echo 'healthy' >> /tmp/vmrs-health || \
-             echo 'unhealthy' >> /tmp/vmrs-health; sleep {}; done &\n",
-            hc.command, hc.interval_secs
+            "  - [\"sh\", \"-c\", \"while true; do {} > /tmp/vmrs-health 2>&1 && echo healthy >> /tmp/vmrs-health || echo unhealthy >> /tmp/vmrs-health; sleep {}; done &\"]\n",
+            quoted_hc_cmd, hc.interval_secs
         ));
     }
 
@@ -463,6 +494,7 @@ mod tests {
             nics: vec![],
             process: Some(ProcessConfig {
                 command: "/bin/app".into(),
+                args: vec![],
                 workdir: Some("/opt/app".into()),
                 env: vec![("PORT".into(), "8080".into())],
             }),
@@ -472,7 +504,28 @@ mod tests {
         };
         let ud = build_user_data(&config);
         assert!(ud.contains("export PORT='8080'"));
-        assert!(ud.contains("cd '/opt/app' && /bin/app"));
+        assert!(ud.contains("cd '/opt/app' && exec '/bin/app'"));
+    }
+
+    #[test]
+    fn user_data_with_process_args() {
+        let config = SeedConfig {
+            hostname: "test-vm",
+            ssh_pubkey: "ssh-ed25519 AAAA...",
+            nics: vec![],
+            process: Some(ProcessConfig {
+                command: "/bin/app".into(),
+                args: vec!["--config".into(), "/etc/app.conf".into()],
+                workdir: None,
+                env: vec![],
+            }),
+            volumes: vec![],
+            healthcheck: None,
+            extra_hosts: vec![],
+        };
+        let ud = build_user_data(&config);
+        // Should produce YAML array list with program + args
+        assert!(ud.contains("'/bin/app', '--config', '/etc/app.conf'"));
     }
 
     #[test]
@@ -483,6 +536,7 @@ mod tests {
             nics: vec![],
             process: Some(ProcessConfig {
                 command: "/bin/app".into(),
+                args: vec![],
                 workdir: None,
                 env: vec![
                     ("GOOD".into(), "ok".into()),
@@ -496,6 +550,72 @@ mod tests {
         let ud = build_user_data(&config);
         assert!(ud.contains("export GOOD="));
         assert!(!ud.contains("BAD;rm"));
+    }
+
+    #[test]
+    fn user_data_shell_metacharacters_in_mount_and_command() {
+        // Every dangerous value must appear only inside shell single-quotes so it cannot
+        // be interpreted by a shell.  shell_quote wraps the string in '...', which means
+        // the raw injection form (unquoted or preceded by a space) must NOT appear in the
+        // output, while the properly-quoted form MUST appear.
+        let config = SeedConfig {
+            hostname: "test-vm",
+            ssh_pubkey: "ssh-ed25519 AAAA...",
+            nics: vec![],
+            process: Some(ProcessConfig {
+                command: "/bin/app; rm -rf /".into(),
+                args: vec!["$(whoami)".into(), "arg with spaces".into()],
+                workdir: Some("/work dir/path".into()),
+                env: vec![("VAR".into(), "value$(id)".into())],
+            }),
+            volumes: vec![VolumeMountConfig {
+                tag: "tag;evil".into(),
+                mount_point: "/mnt/$(evil)".into(),
+                read_only: false,
+            }],
+            healthcheck: Some(HealthCheckConfig {
+                command: "curl http://localhost; rm -rf /".into(),
+                interval_secs: 5,
+                retries: 3,
+            }),
+            extra_hosts: vec![],
+        };
+        let ud = build_user_data(&config);
+
+        // Mount tag: must appear shell-quoted (surrounded by single-quotes), never bare.
+        assert!(ud.contains("'tag;evil'"), "mount tag must appear shell-quoted");
+        // The bare (unquoted) form with a leading space or comma would be injectable.
+        assert!(!ud.contains(", tag;evil"), "mount tag must not appear as bare YAML element");
+        assert!(!ud.contains("\" tag;evil\""), "mount tag must not appear unquoted in string");
+
+        // Mount point: same rule.
+        assert!(ud.contains("'/mnt/$(evil)'"), "mount point must appear shell-quoted");
+        assert!(!ud.contains(", /mnt/$(evil)"), "mount point must not appear as bare YAML element");
+
+        // Process command: the semicolon injection must be inside single-quotes.
+        assert!(ud.contains("'/bin/app; rm -rf /'"), "command must appear shell-quoted");
+
+        // Args: $() injection must be inside single-quotes.
+        assert!(ud.contains("'$(whoami)'"), "arg must appear shell-quoted");
+        assert!(!ud.contains(", $(whoami)"), "arg must not appear as bare YAML element");
+
+        // Env value: $() injection must be inside single-quotes.
+        assert!(ud.contains("'value$(id)'"), "env value must appear shell-quoted");
+
+        // Health check: the semicolon injection must be inside single-quotes.
+        assert!(
+            ud.contains("'curl http://localhost; rm -rf /'"),
+            "healthcheck command must appear shell-quoted"
+        );
+
+        // Every runcmd line must start with "  - "
+        let runcmd_lines: Vec<&str> = ud
+            .lines()
+            .skip_while(|l| *l != "runcmd:")
+            .skip(1)
+            .take_while(|l| l.starts_with("  - "))
+            .collect();
+        assert!(!runcmd_lines.is_empty(), "must have runcmd entries");
     }
 
     // ── build_network_config ─────────────────────────────────────────────

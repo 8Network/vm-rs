@@ -222,8 +222,11 @@ impl ImageStore {
             .ok_or_else(|| OciError::ManifestParse("missing layers".into()))?;
         let layer_digests: Vec<String> = layers
             .into_iter()
-            .map(|l| l.digest.unwrap_or_default())
-            .collect();
+            .map(|l| {
+                l.digest
+                    .ok_or_else(|| OciError::ManifestParse("layer missing digest".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(ImageManifest {
             config_digest,
@@ -479,6 +482,29 @@ mod tests {
         let manifest_json = r#"{"schemaVersion": 2, "layers": []}"#;
         let result = ImageStore::parse_manifest(manifest_json.as_bytes());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_manifest_layer_missing_digest_is_error() {
+        // A layer descriptor without a "digest" field must be rejected, not silently
+        // collapsed to an empty string.
+        let manifest_json = r#"{
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "digest": "sha256:abc123"
+            },
+            "layers": [
+                { "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": 1234 }
+            ]
+        }"#;
+        let result = ImageStore::parse_manifest(manifest_json.as_bytes());
+        assert!(result.is_err(), "layer with missing digest must be a parse error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("layer missing digest"),
+            "error message should mention 'layer missing digest', got: {err_msg}"
+        );
     }
 
     #[test]

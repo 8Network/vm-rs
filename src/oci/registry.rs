@@ -151,9 +151,12 @@ pub fn parse_image_ref(image: &str) -> ImageRef {
     };
 
     let first_part = image_no_digest.split('/').next().unwrap_or(image_no_digest);
-    // A registry is present if the first path segment contains a dot OR a colon (port)
-    let has_registry =
-        image_no_digest.contains('/') && (first_part.contains('.') || first_part.contains(':'));
+    // A registry is present if the first path segment contains a dot, a colon (port),
+    // or is exactly "localhost" (no dot/colon but clearly not a Docker Hub username).
+    let has_registry = image_no_digest.contains('/')
+        && (first_part.contains('.')
+            || first_part.contains(':')
+            || first_part == "localhost");
 
     let (registry, rest) = if has_registry {
         let slash = image_no_digest.find('/').expect("checked above");
@@ -495,5 +498,22 @@ mod tests {
         assert_eq!(r.registry, "ghcr.io");
         assert_eq!(r.repository, "org/team/app");
         assert_eq!(r.tag, "v1");
+    }
+
+    #[test]
+    fn parse_localhost_without_port() {
+        // "localhost" has no dot or colon, but must not be treated as Docker Hub.
+        let r = parse_image_ref("localhost/myrepo:tag");
+        assert_eq!(r.registry, "localhost");
+        assert_eq!(r.repository, "myrepo");
+        assert_eq!(r.tag, "tag");
+    }
+
+    #[test]
+    fn parse_localhost_no_library_prefix() {
+        // Docker Hub official images get "library/" prepended, but localhost images must not.
+        let r = parse_image_ref("localhost/myrepo:latest");
+        assert_eq!(r.registry, "localhost");
+        assert!(!r.repository.starts_with("library/"), "localhost repo must not get library/ prefix");
     }
 }

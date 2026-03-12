@@ -37,6 +37,26 @@ pub trait VmDriver: Send + Sync {
 
     /// Query current VM state.
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError>;
+
+    /// Pause a running VM, suspending execution but preserving memory.
+    ///
+    /// Not all drivers support this. Default returns `Hypervisor` error.
+    fn pause(&self, handle: &VmHandle) -> Result<(), VmError> {
+        let _ = handle;
+        Err(VmError::Hypervisor(
+            "pause not supported by this driver".into(),
+        ))
+    }
+
+    /// Resume a paused VM.
+    ///
+    /// Not all drivers support this. Default returns `Hypervisor` error.
+    fn resume(&self, handle: &VmHandle) -> Result<(), VmError> {
+        let _ = handle;
+        Err(VmError::Hypervisor(
+            "resume not supported by this driver".into(),
+        ))
+    }
 }
 
 /// VM operation errors.
