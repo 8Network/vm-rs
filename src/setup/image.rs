@@ -328,11 +328,9 @@ async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
         .join(&filename);
 
     let result = download_file_to_tmp(url, path, &tmp_path).await;
-    if result.is_err() {
-        if tmp_path.exists() {
-            if let Err(e) = std::fs::remove_file(&tmp_path) {
-                tracing::warn!(path = %tmp_path.display(), "failed to clean up temp download: {e}");
-            }
+    if result.is_err() && tmp_path.exists() {
+        if let Err(e) = std::fs::remove_file(&tmp_path) {
+            tracing::warn!(path = %tmp_path.display(), "failed to clean up temp download: {e}");
         }
     }
     result
