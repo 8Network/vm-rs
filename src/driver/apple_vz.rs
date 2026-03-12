@@ -8,8 +8,9 @@
 //! accumulating in the caller's thread-local storage (TLS) autorelease pool,
 //! which would cause SIGSEGV in `_pthread_tsd_cleanup` when the thread exits.
 //!
-//! Uses `Box::leak` to keep `VZVirtualMachine` alive (Objective-C reference
-//! counting requires the object to outlive the dispatch queue).
+//! Uses `Pin<Box<>>` to keep `VZVirtualMachine` alive with a stable address
+//! (Objective-C reference counting requires the object to outlive the dispatch
+//! queue). Removing the VM from the registry drops the `Pin<Box<>>`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -569,27 +570,18 @@ impl VmDriver for AppleVzDriver {
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        // Extract vm + queue from registry, then drop the lock before blocking.
-        let (vm, queue) = {
-            let registry = VM_REGISTRY
-                .lock()
-                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-            let entry = registry
-                .get(&handle.name)
-                .ok_or_else(|| VmError::NotFound {
-                    name: handle.name.clone(),
-                })?;
-            (entry.vm, entry.queue)
-        };
-
+        let (vm_ptr, queue) = get_vm_and_queue(&handle.name)?;
+        // Convert to usize for Send across GCD block boundary.
+        let vm_addr = vm_ptr as usize;
         let name = handle.name.clone();
 
         // dispatch_async + channel avoids placing ObjC autorelease objects
         // on the caller's thread pool (prevents SIGSEGV at thread exit).
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let stop_block = ConcreteBlock::new(move || {
-            let mut vm_ref = vm.clone();
-            // SAFETY: called on the VM's dispatch queue, vm_ref is a valid VZ object.
+            // SAFETY: pointer is stable (Pin<Box<>>) and valid while VM is in registry.
+            // Called on the VM's GCD queue. Mutable ref needed for request_stop_with_error.
+            let vm_ref = unsafe { &mut *(vm_addr as *mut VZVirtualMachine) };
             let result = unsafe {
                 match vm_ref.request_stop_with_error() {
                     Ok(_) => {
@@ -632,9 +624,15 @@ impl VmDriver for AppleVzDriver {
         };
 
         if let Some(entry) = entry {
-            let vm = entry.vm;
+            // Get raw pointer before moving entry into closure.
+            let vm_ptr: *const VZVirtualMachine = &*entry.vm;
+            let vm_addr = vm_ptr as usize;
             let queue = entry.queue;
             let name = handle.name.clone();
+
+            // Keep the entry alive until the GCD block completes — the VM
+            // object must not be dropped while stop is in flight.
+            // We move `entry` into the outer closure for this.
 
             // stopWithCompletionHandler (macOS 14+) via dispatch_async.
             // dispatch_async keeps all ObjC autoreleases on the GCD queue's
@@ -643,6 +641,8 @@ impl VmDriver for AppleVzDriver {
 
             let name_inner = name.clone();
             let stop_block = ConcreteBlock::new(move || {
+                // SAFETY: pointer is valid — entry (moved into this closure) keeps the VM alive.
+                let vm_ref = unsafe { &*(vm_addr as *const VZVirtualMachine) };
                 let name_err = name_inner.clone();
                 let tx_inner = tx.clone();
                 let completion = ConcreteBlock::new(move |err: Id| {
@@ -661,7 +661,9 @@ impl VmDriver for AppleVzDriver {
                 });
                 let completion = completion.copy();
                 let completion: &Block<(Id,), ()> = &completion;
-                vm.stop_with_completion_handler(completion);
+                vm_ref.stop_with_completion_handler(completion);
+                // `entry` is implicitly kept alive here by the closure capture.
+                let _ = &entry;
             });
             let stop_block = stop_block.copy();
             let stop_block: &Block<(), ()> = &stop_block;
@@ -680,16 +682,12 @@ impl VmDriver for AppleVzDriver {
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        // Extract vm + queue, then drop the lock before blocking.
-        let (vm, queue) = {
-            let registry = VM_REGISTRY
-                .lock()
-                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-            match registry.get(&handle.name) {
-                Some(entry) => (entry.vm, entry.queue),
-                None => return Ok(VmState::Stopped),
-            }
+        let (vm_ptr, queue) = match get_vm_and_queue(&handle.name) {
+            Ok(pair) => pair,
+            Err(VmError::NotFound { .. }) => return Ok(VmState::Stopped),
+            Err(e) => return Err(e),
         };
+        let vm_addr = vm_ptr as usize;
 
         let serial_log = handle.serial_log.clone();
 
@@ -697,8 +695,9 @@ impl VmDriver for AppleVzDriver {
         // This keeps ObjC autoreleases off the caller's thread.
         let (tx, rx) = std::sync::mpsc::channel::<VmState>();
         let state_block = ConcreteBlock::new(move || {
-            // SAFETY: called on the VM's dispatch queue; vm is a valid leaked reference.
-            let vz_state = unsafe { vm.state() };
+            // SAFETY: pointer is stable (Pin<Box<>>) and valid while VM is in registry.
+            let vm_ref = unsafe { &*(vm_addr as *const VZVirtualMachine) };
+            let vz_state = unsafe { vm_ref.state() };
             let result = match vz_state {
                 VZVirtualMachineState::VZVirtualMachineStateStopped => VmState::Stopped,
                 VZVirtualMachineState::VZVirtualMachineStateError => VmState::Failed {
@@ -734,13 +733,15 @@ impl VmDriver for AppleVzDriver {
     }
 
     fn pause(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let (vm, queue) = get_vm_and_queue(&handle.name)?;
+        let (vm_ptr, queue) = get_vm_and_queue(&handle.name)?;
+        let vm_addr = vm_ptr as usize;
         let name = handle.name.clone();
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let pause_block = ConcreteBlock::new(move || {
-            // SAFETY: called on the VM's dispatch queue.
-            let can = unsafe { vm.can_pause() };
+            // SAFETY: pointer is stable (Pin<Box<>>) and valid while VM is in registry.
+            let vm_ref = unsafe { &*(vm_addr as *const VZVirtualMachine) };
+            let can = unsafe { vm_ref.can_pause() };
             if !can {
                 let _ = tx.send(Err("VM is not in a state that can be paused".into()));
                 return;
@@ -759,7 +760,7 @@ impl VmDriver for AppleVzDriver {
             });
             let completion = completion.copy();
             let completion: &Block<(Id,), ()> = &completion;
-            vm.pause_with_completion_handler(completion);
+            vm_ref.pause_with_completion_handler(completion);
         });
         let pause_block = pause_block.copy();
         let pause_block: &Block<(), ()> = &pause_block;
@@ -782,13 +783,15 @@ impl VmDriver for AppleVzDriver {
     }
 
     fn resume(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let (vm, queue) = get_vm_and_queue(&handle.name)?;
+        let (vm_ptr, queue) = get_vm_and_queue(&handle.name)?;
+        let vm_addr = vm_ptr as usize;
         let name = handle.name.clone();
 
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let resume_block = ConcreteBlock::new(move || {
-            // SAFETY: called on the VM's dispatch queue.
-            let can = unsafe { vm.can_resume() };
+            // SAFETY: pointer is stable (Pin<Box<>>) and valid while VM is in registry.
+            let vm_ref = unsafe { &*(vm_addr as *const VZVirtualMachine) };
+            let can = unsafe { vm_ref.can_resume() };
             if !can {
                 let _ = tx.send(Err("VM is not in a state that can be resumed".into()));
                 return;
@@ -807,7 +810,7 @@ impl VmDriver for AppleVzDriver {
             });
             let completion = completion.copy();
             let completion: &Block<(Id,), ()> = &completion;
-            vm.resume_with_completion_handler(completion);
+            vm_ref.resume_with_completion_handler(completion);
         });
         let resume_block = resume_block.copy();
         let resume_block: &Block<(), ()> = &resume_block;

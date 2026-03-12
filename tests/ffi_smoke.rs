@@ -224,8 +224,10 @@ mod apple_vz {
         // Create the file first
         std::fs::write(&log_path, b"").unwrap();
 
-        let attachment = VZFileSerialPortAttachment::new(log_path.to_str().unwrap(), false)
-            .expect("VZFileSerialPortAttachment::new should succeed for a valid path");
+        let attachment = match VZFileSerialPortAttachment::new(log_path.to_str().unwrap(), false) {
+            Ok(a) => a,
+            Err(_) => panic!("VZFileSerialPortAttachment::new should succeed for a valid path"),
+        };
         let id = attachment.id();
         assert!(!id.is_null(), "file serial port Id should not be null");
     }
@@ -238,8 +240,10 @@ mod apple_vz {
         let log_path = tmp.path().join("serial-append.log");
         std::fs::write(&log_path, b"existing content\n").unwrap();
 
-        let _attachment = VZFileSerialPortAttachment::new(log_path.to_str().unwrap(), true)
-            .expect("VZFileSerialPortAttachment::new should succeed in append mode");
+        let _attachment = match VZFileSerialPortAttachment::new(log_path.to_str().unwrap(), true) {
+            Ok(a) => a,
+            Err(_) => panic!("VZFileSerialPortAttachment::new should succeed in append mode"),
+        };
         // No crash in append mode = success
     }
 
