@@ -855,19 +855,3 @@ fn update_state(state: &Arc<RwLock<VmState>>, new_state: VmState) {
         *s = new_state;
     }
 }
-
-/// Check the serial log for the readiness marker.
-fn check_ready_marker(log_path: &Path) -> Option<String> {
-    let content = match std::fs::read_to_string(log_path) {
-        Ok(c) => c,
-        Err(_) => return None,
-    };
-    let pos = content.find(crate::config::READY_MARKER)?;
-    let after = &content[pos + crate::config::READY_MARKER.len()..];
-    let ip = after.split_whitespace().next()?.trim().to_string();
-    if ip.is_empty() {
-        None
-    } else {
-        Some(ip)
-    }
-}

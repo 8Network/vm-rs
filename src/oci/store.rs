@@ -455,9 +455,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path()).unwrap();
         let path = store.blob_path("sha256:abc123def456");
-        assert!(path
-            .to_string_lossy()
-            .ends_with("blobs/sha256/abc123def456"));
+        // Use Path::ends_with for platform-independent separator handling
+        assert!(path.ends_with(std::path::Path::new("blobs/sha256/abc123def456")));
     }
 
     #[test]

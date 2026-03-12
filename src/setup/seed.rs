@@ -237,6 +237,7 @@ fn build_network_config(config: &SeedConfig<'_>) -> String {
     nc
 }
 
+#[allow(unused_variables)] // used on macOS/Linux, not on unsupported platforms
 fn create_iso_image(iso_path: &Path, source_dir: &Path) -> Result<(), SetupError> {
     #[cfg(target_os = "macos")]
     {
