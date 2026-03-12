@@ -86,7 +86,16 @@ pub fn delete_bridge(name: &str, subnet_cidr: Option<&str>) {
     if let Some(subnet) = subnet_cidr {
         let result = Command::new("iptables")
             .args([
-                "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "!", "-o", name, "-j",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                subnet,
+                "!",
+                "-o",
+                name,
+                "-j",
                 "MASQUERADE",
             ])
             .stdout(Stdio::null())

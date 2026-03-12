@@ -308,7 +308,9 @@ async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
 
     // Stream to disk instead of buffering the whole response in memory.
     // VM images can be hundreds of MB.
-    let mut file = tokio::fs::File::create(path).await.map_err(SetupError::Io)?;
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(SetupError::Io)?;
     let mut stream = resp.bytes_stream();
     let mut total_bytes = 0u64;
 

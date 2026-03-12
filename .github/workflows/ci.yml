@@ -79,6 +79,10 @@ jobs:
         with:
           key: ${{ matrix.os }}-integration
 
+      # VmManager mock driver tests (no hypervisor needed)
+      - name: VmManager orchestration tests
+        run: cargo test --test vm_manager --target ${{ matrix.target }}
+
       # Disk clone tests
       - name: Disk clone tests
         run: cargo test --test disk_clone --target ${{ matrix.target }}
@@ -108,54 +112,64 @@ jobs:
         run: cargo test --test oci_pull
         timeout-minutes: 5
 
-  # ── VM lifecycle tests (requires hypervisor) ────────────────────────
-  # These tests need real kernel/initramfs assets and hardware virtualization.
-  # macOS: Apple Virtualization.framework (macOS 13+ runner)
-  # Linux: Cloud Hypervisor + KVM (/dev/kvm)
-  #
-  # Skipped by default — VM tests only run when VMRS_TEST_KERNEL and
-  # VMRS_TEST_INITRAMFS env vars point to valid assets.
-  vm-macos:
-    name: VM Lifecycle (macOS)
-    runs-on: macos-latest
-    if: false  # Enable when test assets are available in CI
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: vm-macos
-      - name: VM lifecycle tests
-        env:
-          VMRS_TEST_KERNEL: ${{ github.workspace }}/testdata/vmlinuz
-          VMRS_TEST_INITRAMFS: ${{ github.workspace }}/testdata/initramfs
-        run: cargo test --test vm_lifecycle
-        timeout-minutes: 10
-
+  # ── VM lifecycle tests (Linux — KVM available on GitHub runners) ──
   vm-linux:
     name: VM Lifecycle (Linux)
     runs-on: ubuntu-latest
-    if: false  # Enable when cloud-hypervisor + test assets are available
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: vm-linux
+
+      - name: Check KVM availability
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::warning::KVM not available — skipping VM tests"
+            echo "KVM_AVAILABLE=false" >> $GITHUB_ENV
+          else
+            sudo chmod 666 /dev/kvm
+            echo "KVM_AVAILABLE=true" >> $GITHUB_ENV
+          fi
+
       - name: Install Cloud Hypervisor
+        if: env.KVM_AVAILABLE == 'true'
         run: |
           CH_VERSION="v42.0"
-          curl -L "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static" \
+          sudo curl -L "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static" \
             -o /usr/local/bin/cloud-hypervisor
-          chmod +x /usr/local/bin/cloud-hypervisor
+          sudo chmod +x /usr/local/bin/cloud-hypervisor
           cloud-hypervisor --version
-      - name: Check KVM
+
+      - name: Download Alpine test assets
+        if: env.KVM_AVAILABLE == 'true'
         run: |
-          ls -la /dev/kvm || echo "KVM not available"
-          sudo chmod 666 /dev/kvm 2>/dev/null || true
+          ALPINE_VERSION="3.20"
+          ARCH="x86_64"
+          BASE_URL="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}/releases/${ARCH}/netboot"
+
+          mkdir -p testdata
+          echo "Downloading Alpine ${ALPINE_VERSION} kernel..."
+          curl -fsSL "${BASE_URL}/vmlinuz-virt" -o testdata/vmlinuz
+
+          echo "Downloading Alpine ${ALPINE_VERSION} initramfs..."
+          curl -fsSL "${BASE_URL}/initramfs-virt" -o testdata/initramfs
+
+          ls -lh testdata/
+
       - name: VM lifecycle tests
+        if: env.KVM_AVAILABLE == 'true'
         env:
           VMRS_TEST_KERNEL: ${{ github.workspace }}/testdata/vmlinuz
           VMRS_TEST_INITRAMFS: ${{ github.workspace }}/testdata/initramfs
-        run: cargo test --test vm_lifecycle
+        run: cargo test --test vm_lifecycle -- --test-threads=1
         timeout-minutes: 10
+
+  # ── VM lifecycle tests (macOS) ─────────────────────────────────────
+  # macOS runners lack the Virtualization.framework entitlement required
+  # by Apple VZ. These tests must be run manually on entitled hardware.
+  # vm-macos:
+  #   name: VM Lifecycle (macOS)
+  #   runs-on: macos-latest
+  #   if: false  # No VZ entitlement on GitHub runners

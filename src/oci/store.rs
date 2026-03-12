@@ -656,6 +656,9 @@ mod tests {
             !subdir.join("old_dir").exists(),
             "opaque whiteout should remove directories"
         );
-        assert!(subdir.exists(), "opaque whiteout should keep the parent dir");
+        assert!(
+            subdir.exists(),
+            "opaque whiteout should keep the parent dir"
+        );
     }
 }
