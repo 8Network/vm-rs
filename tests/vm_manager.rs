@@ -44,12 +44,6 @@ impl MockDriver {
     fn set_fail_boot(&self, msg: &str) {
         *self.fail_boot.lock().unwrap() = Some(msg.to_string());
     }
-
-    fn set_vm_state(&self, name: &str, state: VmState) {
-        if let Some(vm) = self.vms.lock().unwrap().get_mut(name) {
-            vm.state = state;
-        }
-    }
 }
 
 impl VmDriver for MockDriver {
@@ -126,7 +120,8 @@ impl VmDriver for MockDriver {
 
 fn make_manager(driver: MockDriver) -> VmManager {
     let tmp = tempfile::tempdir().expect("tempdir");
-    VmManager::with_driver(Box::new(driver), tmp.into_path()).expect("manager")
+    let path = tmp.keep();
+    VmManager::with_driver(Box::new(driver), path).expect("manager")
 }
 
 fn make_config(name: &str) -> VmConfig {

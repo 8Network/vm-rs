@@ -474,7 +474,7 @@ fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> bool {
 }
 
 /// Kill and reap virtiofsd sidecar processes.
-fn cleanup_virtiofsd(children: &mut Vec<std::process::Child>) {
+fn cleanup_virtiofsd(children: &mut [std::process::Child]) {
     for child in children.iter_mut() {
         let pid = child.id();
         if let Err(e) = child.kill() {

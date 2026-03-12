@@ -554,11 +554,11 @@ mod tests {
             // Pad to 512-byte boundary
             let remainder = content.len() % 512;
             if remainder > 0 {
-                buf.extend(std::iter::repeat(0u8).take(512 - remainder));
+                buf.extend(std::iter::repeat_n(0u8, 512 - remainder));
             }
         }
         // Two zero blocks = end of archive
-        buf.extend(std::iter::repeat(0u8).take(1024));
+        buf.extend(std::iter::repeat_n(0u8, 1024));
         buf
     }
 
