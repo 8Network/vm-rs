@@ -376,13 +376,24 @@ fn forwarding_loop(
 /// Send a single Ethernet frame to a socket fd. Best-effort (drops if buffer full).
 fn send_frame(fd: RawFd, frame: &[u8]) {
     // SAFETY: Sending to our own fd. MSG_DONTWAIT prevents blocking on full buffer.
-    unsafe {
+    let ret = unsafe {
         libc::send(
             fd,
             frame.as_ptr() as *const libc::c_void,
             frame.len(),
             libc::MSG_DONTWAIT,
-        );
+        )
+    };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        let errno = err.raw_os_error();
+        if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
+            // Buffer full — expected in best-effort mode, drop silently.
+        } else if errno == Some(libc::EBADF) || errno == Some(libc::EPIPE) {
+            tracing::warn!(fd = fd, error = %err, "send_frame failed: socket closed or invalid");
+        } else {
+            tracing::warn!(fd = fd, error = %err, "send_frame failed");
+        }
     }
 }
 

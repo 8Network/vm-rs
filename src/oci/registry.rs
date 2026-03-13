@@ -10,9 +10,14 @@
 //! 4. GET config blob
 //! 5. GET layer blobs (parallel, skip if already cached)
 
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use super::store::{ImageManifest, ImageStore};
+
+/// Maximum blob size we're willing to download (10 GB).
+const MAX_BLOB_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Parsed image reference: registry/repo:tag
 #[derive(Debug, Clone)]
@@ -76,6 +81,8 @@ pub async fn pull(image: &str, store: &ImageStore) -> Result<ImageManifest, OciE
     let image_ref = parse_image_ref(image);
     let client = reqwest::Client::builder()
         .user_agent("vm-rs/0.1")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| OciError::Http(format!("failed to create HTTP client: {}", e)))?;
 
@@ -188,10 +195,13 @@ pub fn parse_image_ref(image: &str) -> ImageRef {
 
 async fn authenticate(client: &reqwest::Client, image_ref: &ImageRef) -> Result<String, OciError> {
     if image_ref.registry == "registry-1.docker.io" {
-        let url = format!(
-            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{}:pull",
-            image_ref.repository
-        );
+        let scope = format!("repository:{}:pull", image_ref.repository);
+        let url = reqwest::Url::parse_with_params(
+            "https://auth.docker.io/token",
+            &[("service", "registry.docker.io"), ("scope", &scope)],
+        )
+        .map_err(|e| OciError::Auth(format!("failed to build auth URL: {}", e)))?
+        .to_string();
         let resp = client
             .get(&url)
             .send()
@@ -309,6 +319,16 @@ async fn fetch_blob(
         .error_for_status()
         .map_err(|e| OciError::Http(format!("blob fetch failed: {}", e)))?;
 
+    // Check Content-Length against max before streaming
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_BLOB_SIZE {
+            return Err(OciError::Blob(format!(
+                "blob {} exceeds maximum allowed size: {} bytes (max {} bytes)",
+                digest, content_length, MAX_BLOB_SIZE
+            )));
+        }
+    }
+
     // Stream into buffer instead of loading entire blob at once.
     // OCI layers can be hundreds of MB.
     let mut buf = Vec::new();
@@ -317,6 +337,14 @@ async fn fetch_blob(
         let chunk =
             chunk.map_err(|e| OciError::Http(format!("failed to read blob chunk: {}", e)))?;
         buf.extend_from_slice(&chunk);
+        if buf.len() as u64 > MAX_BLOB_SIZE {
+            return Err(OciError::Blob(format!(
+                "blob {} exceeded maximum allowed size during download: {} bytes (max {} bytes)",
+                digest,
+                buf.len(),
+                MAX_BLOB_SIZE
+            )));
+        }
     }
     Ok(buf)
 }
@@ -413,11 +441,13 @@ fn parse_www_authenticate(header: &str, repository: &str) -> Option<String> {
     }
 
     let realm = realm?;
-    let mut url = format!("{}?scope=repository:{}:pull", realm, repository);
-    if let Some(svc) = service {
-        url = format!("{}&service={}", url, svc);
+    let scope = format!("repository:{}:pull", repository);
+    let mut params: Vec<(&str, &str)> = vec![("scope", &scope)];
+    if let Some(ref svc) = service {
+        params.push(("service", svc));
     }
-    Some(url)
+    let parsed = reqwest::Url::parse_with_params(&realm, &params).ok()?;
+    Some(parsed.to_string())
 }
 
 /// OCI registry/store errors.
