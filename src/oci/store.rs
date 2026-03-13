@@ -87,13 +87,25 @@ impl ImageStore {
 
     /// Check if a blob exists locally.
     pub fn has_blob(&self, digest: &str) -> bool {
-        self.blob_path(digest).exists()
+        match self.blob_path(digest) {
+            Ok(path) => path.exists(),
+            Err(_) => false,
+        }
     }
 
     /// Get the path to a blob by its sha256 digest.
-    pub fn blob_path(&self, digest: &str) -> PathBuf {
+    ///
+    /// Returns an error if the digest contains non-hex characters after the
+    /// `sha256:` prefix, preventing path traversal via crafted digests.
+    pub fn blob_path(&self, digest: &str) -> Result<PathBuf, OciError> {
         let hash = digest.strip_prefix("sha256:").unwrap_or(digest);
-        self.root.join("blobs/sha256").join(hash)
+        if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(OciError::Blob(format!(
+                "invalid digest: '{}' contains non-hex characters",
+                digest
+            )));
+        }
+        Ok(self.root.join("blobs/sha256").join(hash))
     }
 
     /// Write a blob and verify its digest.
@@ -110,14 +122,14 @@ impl ImageStore {
             )));
         }
 
-        let path = self.blob_path(digest);
+        let path = self.blob_path(digest)?;
         std::fs::write(&path, data)?;
         Ok(path)
     }
 
     /// Read a blob's bytes.
     pub fn get_blob(&self, digest: &str) -> Result<Vec<u8>, OciError> {
-        let path = self.blob_path(digest);
+        let path = self.blob_path(digest)?;
         std::fs::read(&path)
             .map_err(|e| OciError::Blob(format!("failed to read blob {}: {}", digest, e)))
     }
@@ -180,7 +192,7 @@ impl ImageStore {
                         .layer_digests
                         .iter()
                         .filter_map(|d| {
-                            let path = self.blob_path(d);
+                            let path = self.blob_path(d).ok()?;
                             std::fs::metadata(&path).ok().map(|m| m.len())
                         })
                         .sum();
@@ -273,7 +285,7 @@ impl ImageStore {
         std::fs::create_dir_all(target)?;
 
         for (i, digest) in manifest.layer_digests.iter().enumerate() {
-            let blob_path = self.blob_path(digest);
+            let blob_path = self.blob_path(digest)?;
             if !blob_path.exists() {
                 return Err(OciError::Blob(format!("missing layer blob: {}", digest)));
             }
@@ -389,15 +401,15 @@ fn is_gzip(path: &Path) -> Result<bool, OciError> {
 }
 
 fn sanitize_name(s: &str) -> String {
-    s.replace('/', "_slash_").replace(':', "_colon_")
+    s.replace("..", "_dotdot_")
+        .replace('/', "_slash_")
+        .replace(':', "_colon_")
 }
 
 fn unsanitize_name(s: &str) -> String {
-    let result = s.replace("_slash_", "/").replace("_colon_", ":");
-    if result == s && s.contains('_') && !s.contains('/') {
-        return s.replacen('_', "/", 1);
-    }
-    result
+    s.replace("_dotdot_", "..")
+        .replace("_slash_", "/")
+        .replace("_colon_", ":")
 }
 
 #[cfg(test)]
@@ -454,9 +466,19 @@ mod tests {
     fn blob_path_strips_prefix() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path()).unwrap();
-        let path = store.blob_path("sha256:abc123def456");
+        let path = store.blob_path("sha256:abc123def456").unwrap();
         // Use Path::ends_with for platform-independent separator handling
         assert!(path.ends_with(std::path::Path::new("blobs/sha256/abc123def456")));
+    }
+
+    #[test]
+    fn blob_path_rejects_non_hex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path()).unwrap();
+        assert!(store.blob_path("sha256:../../../etc/passwd").is_err());
+        assert!(store.blob_path("sha256:abc_xyz").is_err());
+        assert!(store.blob_path("sha256:").is_err());
+        assert!(store.blob_path("sha256:ABCDEF0123456789abcdef").is_ok());
     }
 
     #[test]
@@ -474,6 +496,28 @@ mod tests {
         let name = "alpine";
         let sanitized = sanitize_name(name);
         assert_eq!(sanitized, "alpine");
+    }
+
+    #[test]
+    fn sanitize_rejects_path_traversal() {
+        let name = "../../etc/passwd";
+        let sanitized = sanitize_name(name);
+        assert!(
+            !sanitized.contains(".."),
+            "sanitized name must not contain '..'"
+        );
+        let unsanitized = unsanitize_name(&sanitized);
+        assert_eq!(unsanitized, name, "roundtrip must preserve original name");
+    }
+
+    #[test]
+    fn unsanitize_no_false_slash_heuristic() {
+        // Names with underscores that are NOT sanitization markers must NOT
+        // have their underscores converted to slashes.
+        let name = "my_image";
+        let sanitized = sanitize_name(name);
+        let unsanitized = unsanitize_name(&sanitized);
+        assert_eq!(unsanitized, "my_image", "underscore must not become slash");
     }
 
     #[test]

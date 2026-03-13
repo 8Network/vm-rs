@@ -343,7 +343,11 @@ async fn download_file_to_tmp(
 ) -> Result<(), SetupError> {
     use tokio::io::AsyncWriteExt;
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| SetupError::AssetDownload(format!("failed to create HTTP client: {}", e)))?;
     let resp = client.get(url).send().await.map_err(|e| {
         SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
     })?;
