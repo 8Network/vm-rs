@@ -237,6 +237,7 @@ fn build_network_config(config: &SeedConfig<'_>) -> String {
     nc
 }
 
+#[allow(unused_variables)] // used on macOS/Linux, not on unsupported platforms
 fn create_iso_image(iso_path: &Path, source_dir: &Path) -> Result<(), SetupError> {
     #[cfg(target_os = "macos")]
     {
@@ -592,24 +593,48 @@ mod tests {
         let ud = build_user_data(&config);
 
         // Mount tag: must appear shell-quoted (surrounded by single-quotes), never bare.
-        assert!(ud.contains("'tag;evil'"), "mount tag must appear shell-quoted");
+        assert!(
+            ud.contains("'tag;evil'"),
+            "mount tag must appear shell-quoted"
+        );
         // The bare (unquoted) form with a leading space or comma would be injectable.
-        assert!(!ud.contains(", tag;evil"), "mount tag must not appear as bare YAML element");
-        assert!(!ud.contains("\" tag;evil\""), "mount tag must not appear unquoted in string");
+        assert!(
+            !ud.contains(", tag;evil"),
+            "mount tag must not appear as bare YAML element"
+        );
+        assert!(
+            !ud.contains("\" tag;evil\""),
+            "mount tag must not appear unquoted in string"
+        );
 
         // Mount point: same rule.
-        assert!(ud.contains("'/mnt/$(evil)'"), "mount point must appear shell-quoted");
-        assert!(!ud.contains(", /mnt/$(evil)"), "mount point must not appear as bare YAML element");
+        assert!(
+            ud.contains("'/mnt/$(evil)'"),
+            "mount point must appear shell-quoted"
+        );
+        assert!(
+            !ud.contains(", /mnt/$(evil)"),
+            "mount point must not appear as bare YAML element"
+        );
 
         // Process command: the semicolon injection must be inside single-quotes.
-        assert!(ud.contains("'/bin/app; rm -rf /'"), "command must appear shell-quoted");
+        assert!(
+            ud.contains("'/bin/app; rm -rf /'"),
+            "command must appear shell-quoted"
+        );
 
         // Args: $() injection must be inside single-quotes.
         assert!(ud.contains("'$(whoami)'"), "arg must appear shell-quoted");
-        assert!(!ud.contains(", $(whoami)"), "arg must not appear as bare YAML element");
+        assert!(
+            !ud.contains(", $(whoami)"),
+            "arg must not appear as bare YAML element"
+        );
 
         // Env value: $() injection must be inside single-quotes.
-        assert!(ud.contains("'value$(id)'"), "env value must appear shell-quoted");
+        assert!(
+            ud.contains("'value$(id)'"),
+            "env value must appear shell-quoted"
+        );
 
         // Health check: the semicolon injection must be inside single-quotes.
         assert!(

@@ -5,7 +5,7 @@ Boot, stop, and orchestrate lightweight virtual machines on macOS, Linux, and Wi
 
 - **macOS**: Apple Virtualization.framework (in-process, via Objective-C FFI)
 - **Linux**: Cloud Hypervisor (separate VMM process, CLI mode)
-- **Windows**: WHP driver planned (compiles and tests today, VM driver coming)
+- **Windows**: Windows Hypervisor Platform (in-process, same technology as WSL2)
 
 ## Quick Start
 
@@ -76,8 +76,9 @@ See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for the full capability matrix 
 
 ### Windows
 
-- Windows 10/11 with Hyper-V enabled (WHP driver planned)
-- OCI, setup, and core types work today; VM lifecycle driver coming
+- Windows 10 build 17134+ or Windows 11
+- Hyper-V / Windows Hypervisor Platform enabled in Windows Features
+- Intel VT-x or AMD-V
 
 ## Building
 
@@ -102,17 +103,16 @@ VmManager              Multi-VM orchestration, auto-selects driver
   VmDriver trait       Platform-agnostic lifecycle interface
     AppleVzDriver      macOS: VZ framework via ObjC FFI + GCD queues
     CloudHvDriver      Linux: cloud-hypervisor process + signals
+    WhpDriver          Windows: WHP partition + vCPU threads
   NetworkSwitch        L2 userspace Ethernet switch (macOS)
   OciStore + pull()    Content-addressable OCI image store
   setup::              Cloud-init ISOs, image download, SSH keys
 ```
 
-The Apple VZ driver dispatches all Objective-C calls to per-VM GCD serial queues.
-The calling thread never makes ObjC calls directly — this prevents autorelease pool
-corruption that causes SIGSEGV at thread exit.
-
-The Cloud Hypervisor driver spawns `cloud-hypervisor` as a child process and manages
-lifecycle via signals. The `Child` handle prevents PID reuse.
+Each platform driver is an in-process implementation optimized for its hypervisor:
+- **macOS**: ObjC/GCD dispatch queues prevent autorelease pool corruption
+- **Linux**: Cloud Hypervisor child process with `Child` handle for PID safety
+- **Windows**: WHP partitions with dedicated vCPU threads and COM1 serial emulation
 
 ## Testing
 

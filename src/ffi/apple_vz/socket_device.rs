@@ -73,8 +73,7 @@ impl VZVirtioSocketDevice {
     /// Must be called on the VM's dispatch queue.
     pub fn connect_to_port(&self, port: u32, completion_handler: &Block<(Id, Id), ()>) {
         unsafe {
-            let _: () =
-                msg_send![*self.0, connectToPort:port completionHandler:completion_handler];
+            let _: () = msg_send![*self.0, connectToPort:port completionHandler:completion_handler];
         }
     }
 

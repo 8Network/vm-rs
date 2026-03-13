@@ -119,9 +119,7 @@ impl VmDriver for MockDriver {
         match vms.get_mut(&handle.name) {
             Some(vm) => {
                 if !matches!(vm.state, VmState::Running { .. }) {
-                    return Err(VmError::Hypervisor(
-                        "can only pause a running VM".into(),
-                    ));
+                    return Err(VmError::Hypervisor("can only pause a running VM".into()));
                 }
                 vm.state = VmState::Paused;
                 Ok(())
@@ -137,9 +135,7 @@ impl VmDriver for MockDriver {
         match vms.get_mut(&handle.name) {
             Some(vm) => {
                 if vm.state != VmState::Paused {
-                    return Err(VmError::Hypervisor(
-                        "can only resume a paused VM".into(),
-                    ));
+                    return Err(VmError::Hypervisor("can only resume a paused VM".into()));
                 }
                 vm.state = VmState::Running {
                     ip: "10.0.0.99".into(),
@@ -412,7 +408,9 @@ fn resume_paused_vm_returns_to_running() {
     manager.start(&config).expect("boot");
     manager.pause("mock-resume").expect("pause");
 
-    manager.resume("mock-resume").expect("resume should succeed");
+    manager
+        .resume("mock-resume")
+        .expect("resume should succeed");
 
     // After resume, the manager sets state to Starting (waiting for ready marker).
     // But the mock driver already set it to Running internally.
@@ -478,10 +476,7 @@ fn pause_resume_cycle() {
 
     // Pause → verify paused → resume → verify running
     manager.pause("mock-cycle").expect("pause");
-    assert_eq!(
-        manager.state("mock-cycle").expect("state"),
-        VmState::Paused
-    );
+    assert_eq!(manager.state("mock-cycle").expect("state"), VmState::Paused);
 
     manager.resume("mock-cycle").expect("resume");
     let state = manager.state("mock-cycle").expect("state");
@@ -489,10 +484,7 @@ fn pause_resume_cycle() {
 
     // Can pause again after resume
     manager.pause("mock-cycle").expect("second pause");
-    assert_eq!(
-        manager.state("mock-cycle").expect("state"),
-        VmState::Paused
-    );
+    assert_eq!(manager.state("mock-cycle").expect("state"), VmState::Paused);
 }
 
 // ─── Machine ID tests ──────────────────────────────────────────────────
@@ -522,7 +514,10 @@ fn boot_returns_machine_id() {
 fn config_new_fields_default_values() {
     let config = make_config("mock-defaults");
     assert!(!config.vsock, "vsock should default to false");
-    assert!(config.machine_id.is_none(), "machine_id should default to None");
+    assert!(
+        config.machine_id.is_none(),
+        "machine_id should default to None"
+    );
     assert!(
         config.efi_variable_store.is_none(),
         "efi_variable_store should default to None"

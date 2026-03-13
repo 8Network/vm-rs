@@ -2,7 +2,7 @@
 name = "vm-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Cross-platform VM lifecycle management — Apple VZ (macOS), Cloud Hypervisor (Linux), WHP (Windows planned)"
+description = "Cross-platform VM lifecycle management — Apple VZ (macOS), Cloud Hypervisor (Linux), WHP (Windows)"
 license = "MIT"
 repository = "https://github.com/8Network/vm-rs"
 homepage = "https://github.com/8Network/vm-rs"
@@ -51,6 +51,10 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"
 objc = "0.2"
+
+# Windows: Windows Hypervisor Platform (WHP) — same hypervisor as WSL2/Docker Desktop
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = ["Win32_System_Hypervisor", "Win32_System_Memory", "Win32_Foundation"] }
 
 [dev-dependencies]
 tempfile = "3"

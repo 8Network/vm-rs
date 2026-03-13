@@ -1,7 +1,7 @@
 //! virtual machine module
 
 use super::{
-    base::{Id, NSArray, NSError, NSURL, NIL},
+    base::{Id, NSArray, NSError, NIL, NSURL},
     boot_loader::VZBootLoader,
     entropy_device::VZEntropyDeviceConfiguration,
     memory_device::VZMemoryBalloonDeviceConfiguration,
@@ -398,13 +398,10 @@ impl VZVirtualMachine {
     ///
     /// # Safety
     /// Must be called from the VM's dispatch queue.
-    pub fn save_machine_state_to_url(
-        &self,
-        url: &NSURL,
-        completion_handler: &Block<(Id,), ()>,
-    ) {
+    pub fn save_machine_state_to_url(&self, url: &NSURL, completion_handler: &Block<(Id,), ()>) {
         unsafe {
-            let _: () = msg_send![*self.0, saveMachineStateTo:*url.0 completionHandler:completion_handler];
+            let _: () =
+                msg_send![*self.0, saveMachineStateTo:*url.0 completionHandler:completion_handler];
         }
     }
 

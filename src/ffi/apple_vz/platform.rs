@@ -78,8 +78,7 @@ impl VZGenericMachineIdentifier {
     pub fn from_data(data: &[u8]) -> Option<Self> {
         unsafe {
             let nsdata_alloc: Id = msg_send![class!(NSData), alloc];
-            let nsdata: Id =
-                msg_send![nsdata_alloc, initWithBytes:data.as_ptr() length:data.len()];
+            let nsdata: Id = msg_send![nsdata_alloc, initWithBytes:data.as_ptr() length:data.len()];
             if nsdata.is_null() {
                 return None;
             }

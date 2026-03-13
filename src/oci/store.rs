@@ -455,9 +455,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path()).unwrap();
         let path = store.blob_path("sha256:abc123def456");
-        assert!(path
-            .to_string_lossy()
-            .ends_with("blobs/sha256/abc123def456"));
+        // Use Path::ends_with for platform-independent separator handling
+        assert!(path.ends_with(std::path::Path::new("blobs/sha256/abc123def456")));
     }
 
     #[test]
@@ -499,7 +498,10 @@ mod tests {
             ]
         }"#;
         let result = ImageStore::parse_manifest(manifest_json.as_bytes());
-        assert!(result.is_err(), "layer with missing digest must be a parse error");
+        assert!(
+            result.is_err(),
+            "layer with missing digest must be a parse error"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("layer missing digest"),

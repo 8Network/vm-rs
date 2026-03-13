@@ -59,7 +59,6 @@ pub struct VmConfig {
     pub netns: Option<String>,
 
     // ─── New capabilities ───────────────────────────────────────────────
-
     /// Enable vsock device for host↔guest communication (default: false).
     ///
     /// vsock provides bidirectional, FD-based I/O without network setup.

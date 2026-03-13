@@ -4,11 +4,16 @@
 //! - `AppleVzDriver` — macOS via Apple Virtualization.framework
 //! - `CloudHvDriver` — Linux via Cloud Hypervisor REST API
 
+pub mod boot;
+
 #[cfg(target_os = "macos")]
 pub mod apple_vz;
 
 #[cfg(target_os = "linux")]
 pub mod cloud_hv;
+
+#[cfg(target_os = "windows")]
+pub mod whp;
 
 use crate::config::{VmConfig, VmHandle, VmState};
 
