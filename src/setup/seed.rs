@@ -91,6 +91,13 @@ pub struct HealthCheckConfig {
 /// On macOS: uses `hdiutil makehybrid` to create the ISO.
 /// On Linux: uses `genisoimage` or `mkisofs`.
 pub fn create_seed_iso(iso_path: &Path, config: &SeedConfig<'_>) -> Result<(), SetupError> {
+    if !is_safe_hostname(config.hostname) {
+        return Err(SetupError::Config(format!(
+            "unsafe hostname: '{}'. Hostnames must contain only alphanumeric characters, hyphens, and dots (max 253 chars).",
+            config.hostname
+        )));
+    }
+
     let tmp_dir = iso_path
         .parent()
         .ok_or_else(|| SetupError::Config("no parent directory for ISO path".into()))?
@@ -225,6 +232,10 @@ fn build_user_data(config: &SeedConfig<'_>) -> String {
 fn build_network_config(config: &SeedConfig<'_>) -> String {
     let mut nc = String::from("version: 2\nethernets:\n");
     for nic in &config.nics {
+        if !is_safe_identifier(&nic.name) {
+            tracing::error!(nic = %nic.name, "rejecting unsafe NIC name in network config");
+            continue;
+        }
         nc.push_str(&format!("  {}:\n", nic.name));
         nc.push_str(&format!("    addresses: [{}]\n", nic.ip));
         if let Some(ref gw) = nic.gateway {
@@ -336,6 +347,17 @@ fn is_safe_hostname(s: &str) -> bool {
         && s.len() <= 253
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+}
+
+/// Validate an identifier (NIC name, tag, etc.) contains only safe characters
+/// (alphanumeric, hyphens, underscores, dots). Must not be empty or contain
+/// shell metacharacters, path separators, or whitespace.
+fn is_safe_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && !s.contains("..")
 }
 
 /// Validate an IP address contains only safe characters (digits, dots, colons for IPv6).
@@ -652,6 +674,62 @@ mod tests {
         assert!(!runcmd_lines.is_empty(), "must have runcmd entries");
     }
 
+    // ── is_safe_identifier ───────────────────────────────────────────────
+
+    #[test]
+    fn identifier_valid() {
+        assert!(is_safe_identifier("eth0"));
+        assert!(is_safe_identifier("net-1"));
+        assert!(is_safe_identifier("my_nic.0"));
+    }
+
+    #[test]
+    fn identifier_empty() {
+        assert!(!is_safe_identifier(""));
+    }
+
+    #[test]
+    fn identifier_rejects_shell_chars() {
+        assert!(!is_safe_identifier("eth0; rm -rf /"));
+        assert!(!is_safe_identifier("eth0$(whoami)"));
+        assert!(!is_safe_identifier("eth0\nmalicious"));
+    }
+
+    #[test]
+    fn identifier_rejects_path_traversal() {
+        assert!(!is_safe_identifier("../etc"));
+        assert!(!is_safe_identifier("a..b"));
+    }
+
+    #[test]
+    fn identifier_rejects_slashes() {
+        assert!(!is_safe_identifier("eth0/evil"));
+    }
+
+    // ── create_seed_iso hostname validation ─────────────────────────────
+
+    #[test]
+    fn seed_iso_rejects_unsafe_hostname() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_path = tmp.path().join("seed.iso");
+        let config = SeedConfig {
+            hostname: "host; rm -rf /",
+            ssh_pubkey: "ssh-ed25519 AAAA...",
+            nics: vec![],
+            process: None,
+            volumes: vec![],
+            healthcheck: None,
+            extra_hosts: vec![],
+        };
+        let result = create_seed_iso(&iso_path, &config);
+        assert!(result.is_err(), "unsafe hostname must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unsafe hostname"),
+            "error should mention unsafe hostname, got: {err}"
+        );
+    }
+
     // ── build_network_config ─────────────────────────────────────────────
 
     #[test]
@@ -674,6 +752,28 @@ mod tests {
         assert!(nc.contains("eth0:"));
         assert!(nc.contains("addresses: [10.0.1.2/24]"));
         assert!(nc.contains("via: 10.0.1.1"));
+    }
+
+    #[test]
+    fn network_config_rejects_unsafe_nic_name() {
+        let config = SeedConfig {
+            hostname: "test-vm",
+            ssh_pubkey: "ssh-ed25519 AAAA...",
+            nics: vec![NicConfig {
+                name: "eth0; rm -rf /".into(),
+                ip: "10.0.1.2/24".into(),
+                gateway: None,
+            }],
+            process: None,
+            volumes: vec![],
+            healthcheck: None,
+            extra_hosts: vec![],
+        };
+        let nc = build_network_config(&config);
+        assert!(
+            !nc.contains("eth0;"),
+            "unsafe NIC name must be rejected from network config"
+        );
     }
 
     #[test]

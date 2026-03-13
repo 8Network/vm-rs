@@ -409,20 +409,13 @@ fn find_ch_binary() -> Result<PathBuf, VmError> {
 
 /// Generate a deterministic MAC address from a VM name.
 /// Uses the QEMU OUI prefix (52:54:00) for locally administered addresses.
+/// Uses SHA-256 instead of DefaultHasher for stability across Rust versions.
 fn generate_mac(name: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    format!(
-        "52:54:00:{:02x}:{:02x}:{:02x}",
-        (hash >> 16) as u8,
-        (hash >> 8) as u8,
-        hash as u8
-    )
+    let hash = Sha256::digest(name.as_bytes());
+    // Take the first 3 bytes of the SHA-256 output for the MAC suffix
+    format!("52:54:00:{:02x}:{:02x}:{:02x}", hash[0], hash[1], hash[2])
 }
 
 /// Find the virtiofsd binary on PATH or well-known locations.

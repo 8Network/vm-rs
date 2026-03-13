@@ -57,7 +57,7 @@ async fn pull_alpine_image_from_dockerhub() {
 
             // Verify blobs exist on disk
             for digest in &manifest.layer_digests {
-                let blob_path = store.blob_path(digest);
+                let blob_path = store.blob_path(digest).expect("valid digest");
                 assert!(
                     blob_path.exists(),
                     "blob {} should exist at {}",
@@ -67,7 +67,9 @@ async fn pull_alpine_image_from_dockerhub() {
             }
 
             // Verify config exists
-            let config_path = store.blob_path(&manifest.config_digest);
+            let config_path = store
+                .blob_path(&manifest.config_digest)
+                .expect("valid config digest");
             assert!(config_path.exists(), "config blob should exist");
 
             // Parse the config
