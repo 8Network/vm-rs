@@ -50,7 +50,13 @@ impl ReadyMarkerCache {
             self.tail.clear();
         }
 
-        if file.seek(SeekFrom::Start(self.scan_offset)).is_err() {
+        if let Err(e) = file.seek(SeekFrom::Start(self.scan_offset)) {
+            tracing::warn!(
+                path = %log_path.display(),
+                offset = self.scan_offset,
+                "failed to seek serial log while checking readiness: {}",
+                e
+            );
             return None;
         }
 

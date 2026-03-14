@@ -306,7 +306,7 @@ impl VmDriver for CloudHvDriver {
         // SIGTERM → Cloud Hypervisor handles graceful ACPI shutdown
         // SAFETY: Sending SIGTERM to a PID we spawned. PID validity confirmed by prior operations.
         let ret = unsafe { libc::kill(process.identity.pid() as i32, libc::SIGTERM) };
-        if ret != 0 {
+        let wait_result = if ret != 0 {
             let errno = std::io::Error::last_os_error();
             tracing::warn!(
                 driver = "cloud_hv",
@@ -315,6 +315,7 @@ impl VmDriver for CloudHvDriver {
                 error = %errno,
                 "SIGTERM failed (process may already be stopped)"
             );
+            Ok(())
         } else {
             // Wait for process to exit (up to 10s)
             wait_for_exit(process.child, std::time::Duration::from_secs(10)).map_err(|e| {
@@ -326,12 +327,12 @@ impl VmDriver for CloudHvDriver {
                         e
                     ),
                 }
-            })?;
-        }
+            })
+        };
 
         cleanup_taps(&process.tap_devices);
         cleanup_virtiofsd(&process.virtiofsd_pids);
-        Ok(())
+        wait_result
     }
 
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
@@ -381,17 +382,19 @@ impl VmDriver for CloudHvDriver {
         };
         kill_result?;
 
-        if let Some(child) = child {
+        let wait_result = if let Some(child) = child {
             wait_for_exit(child, std::time::Duration::from_secs(2)).map_err(|e| {
                 VmError::StopFailed {
                     name: handle.name.clone(),
                     detail: format!("failed to reap killed VM PID {}: {}", identity.pid(), e),
                 }
-            })?;
-        }
+            })
+        } else {
+            Ok(())
+        };
 
         cleanup_virtiofsd(&virtiofsd_pids);
-        Ok(())
+        wait_result
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
@@ -548,7 +551,8 @@ fn cleanup_virtiofsd(pids: &[u32]) {
 }
 
 /// Wait for a tracked child process to exit.
-/// If the process doesn't exit within the timeout, escalates to SIGKILL.
+/// If the process doesn't exit within the timeout, escalates to SIGKILL and
+/// reports that the graceful stop timed out.
 fn wait_for_exit(mut child: Child, timeout: std::time::Duration) -> std::io::Result<()> {
     let start = std::time::Instant::now();
     let pid = child.id();
@@ -569,7 +573,14 @@ fn wait_for_exit(mut child: Child, timeout: std::time::Duration) -> std::io::Res
     tracing::warn!(pid = pid, elapsed_ms = %timeout.as_millis(), "process did not exit within timeout, sending SIGKILL");
     child.kill()?;
     let _status = child.wait()?;
-    Ok(())
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "PID {} required SIGKILL after waiting {} ms",
+            pid,
+            timeout.as_millis()
+        ),
+    ))
 }
 
 fn wait_for_pid_exit(
