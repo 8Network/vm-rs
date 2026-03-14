@@ -38,6 +38,12 @@ pub struct CloudHvDriver {
     vms: Mutex<HashMap<String, VmProcess>>,
 }
 
+impl Default for CloudHvDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CloudHvDriver {
     pub fn new() -> Self {
         Self {
@@ -198,7 +204,7 @@ impl VmDriver for CloudHvDriver {
             name: name.clone(),
             detail: format!("failed to create VMM log file: {}", e),
         })?;
-        let vmm_log_stderr = vmm_log.try_clone().map_err(|e| VmError::Io(e))?;
+        let vmm_log_stderr = vmm_log.try_clone().map_err(VmError::Io)?;
         let mut process = cmd
             .stdout(vmm_log)
             .stderr(vmm_log_stderr)
@@ -221,7 +227,7 @@ impl VmDriver for CloudHvDriver {
 
         // Brief pause then check if process exited immediately (bad binary, permissions, etc.)
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Some(status) = process.try_wait().map_err(|e| VmError::Io(e))? {
+        if let Some(status) = process.try_wait().map_err(VmError::Io)? {
             // Clean up virtiofsd processes since VM failed
             cleanup_virtiofsd(&virtiofsd_pids);
             return Err(VmError::BootFailed {

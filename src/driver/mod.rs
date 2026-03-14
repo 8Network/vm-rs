@@ -11,6 +11,9 @@ pub mod apple_vz;
 pub mod cloud_hv;
 
 #[cfg(target_os = "windows")]
+pub mod boot;
+
+#[cfg(target_os = "windows")]
 pub mod whp;
 
 use crate::config::{VmConfig, VmHandle, VmState};
