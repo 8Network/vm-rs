@@ -355,22 +355,22 @@ impl VmDriver for CloudHvDriver {
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
-        let (identity, mut child, virtiofsd_children, tap_devices) = if let Some(process) = vms.remove(&handle.name)
-        {
-            (
-                process.identity,
-                Some(process.child),
-                process.virtiofsd_children,
-                process.tap_devices,
-            )
-        } else if let Some(ref process) = handle.process {
-            validate_cloud_hypervisor_process(process, &handle.name)?;
-            (process.clone(), None, Vec::new(), Vec::new())
-        } else {
-            return Err(VmError::NotFound {
-                name: handle.name.clone(),
-            });
-        };
+        let (identity, mut child, virtiofsd_children, tap_devices) =
+            if let Some(process) = vms.remove(&handle.name) {
+                (
+                    process.identity,
+                    Some(process.child),
+                    process.virtiofsd_children,
+                    process.tap_devices,
+                )
+            } else if let Some(ref process) = handle.process {
+                validate_cloud_hypervisor_process(process, &handle.name)?;
+                (process.clone(), None, Vec::new(), Vec::new())
+            } else {
+                return Err(VmError::NotFound {
+                    name: handle.name.clone(),
+                });
+            };
 
         let kill_result = if let Some(child) = child.as_mut() {
             child.kill().map_err(|e| VmError::StopFailed {
