@@ -5,8 +5,12 @@
 //! SSH keys, network config, startup scripts, and health checks.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::SetupError;
+
+static SEED_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -89,40 +93,63 @@ pub struct HealthCheckConfig {
 /// On macOS: uses `hdiutil makehybrid` to create the ISO.
 /// On Linux: uses `genisoimage` or `mkisofs`.
 pub fn create_seed_iso(iso_path: &Path, config: &SeedConfig<'_>) -> Result<(), SetupError> {
-    let tmp_dir = iso_path
+    if !is_safe_hostname(config.hostname) {
+        return Err(SetupError::Config(format!(
+            "invalid hostname '{}'",
+            config.hostname
+        )));
+    }
+
+    let parent = iso_path
         .parent()
-        .ok_or_else(|| SetupError::Config("no parent directory for ISO path".into()))?
-        .join(format!(".seed-{}", config.hostname));
+        .ok_or_else(|| SetupError::Config("no parent directory for ISO path".into()))?;
+    let counter = SEED_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let tmp_dir = parent.join(format!(
+        ".seed-{}-{}-{}-{}",
+        config.hostname,
+        std::process::id(),
+        timestamp_nanos,
+        counter
+    ));
 
     std::fs::create_dir_all(&tmp_dir).map_err(SetupError::Io)?;
 
-    // Write meta-data
-    let meta_data = format!(
-        "instance-id: {hostname}\nlocal-hostname: {hostname}\n",
-        hostname = config.hostname
-    );
-    std::fs::write(tmp_dir.join("meta-data"), &meta_data).map_err(SetupError::Io)?;
+    let result = (|| {
+        // Write meta-data
+        let meta_data = format!(
+            "instance-id: {hostname}\nlocal-hostname: {hostname}\n",
+            hostname = config.hostname
+        );
+        std::fs::write(tmp_dir.join("meta-data"), &meta_data).map_err(SetupError::Io)?;
 
-    // Write user-data
-    let user_data = build_user_data(config)?;
-    std::fs::write(tmp_dir.join("user-data"), &user_data).map_err(SetupError::Io)?;
+        // Write user-data
+        let user_data = build_user_data(config)?;
+        std::fs::write(tmp_dir.join("user-data"), &user_data).map_err(SetupError::Io)?;
 
-    // Write network-config (v2)
-    if !config.nics.is_empty() {
-        let network_config = build_network_config(config)?;
-        std::fs::write(tmp_dir.join("network-config"), &network_config)
-            .map_err(SetupError::Io)?;
-    }
+        // Write network-config (v2)
+        if !config.nics.is_empty() {
+            let network_config = build_network_config(config)?;
+            std::fs::write(tmp_dir.join("network-config"), &network_config)
+                .map_err(SetupError::Io)?;
+        }
 
-    // Create ISO
-    create_iso_image(iso_path, &tmp_dir)?;
+        // Create ISO
+        create_iso_image(iso_path, &tmp_dir)
+    })();
 
-    // Clean up temp dir
     if let Err(e) = std::fs::remove_dir_all(&tmp_dir) {
-        tracing::warn!(path = %tmp_dir.display(), "failed to clean up seed ISO temp dir: {}", e);
+        tracing::warn!(
+            path = %tmp_dir.display(),
+            "failed to clean up seed ISO temp dir: {}",
+            e
+        );
     }
 
-    Ok(())
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +167,10 @@ fn build_user_data(config: &SeedConfig<'_>) -> Result<String, SetupError> {
     // Mount VirtioFS volumes
     for vol in &config.volumes {
         if !is_safe_mount_tag(&vol.tag) {
-            return Err(SetupError::Config(format!("invalid VirtioFS tag '{}'", vol.tag)));
+            return Err(SetupError::Config(format!(
+                "invalid VirtioFS tag '{}'",
+                vol.tag
+            )));
         }
         if !is_safe_mount_point(&vol.mount_point) {
             return Err(SetupError::Config(format!(
@@ -185,7 +215,10 @@ fn build_user_data(config: &SeedConfig<'_>) -> Result<String, SetupError> {
         }
         if let Some(ref wd) = proc.workdir {
             if !is_safe_mount_point(wd) {
-                return Err(SetupError::Config(format!("invalid working directory '{}'", wd)));
+                return Err(SetupError::Config(format!(
+                    "invalid working directory '{}'",
+                    wd
+                )));
             }
             ud.push_str(&format!(
                 "  - cd {} && sh -lc {}\n",
@@ -217,7 +250,8 @@ fn build_user_data(config: &SeedConfig<'_>) -> Result<String, SetupError> {
     let ip_cmd = "hostname -I | awk '{print $1}'";
     ud.push_str(&format!(
         "  - echo \"{} $({})\"\n",
-        crate::config::READY_MARKER, ip_cmd
+        crate::config::READY_MARKER,
+        ip_cmd
     ));
 
     Ok(ud)
@@ -370,7 +404,11 @@ fn is_safe_mount_tag(s: &str) -> bool {
 }
 
 fn is_safe_mount_point(s: &str) -> bool {
-    s.starts_with('/') && !s.contains('\0') && !s.contains('\n') && !s.contains('\r') && s.len() <= 1024
+    s.starts_with('/')
+        && !s.contains('\0')
+        && !s.contains('\n')
+        && !s.contains('\r')
+        && s.len() <= 1024
 }
 
 fn is_safe_iface_name(s: &str) -> bool {
@@ -396,7 +434,9 @@ fn validate_ssh_pubkey(s: &str) -> Result<(), SetupError> {
         return Err(SetupError::Config("SSH public key is empty".into()));
     };
     let Some(key_material) = parts.next() else {
-        return Err(SetupError::Config("SSH public key is missing key material".into()));
+        return Err(SetupError::Config(
+            "SSH public key is missing key material".into(),
+        ));
     };
 
     if !key_type.starts_with("ssh-") && !key_type.starts_with("ecdsa-") {
@@ -406,7 +446,9 @@ fn validate_ssh_pubkey(s: &str) -> Result<(), SetupError> {
         )));
     }
     if key_material.is_empty() {
-        return Err(SetupError::Config("SSH public key is missing key material".into()));
+        return Err(SetupError::Config(
+            "SSH public key is missing key material".into(),
+        ));
     }
 
     Ok(())
@@ -489,6 +531,29 @@ mod tests {
     fn hostname_rejects_too_long() {
         let long = "a".repeat(254);
         assert!(!is_safe_hostname(&long));
+    }
+
+    #[test]
+    fn create_seed_iso_rejects_invalid_hostname_before_running_tools() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let iso_path = tmp.path().join("seed.iso");
+        let config = SeedConfig {
+            hostname: "../bad-host",
+            ssh_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest test@test",
+            nics: vec![],
+            process: None,
+            volumes: vec![],
+            healthcheck: None,
+            extra_hosts: vec![],
+        };
+
+        let err = create_seed_iso(&iso_path, &config)
+            .expect_err("invalid hostname should fail before ISO tool invocation");
+        assert!(
+            err.to_string().contains("invalid hostname"),
+            "expected invalid hostname error, got: {}",
+            err
+        );
     }
 
     // ── is_safe_ip ───────────────────────────────────────────────────────
@@ -591,7 +656,10 @@ mod tests {
             process: Some(ProcessConfig {
                 command: "/bin/app".into(),
                 workdir: None,
-                env: vec![("GOOD".into(), "ok".into()), ("BAD;rm".into(), "evil".into())],
+                env: vec![
+                    ("GOOD".into(), "ok".into()),
+                    ("BAD;rm".into(), "evil".into()),
+                ],
             }),
             volumes: vec![],
             healthcheck: None,

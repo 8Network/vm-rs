@@ -6,7 +6,6 @@ use std::slice;
 use std::str;
 
 use block::Block;
-use libc::c_void;
 use objc::rc::StrongPtr;
 use objc::runtime::{Object, BOOL, NO, YES};
 use objc::{class, msg_send, sel, sel_impl};
@@ -17,10 +16,8 @@ extern "C" {}
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
     pub fn dispatch_queue_create(label: *const libc::c_char, attr: Id) -> Id;
-    // pub fn dispatch_sync(queue: Id, block: &Block<(), ()>);
-    pub fn dispatch_sync(queue: Id, block: *mut c_void);
     pub fn dispatch_async(queue: Id, block: &Block<(), ()>);
-// pub fn dispatch_async(queue: Id, block: *mut c_void);
+    // pub fn dispatch_async(queue: Id, block: *mut c_void);
 }
 
 pub type Id = *mut Object;
@@ -167,9 +164,7 @@ impl NSFileHandle {
     /// lifetime expected by the created Objective-C file handle.
     pub unsafe fn file_handle_with_fd(fd: i32) -> NSFileHandle {
         let alloc: Id = msg_send![class!(NSFileHandle), alloc];
-        let p = StrongPtr::new(
-            msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: NO],
-        );
+        let p = StrongPtr::new(msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: YES]);
         NSFileHandle(p)
     }
 }
@@ -251,24 +246,31 @@ impl NSError {
 
     pub fn dump(&self) {
         if *self.0 == NIL {
-            println!("NSError: nil");
+            tracing::error!("NSError: nil");
             return;
         }
         let code = self.code();
-        println!("code: {}", code);
 
         // Helper: safely print an NSString that may be backed by nil
         fn safe_str(s: &NSString) -> Cow<'_, str> {
-            if *s.0 == NIL { Cow::Borrowed("(nil)") } else { s.as_str() }
+            if *s.0 == NIL {
+                Cow::Borrowed("(nil)")
+            } else {
+                s.as_str()
+            }
         }
 
         let desc = self.localized_description();
-        println!("localizedDescription : {}", safe_str(&desc));
         let reason = self.localized_failure_reason();
-        println!("localizedFailureReason : {}", safe_str(&reason));
         let suggestion = self.localized_recovery_suggestion();
-        println!("localizedRecoverySuggestion : {}", safe_str(&suggestion));
         let anchor = self.help_anchor();
-        println!("helpAnchor : {}", safe_str(&anchor));
+        tracing::error!(
+            code = code,
+            localized_description = %safe_str(&desc),
+            localized_failure_reason = %safe_str(&reason),
+            localized_recovery_suggestion = %safe_str(&suggestion),
+            help_anchor = %safe_str(&anchor),
+            "NSError dump"
+        );
     }
 }

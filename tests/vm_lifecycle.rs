@@ -68,6 +68,10 @@ fn make_config(name: &str, kernel: &Path, initramfs: &Path) -> VmConfig {
         serial_log: base.join("serial.log"),
         cmdline: Some("console=hvc0".to_string()),
         netns: None,
+        vsock: false,
+        machine_id: None,
+        efi_variable_store: None,
+        rosetta: false,
     }
 }
 

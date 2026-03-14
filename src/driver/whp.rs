@@ -113,6 +113,8 @@ struct WhpVm {
     _memory: GuestMemory,
     /// Shared VM state (read by driver, written by vCPU thread).
     state: Arc<RwLock<VmState>>,
+    /// State to restore after a successful resume.
+    resume_state: Option<VmState>,
     /// Stop flag — signals the vCPU thread to exit.
     stop_flag: Arc<AtomicBool>,
     /// vCPU execution thread handle.
@@ -359,6 +361,7 @@ impl VmDriver for WhpDriver {
             partition,
             _memory: memory,
             state: Arc::clone(&state),
+            resume_state: None,
             stop_flag: Arc::clone(&stop_flag),
             vcpu_thread: Some(vcpu_thread),
             serial_log: serial_log.clone(),
@@ -376,7 +379,7 @@ impl VmDriver for WhpDriver {
             name: name.clone(),
             namespace: config.namespace.clone(),
             state: VmState::Starting,
-            pid: None, // In-process, no separate PID
+            process: None, // In-process, no separate PID
             serial_log,
             machine_id: None,
         })
@@ -455,6 +458,15 @@ impl VmDriver for WhpDriver {
             name: handle.name.clone(),
         })?;
 
+        let current_state = vm
+            .state
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("state lock poisoned: {e}")))?
+            .clone();
+        if !matches!(current_state, VmState::Running { .. }) {
+            return Err(VmError::Hypervisor("can only pause a running VM".into()));
+        }
+
         // Signal vCPU to stop running (but don't destroy partition)
         vm.stop_flag.store(true, Ordering::Release);
 
@@ -465,6 +477,7 @@ impl VmDriver for WhpDriver {
             let _ = thread.join();
         }
 
+        vm.resume_state = Some(current_state);
         if let Ok(mut state) = vm.state.write() {
             *state = VmState::Paused;
         }
@@ -483,8 +496,24 @@ impl VmDriver for WhpDriver {
             name: handle.name.clone(),
         })?;
 
+        let current_state = vm
+            .state
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("state lock poisoned: {e}")))?
+            .clone();
+        if current_state != VmState::Paused {
+            return Err(VmError::Hypervisor("can only resume a paused VM".into()));
+        }
+        if vm.vcpu_thread.is_some() {
+            return Err(VmError::Hypervisor(format!(
+                "VM '{}' already has an active vCPU thread",
+                handle.name
+            )));
+        }
+
         // Reset stop flag and spawn new vCPU thread
         vm.stop_flag.store(false, Ordering::Release);
+        let resumed_state = vm.resume_state.clone().unwrap_or(VmState::Starting);
 
         let sendable = SendablePartition(vm.partition);
         let state_clone = Arc::clone(&vm.state);
@@ -500,6 +529,10 @@ impl VmDriver for WhpDriver {
             .map_err(|e| VmError::Hypervisor(format!("failed to spawn vCPU thread: {e}")))?;
 
         vm.vcpu_thread = Some(thread);
+        vm.resume_state = None;
+        if let Ok(mut state) = vm.state.write() {
+            *state = resumed_state;
+        }
 
         tracing::info!(vm = %handle.name, "VM resumed");
         Ok(())
@@ -808,6 +841,7 @@ fn handle_io_port(
                     if !ip.is_empty() {
                         tracing::info!(vm = %vm_name, ip = %ip, "VM ready");
                         update_state(state, VmState::Running { ip });
+                        serial_buffer.clear();
                     }
                 }
             }

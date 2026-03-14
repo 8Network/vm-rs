@@ -10,6 +10,12 @@ pub mod apple_vz;
 #[cfg(target_os = "linux")]
 pub mod cloud_hv;
 
+#[cfg(target_os = "windows")]
+pub mod boot;
+
+#[cfg(target_os = "windows")]
+pub mod whp;
+
 use crate::config::{VmConfig, VmHandle, VmState};
 
 /// Platform-agnostic VM lifecycle.
@@ -37,6 +43,26 @@ pub trait VmDriver: Send + Sync {
 
     /// Query current VM state.
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError>;
+
+    /// Pause a running VM (suspend execution, preserve state).
+    ///
+    /// Not all drivers support pause. The default returns an error.
+    fn pause(&self, handle: &VmHandle) -> Result<(), VmError> {
+        Err(VmError::Hypervisor(format!(
+            "pause is not supported by this driver for VM '{}'",
+            handle.name
+        )))
+    }
+
+    /// Resume a paused VM.
+    ///
+    /// Not all drivers support resume. The default returns an error.
+    fn resume(&self, handle: &VmHandle) -> Result<(), VmError> {
+        Err(VmError::Hypervisor(format!(
+            "resume is not supported by this driver for VM '{}'",
+            handle.name
+        )))
+    }
 }
 
 /// VM operation errors.
@@ -69,4 +95,39 @@ pub enum VmError {
     /// Configuration error.
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+}
+
+impl From<crate::oci::registry::OciError> for VmError {
+    fn from(e: crate::oci::registry::OciError) -> Self {
+        VmError::Hypervisor(format!("OCI error: {}", e))
+    }
+}
+
+impl From<crate::setup::SetupError> for VmError {
+    fn from(e: crate::setup::SetupError) -> Self {
+        VmError::Hypervisor(format!("setup error: {}", e))
+    }
+}
+
+/// Check a serial console log for the VM readiness marker.
+///
+/// The guest writes `VMRS_READY <ip>` when boot completes.
+/// Returns `Some(ip)` if found, `None` otherwise.
+pub(crate) fn check_ready_marker(log_path: &std::path::Path) -> Option<String> {
+    let content = match std::fs::read_to_string(log_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path = %log_path.display(), "failed to read serial log: {}", e);
+            return None;
+        }
+    };
+    let pos = content.find(crate::config::READY_MARKER)?;
+    let after = &content[pos + crate::config::READY_MARKER.len()..];
+    let ip = after.split_whitespace().next()?.trim().to_string();
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip)
+    }
 }

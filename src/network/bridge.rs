@@ -9,10 +9,30 @@ use std::process::{Command, Stdio};
 
 use crate::driver::VmError;
 
+fn validate_interface_name(name: &str) -> Result<(), VmError> {
+    if name.is_empty() || name.len() > 15 {
+        return Err(VmError::InvalidConfig(format!(
+            "interface name must be 1-15 characters, got {} characters",
+            name.len()
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(VmError::InvalidConfig(format!(
+            "interface name '{}' contains invalid characters (only alphanumeric, hyphen, underscore allowed)",
+            name
+        )));
+    }
+    Ok(())
+}
+
 /// Ensure a Linux bridge exists with the given gateway IP.
 ///
 /// Idempotent — if the bridge already exists, only ensures it's up with the right IP.
 pub fn ensure_bridge(name: &str, gateway_ip: &str, subnet_cidr: &str) -> Result<(), VmError> {
+    validate_interface_name(name)?;
     // Create bridge if it doesn't exist
     if !link_exists(name) {
         run_ip(&["link", "add", name, "type", "bridge"])?;
@@ -54,6 +74,7 @@ pub fn ensure_bridge(name: &str, gateway_ip: &str, subnet_cidr: &str) -> Result<
 
 /// Create a TAP device.
 pub fn create_tap(name: &str) -> Result<(), VmError> {
+    validate_interface_name(name)?;
     run_ip(&["tuntap", "add", "dev", name, "mode", "tap"])?;
     run_ip(&["link", "set", name, "up"])?;
     tracing::debug!(tap = %name, "TAP device created");
@@ -62,6 +83,8 @@ pub fn create_tap(name: &str) -> Result<(), VmError> {
 
 /// Add a TAP device to a bridge.
 pub fn add_to_bridge(tap: &str, bridge: &str) -> Result<(), VmError> {
+    validate_interface_name(tap)?;
+    validate_interface_name(bridge)?;
     run_ip(&["link", "set", tap, "master", bridge])?;
     tracing::debug!(tap = %tap, bridge = %bridge, "TAP added to bridge");
     Ok(())
@@ -113,9 +136,17 @@ fn setup_nat(bridge: &str, subnet: &str) -> Result<(), VmError> {
     // Check if rule already exists
     let check = Command::new("iptables")
         .args([
-            "-t", "nat", "-C", "POSTROUTING",
-            "-s", subnet, "!", "-o", bridge,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "!",
+            "-o",
+            bridge,
+            "-j",
+            "MASQUERADE",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -130,9 +161,17 @@ fn setup_nat(bridge: &str, subnet: &str) -> Result<(), VmError> {
     // Add the rule
     let status = Command::new("iptables")
         .args([
-            "-t", "nat", "-A", "POSTROUTING",
-            "-s", subnet, "!", "-o", bridge,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "!",
+            "-o",
+            bridge,
+            "-j",
+            "MASQUERADE",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -42,7 +42,10 @@ impl MockDriver {
     }
 
     fn set_fail_boot(&self, msg: &str) {
-        *self.fail_boot.lock().unwrap() = Some(msg.to_string());
+        *self
+            .fail_boot
+            .lock()
+            .expect("fail_boot lock should not be poisoned") = Some(msg.to_string());
     }
 }
 
@@ -50,7 +53,12 @@ impl VmDriver for MockDriver {
     fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
         self.boot_count.fetch_add(1, Ordering::SeqCst);
 
-        if let Some(msg) = self.fail_boot.lock().unwrap().as_ref() {
+        if let Some(msg) = self
+            .fail_boot
+            .lock()
+            .expect("fail_boot lock should not be poisoned")
+            .as_ref()
+        {
             return Err(VmError::BootFailed {
                 name: config.name.clone(),
                 detail: msg.clone(),
@@ -63,25 +71,28 @@ impl VmDriver for MockDriver {
             state: VmState::Running {
                 ip: "10.0.0.99".into(),
             },
-            pid: Some(99999),
+            process: None,
             serial_log: config.serial_log.clone(),
             machine_id: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
         };
 
-        self.vms.lock().unwrap().insert(
-            config.name.clone(),
-            MockVmState {
-                state: VmState::Running {
-                    ip: "10.0.0.99".into(),
+        self.vms
+            .lock()
+            .expect("vms lock should not be poisoned")
+            .insert(
+                config.name.clone(),
+                MockVmState {
+                    state: VmState::Running {
+                        ip: "10.0.0.99".into(),
+                    },
                 },
-            },
-        );
+            );
 
         Ok(handle)
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().unwrap();
+        let mut vms = self.vms.lock().expect("vms lock should not be poisoned");
         match vms.get_mut(&handle.name) {
             Some(vm) => {
                 vm.state = VmState::Stopped;
@@ -94,7 +105,7 @@ impl VmDriver for MockDriver {
     }
 
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().unwrap();
+        let mut vms = self.vms.lock().expect("vms lock should not be poisoned");
         match vms.get_mut(&handle.name) {
             Some(vm) => {
                 vm.state = VmState::Stopped;
@@ -107,7 +118,7 @@ impl VmDriver for MockDriver {
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let vms = self.vms.lock().unwrap();
+        let vms = self.vms.lock().expect("vms lock should not be poisoned");
         match vms.get(&handle.name) {
             Some(vm) => Ok(vm.state.clone()),
             None => Ok(VmState::Stopped),
@@ -115,7 +126,7 @@ impl VmDriver for MockDriver {
     }
 
     fn pause(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().unwrap();
+        let mut vms = self.vms.lock().expect("vms lock should not be poisoned");
         match vms.get_mut(&handle.name) {
             Some(vm) => {
                 if !matches!(vm.state, VmState::Running { .. }) {
@@ -131,7 +142,7 @@ impl VmDriver for MockDriver {
     }
 
     fn resume(&self, handle: &VmHandle) -> Result<(), VmError> {
-        let mut vms = self.vms.lock().unwrap();
+        let mut vms = self.vms.lock().expect("vms lock should not be poisoned");
         match vms.get_mut(&handle.name) {
             Some(vm) => {
                 if vm.state != VmState::Paused {
@@ -242,7 +253,9 @@ fn duplicate_boot_rejected() {
 
     let result = manager.start(&config);
     assert!(result.is_err(), "duplicate boot should fail");
-    let err = result.unwrap_err().to_string();
+    let err = result
+        .expect_err("duplicate boot should return an error")
+        .to_string();
     assert!(
         err.contains("already exists"),
         "error should say 'already exists': {}",
@@ -286,7 +299,10 @@ fn stop_nonexistent_vm() {
 
     let result = manager.stop("does-not-exist");
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("not found"));
+    assert!(result
+        .expect_err("stopping a nonexistent VM should fail")
+        .to_string()
+        .contains("not found"));
 }
 
 #[test]
@@ -360,7 +376,7 @@ fn concurrent_boots_different_names() {
 
         let mut successes = 0;
         for h in handles {
-            if h.join().unwrap().is_ok() {
+            if h.join().expect("boot thread should not panic").is_ok() {
                 successes += 1;
             }
         }
@@ -412,9 +428,17 @@ fn resume_paused_vm_returns_to_running() {
         .resume("mock-resume")
         .expect("resume should succeed");
 
-    // After resume, the manager sets state to Starting (waiting for ready marker).
-    // But the mock driver already set it to Running internally.
-    // The next state() call will pick up Running from the driver.
+    let listed = manager.list().expect("list");
+    let listed_vm = listed
+        .into_iter()
+        .find(|vm| vm.name == "mock-resume")
+        .expect("resumed VM should still be tracked");
+    assert!(
+        matches!(listed_vm.state, VmState::Running { .. }),
+        "cached handle state should be Running after resume, got: {}",
+        listed_vm.state
+    );
+
     let state = manager.state("mock-resume").expect("state");
     assert!(
         matches!(state, VmState::Running { .. }),
@@ -502,7 +526,9 @@ fn boot_returns_machine_id() {
         "boot should return a machine_id"
     );
     assert_eq!(
-        handle.machine_id.unwrap(),
+        handle
+            .machine_id
+            .expect("mock driver should populate machine_id"),
         vec![0xDE, 0xAD, 0xBE, 0xEF],
         "machine_id should match mock"
     );
@@ -537,7 +563,12 @@ fn config_machine_id_roundtrip() {
     let mut config = make_config("mock-mid");
     let id = vec![1, 2, 3, 4, 5, 6, 7, 8];
     config.machine_id = Some(id.clone());
-    assert_eq!(config.machine_id.unwrap(), id);
+    assert_eq!(
+        config
+            .machine_id
+            .expect("machine_id should be present after assignment"),
+        id
+    );
 }
 
 #[test]

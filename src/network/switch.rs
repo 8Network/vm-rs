@@ -58,12 +58,12 @@ impl std::fmt::Display for MacAddress {
 #[derive(Debug)]
 struct SwitchPort {
     /// The switch's end of the socketpair. The other end goes to the VM.
-    fd: RawFd,
+    fd: OwnedFd,
 }
 
 impl AsRawFd for SwitchPort {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
@@ -96,9 +96,7 @@ impl NetworkSwitch {
     pub fn add_port(&self, network_id: &str, _label: &str) -> io::Result<VmSocketEndpoint> {
         let (switch_fd, vm_fd) = create_socketpair()?;
 
-        let port = SwitchPort {
-            fd: switch_fd,
-        };
+        let port = SwitchPort { fd: switch_fd };
 
         let mut networks = self
             .networks
@@ -115,8 +113,7 @@ impl NetworkSwitch {
             .map_err(|e| io::Error::other(format!("lock poisoned: {}", e)))?;
         mac_tables.entry(network_id.to_string()).or_default();
 
-        // SAFETY: `socketpair` returned a fresh owned file descriptor for the VM side.
-        Ok(VmSocketEndpoint::new(unsafe { OwnedFd::from_raw_fd(vm_fd) }))
+        Ok(VmSocketEndpoint::new(vm_fd))
     }
 
     /// Start the forwarding loop on a background thread.
@@ -178,29 +175,12 @@ impl Default for NetworkSwitch {
 impl Drop for NetworkSwitch {
     fn drop(&mut self) {
         self.stop();
-        match self.networks.lock() {
-            Ok(networks) => {
-                for ports in networks.values() {
-                    for port in ports {
-                        // SAFETY: Closing file descriptors we created in add_port().
-                        let ret = unsafe { libc::close(port.fd) };
-                        if ret != 0 {
-                            // Log but don't panic in Drop — best we can do.
-                            let err = std::io::Error::last_os_error();
-                            eprintln!("vm-rs: failed to close switch port fd {}: {}", port.fd, err);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("vm-rs: network switch lock poisoned during drop: {}", e);
-            }
-        }
+        // OwnedFd in SwitchPort handles closing file descriptors automatically.
     }
 }
 
 /// Create a Unix SOCK_DGRAM socketpair. Returns (switch_fd, vm_fd).
-fn create_socketpair() -> io::Result<(RawFd, RawFd)> {
+fn create_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     // SAFETY: Standard POSIX socketpair call with valid fd array.
     let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
@@ -208,25 +188,29 @@ fn create_socketpair() -> io::Result<(RawFd, RawFd)> {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: socketpair just created these fresh file descriptors; wrapping
+    // them in OwnedFd transfers ownership so they are closed on drop.
+    let switch_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let vm_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
     // Set switch side non-blocking for the poll loop.
     // SAFETY: fcntl on file descriptors we just created in the socketpair above.
     unsafe {
-        let flags = libc::fcntl(fds[0], libc::F_GETFL);
+        let flags = libc::fcntl(switch_fd.as_raw_fd(), libc::F_GETFL);
         if flags == -1 {
-            let err = io::Error::last_os_error();
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
-        if libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
-            let err = io::Error::last_os_error();
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-            return Err(err);
+        if libc::fcntl(
+            switch_fd.as_raw_fd(),
+            libc::F_SETFL,
+            flags | libc::O_NONBLOCK,
+        ) == -1
+        {
+            return Err(io::Error::last_os_error());
         }
     }
 
-    Ok((fds[0], fds[1]))
+    Ok((switch_fd, vm_fd))
 }
 
 /// The main forwarding loop. Runs until `running` is set to false.
@@ -266,11 +250,11 @@ fn forwarding_loop(
         let mut port_fds: HashMap<String, Vec<RawFd>> = HashMap::new();
 
         for (net_id, ports) in nets.iter() {
-            let fds: Vec<RawFd> = ports.iter().map(|p| p.fd).collect();
+            let fds: Vec<RawFd> = ports.iter().map(|p| p.fd.as_raw_fd()).collect();
             port_fds.insert(net_id.clone(), fds);
             for (idx, port) in ports.iter().enumerate() {
                 pollfds.push(libc::pollfd {
-                    fd: port.fd,
+                    fd: port.fd.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 });
@@ -285,8 +269,7 @@ fn forwarding_loop(
         }
 
         // SAFETY: poll(2) on fds we own. pollfds array is valid and properly sized.
-        let ready =
-            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
 
         if ready <= 0 {
             continue;
@@ -301,14 +284,8 @@ fn forwarding_loop(
 
             // Read one Ethernet frame
             // SAFETY: Reading from our own fd into a stack buffer of MAX_FRAME_SIZE.
-            let n = unsafe {
-                libc::recv(
-                    pfd.fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                )
-            };
+            let n =
+                unsafe { libc::recv(pfd.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
 
             if n < MIN_FRAME_SIZE as isize {
                 continue;
@@ -377,6 +354,7 @@ fn forwarding_loop(
             }
         }
     }
+    running.store(false, Ordering::SeqCst);
 }
 
 /// Send a single Ethernet frame to a socket fd. Best-effort (drops if buffer full).
@@ -405,8 +383,7 @@ mod tests {
 
     #[test]
     fn mac_from_bytes_valid() {
-        let mac = MacAddress::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
-            .expect("valid MAC");
+        let mac = MacAddress::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).expect("valid MAC");
         assert_eq!(mac.0, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
     }
 
@@ -487,7 +464,9 @@ mod tests {
     #[test]
     fn switch_add_ports_different_networks() {
         let switch = NetworkSwitch::new();
-        let fd1 = switch.add_port("frontend", "web").expect("add frontend port");
+        let fd1 = switch
+            .add_port("frontend", "web")
+            .expect("add frontend port");
         let fd2 = switch.add_port("backend", "db").expect("add backend port");
         assert_ne!(fd1.as_raw_fd(), fd2.as_raw_fd());
     }
@@ -496,7 +475,9 @@ mod tests {
     fn switch_frame_delivery_same_network() {
         let switch = NetworkSwitch::new();
         let fd1 = switch.add_port("net0", "sender").expect("add sender port");
-        let fd2 = switch.add_port("net0", "receiver").expect("add receiver port");
+        let fd2 = switch
+            .add_port("net0", "receiver")
+            .expect("add receiver port");
         switch.start().expect("start switch");
 
         // Build a minimal Ethernet frame: dst(6) + src(6) + ethertype(2) = 14 bytes
@@ -534,7 +515,10 @@ mod tests {
                 libc::MSG_DONTWAIT,
             )
         };
-        assert_eq!(recvd, 14, "broadcast frame should be forwarded to the other port");
+        assert_eq!(
+            recvd, 14,
+            "broadcast frame should be forwarded to the other port"
+        );
         assert_eq!(&buf[..14], &frame[..14]);
 
         switch.stop();
@@ -544,7 +528,9 @@ mod tests {
     fn switch_no_cross_network_forwarding() {
         let switch = NetworkSwitch::new();
         let fd1 = switch.add_port("net-a", "sender").expect("add sender port");
-        let fd2 = switch.add_port("net-b", "isolated").expect("add isolated port");
+        let fd2 = switch
+            .add_port("net-b", "isolated")
+            .expect("add isolated port");
         switch.start().expect("start switch");
 
         // Broadcast frame from net-a
