@@ -161,9 +161,7 @@ impl WhpDriver {
     pub fn is_available() -> bool {
         // SAFETY: WHvGetCapability reads a capability value from the hypervisor.
         // WHvCapabilityCodeHypervisorPresent queries if the hypervisor is running.
-        let mut capability = WHV_CAPABILITY {
-            HypervisorPresent: windows::Win32::Foundation::BOOL(0),
-        };
+        let mut capability: WHV_CAPABILITY = unsafe { std::mem::zeroed() };
         let result = unsafe {
             WHvGetCapability(
                 WHvCapabilityCodeHypervisorPresent,

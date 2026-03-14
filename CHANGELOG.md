@@ -6,6 +6,11 @@ This project follows [Semantic Versioning](https://semver.org/). During `0.x`, m
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-03-14
+
+### Windows
+- Fix WHP capability probing on the Windows release runner by avoiding a `BOOL` constructor that is not exposed by the selected `windows` bindings
+
 ## [0.2.1] — 2026-03-14
 
 ### CI and release
