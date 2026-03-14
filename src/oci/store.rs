@@ -462,9 +462,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = ImageStore::new(tmp.path()).expect("store");
         let path = store.blob_path("sha256:abc123def456");
-        assert!(path
-            .to_string_lossy()
-            .ends_with("blobs/sha256/abc123def456"));
+        let suffix = std::path::Path::new("blobs")
+            .join("sha256")
+            .join("abc123def456");
+        assert!(path.ends_with(&suffix));
     }
 
     #[test]

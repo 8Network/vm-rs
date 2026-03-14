@@ -1,6 +1,6 @@
 [package]
 name = "vm-rs"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Cross-platform VM lifecycle management — Apple Virtualization.framework (macOS) + Cloud Hypervisor (Linux)"
 license = "MIT"

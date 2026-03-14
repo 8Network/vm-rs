@@ -6,6 +6,11 @@ This project follows [Semantic Versioning](https://semver.org/). During `0.x`, m
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-03-14
+
+### Tests
+- Make the OCI blob path test platform-correct by asserting on path components instead of POSIX separators
+
 ## [0.2.3] — 2026-03-14
 
 ### Windows
