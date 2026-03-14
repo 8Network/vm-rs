@@ -94,7 +94,7 @@ fn boot_vm_reaches_running_state() {
     let mut final_state = VmState::Starting;
     while start.elapsed() < timeout {
         match manager.state("test-boot") {
-            Ok(state @ VmState::Running { .. }) => {
+            Ok(state @ VmState::Ready { .. }) => {
                 final_state = state;
                 break;
             }
@@ -110,8 +110,8 @@ fn boot_vm_reaches_running_state() {
     }
 
     assert!(
-        matches!(final_state, VmState::Running { .. }),
-        "VM did not reach Running state within 30s, stuck at: {}",
+        matches!(final_state, VmState::Ready { .. }),
+        "VM did not reach Ready state within 30s, stuck at: {}",
         final_state
     );
 

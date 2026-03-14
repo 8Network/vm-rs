@@ -329,7 +329,7 @@ impl VmDriver for WhpDriver {
 
         // ── Step 6: Spawn vCPU thread ──
 
-        let state = Arc::new(RwLock::new(VmState::Starting));
+        let state = Arc::new(RwLock::new(VmState::Running));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let serial_log = config.serial_log.clone();
 
@@ -378,7 +378,7 @@ impl VmDriver for WhpDriver {
         Ok(VmHandle {
             name: name.clone(),
             namespace: config.namespace.clone(),
-            state: VmState::Starting,
+            state: VmState::Running,
             process: None, // In-process, no separate PID
             serial_log,
             machine_id: None,
@@ -463,7 +463,7 @@ impl VmDriver for WhpDriver {
             .read()
             .map_err(|e| VmError::Hypervisor(format!("state lock poisoned: {e}")))?
             .clone();
-        if !matches!(current_state, VmState::Running { .. }) {
+        if !current_state.is_running() {
             return Err(VmError::Hypervisor("can only pause a running VM".into()));
         }
 
@@ -513,7 +513,7 @@ impl VmDriver for WhpDriver {
 
         // Reset stop flag and spawn new vCPU thread
         vm.stop_flag.store(false, Ordering::Release);
-        let resumed_state = vm.resume_state.clone().unwrap_or(VmState::Starting);
+        let resumed_state = vm.resume_state.clone().unwrap_or(VmState::Running);
 
         let sendable = SendablePartition(vm.partition);
         let state_clone = Arc::clone(&vm.state);
@@ -840,7 +840,7 @@ fn handle_io_port(
                     let ip = ip.trim().to_string();
                     if !ip.is_empty() {
                         tracing::info!(vm = %vm_name, ip = %ip, "VM ready");
-                        update_state(state, VmState::Running { ip });
+                        update_state(state, VmState::Ready { ip });
                         serial_buffer.clear();
                     }
                 }

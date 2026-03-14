@@ -16,7 +16,10 @@ pub mod boot;
 #[cfg(target_os = "windows")]
 pub mod whp;
 
+mod ready;
+
 use crate::config::{VmConfig, VmHandle, VmState};
+pub(crate) use ready::{check_ready_marker, ReadyMarkerCache};
 
 /// Platform-agnostic VM lifecycle.
 ///
@@ -28,7 +31,7 @@ pub trait VmDriver: Send + Sync {
     ///
     /// Returns a handle that can be used to query state, stop, or kill the VM.
     /// The VM may still be in `Starting` state when this returns — use
-    /// `state()` to poll for `Running`.
+    /// `state()` to poll for `Running`/`Ready`.
     fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError>;
 
     /// Stop a running VM gracefully.
@@ -106,28 +109,5 @@ impl From<crate::oci::registry::OciError> for VmError {
 impl From<crate::setup::SetupError> for VmError {
     fn from(e: crate::setup::SetupError) -> Self {
         VmError::Hypervisor(format!("setup error: {}", e))
-    }
-}
-
-/// Check a serial console log for the VM readiness marker.
-///
-/// The guest writes `VMRS_READY <ip>` when boot completes.
-/// Returns `Some(ip)` if found, `None` otherwise.
-pub(crate) fn check_ready_marker(log_path: &std::path::Path) -> Option<String> {
-    let content = match std::fs::read_to_string(log_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(path = %log_path.display(), "failed to read serial log: {}", e);
-            return None;
-        }
-    };
-    let pos = content.find(crate::config::READY_MARKER)?;
-    let after = &content[pos + crate::config::READY_MARKER.len()..];
-    let ip = after.split_whitespace().next()?.trim().to_string();
-    if ip.is_empty() {
-        None
-    } else {
-        Some(ip)
     }
 }

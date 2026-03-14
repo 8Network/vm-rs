@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use crate::config::{NetworkAttachment, VmConfig, VmHandle, VmState, VmmProcess};
-use crate::driver::{VmDriver, VmError};
+use crate::driver::{ReadyMarkerCache, VmDriver, VmError};
 
 // ---------------------------------------------------------------------------
 // Internal VM tracking
@@ -26,8 +26,10 @@ struct VmProcess {
     child: Child,
     /// TAP device names (for cleanup on stop).
     tap_devices: Vec<String>,
-    /// virtiofsd sidecar PIDs (for VirtioFS shared dirs, cleaned up on stop).
-    virtiofsd_pids: Vec<u32>,
+    /// virtiofsd sidecar child handles retained so they can be terminated and reaped.
+    virtiofsd_children: Vec<Child>,
+    /// Cached guest readiness marker from the serial log.
+    ready: ReadyMarkerCache,
 }
 
 /// Cloud Hypervisor driver for Linux.
@@ -58,6 +60,7 @@ impl VmDriver for CloudHvDriver {
         let name = &config.name;
 
         tracing::info!(
+            driver = "cloud_hv",
             vm = %name,
             cpus = config.cpus,
             memory_mb = config.memory_mb,
@@ -167,6 +170,7 @@ impl VmDriver for CloudHvDriver {
                 })?;
 
             tracing::info!(
+                driver = "cloud_hv",
                 vm = %name,
                 tag = %vol.tag,
                 pid = child.id(),
@@ -178,9 +182,7 @@ impl VmDriver for CloudHvDriver {
             let socket_ready = wait_for_socket(&socket_path, std::time::Duration::from_secs(5));
             if !socket_ready {
                 // Clean up already-started virtiofsd processes
-                for mut c in virtiofsd_children {
-                    let _ = c.kill();
-                }
+                cleanup_virtiofsd(virtiofsd_children);
                 return Err(VmError::BootFailed {
                     name: name.clone(),
                     detail: format!(
@@ -200,36 +202,51 @@ impl VmDriver for CloudHvDriver {
 
         // Spawn — redirect stdout/stderr to a log file for debugging
         let vmm_log_path = config.serial_log.with_extension("vmm.log");
-        let vmm_log = std::fs::File::create(&vmm_log_path).map_err(|e| VmError::BootFailed {
-            name: name.clone(),
-            detail: format!("failed to create VMM log file: {}", e),
-        })?;
-        let vmm_log_stderr = vmm_log.try_clone().map_err(VmError::Io)?;
-        let mut process = cmd
-            .stdout(vmm_log)
-            .stderr(vmm_log_stderr)
-            .spawn()
-            .map_err(|e| VmError::BootFailed {
-                name: name.clone(),
-                detail: format!("failed to spawn cloud-hypervisor: {}", e),
-            })?;
+        let vmm_log = match std::fs::File::create(&vmm_log_path) {
+            Ok(file) => file,
+            Err(e) => {
+                cleanup_virtiofsd(virtiofsd_children);
+                return Err(VmError::BootFailed {
+                    name: name.clone(),
+                    detail: format!("failed to create VMM log file: {}", e),
+                });
+            }
+        };
+        let vmm_log_stderr = match vmm_log.try_clone() {
+            Ok(file) => file,
+            Err(e) => {
+                cleanup_virtiofsd(virtiofsd_children);
+                return Err(VmError::Io(e));
+            }
+        };
+        let mut process = match cmd.stdout(vmm_log).stderr(vmm_log_stderr).spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                cleanup_virtiofsd(virtiofsd_children);
+                return Err(VmError::BootFailed {
+                    name: name.clone(),
+                    detail: format!("failed to spawn cloud-hypervisor: {}", e),
+                });
+            }
+        };
 
         let pid = process.id();
-        let identity = process_identity(pid, name)?;
-        tracing::info!(vm = %name, pid = pid, "Cloud Hypervisor process started");
-
-        // Collect virtiofsd PIDs for cleanup, then drop the Child handles.
-        // Dropping Child on Unix does NOT kill the process — it only closes our
-        // handle. The virtiofsd processes keep running and are killed via raw
-        // kill() in stop/cleanup using the saved PIDs.
-        let virtiofsd_pids: Vec<u32> = virtiofsd_children.iter().map(|c| c.id()).collect();
-        drop(virtiofsd_children);
+        let identity = match process_identity(pid, name) {
+            Ok(identity) => identity,
+            Err(e) => {
+                let _ = process.kill();
+                let _ = process.wait();
+                cleanup_virtiofsd(virtiofsd_children);
+                return Err(e);
+            }
+        };
+        tracing::info!(driver = "cloud_hv", vm = %name, pid = pid, "Cloud Hypervisor process started");
 
         // Brief pause then check if process exited immediately (bad binary, permissions, etc.)
         std::thread::sleep(std::time::Duration::from_millis(100));
         if let Some(status) = process.try_wait().map_err(VmError::Io)? {
             // Clean up virtiofsd processes since VM failed
-            cleanup_virtiofsd(&virtiofsd_pids);
+            cleanup_virtiofsd(virtiofsd_children);
             return Err(VmError::BootFailed {
                 name: name.clone(),
                 detail: format!(
@@ -253,7 +270,8 @@ impl VmDriver for CloudHvDriver {
                     child: process,
                     identity: identity.clone(),
                     tap_devices,
-                    virtiofsd_pids,
+                    virtiofsd_children,
+                    ready: ReadyMarkerCache::default(),
                 },
             );
         }
@@ -269,7 +287,7 @@ impl VmDriver for CloudHvDriver {
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        tracing::info!(vm = %handle.name, "requesting graceful stop via Cloud Hypervisor");
+        tracing::info!(driver = "cloud_hv", vm = %handle.name, "requesting graceful stop via Cloud Hypervisor");
         let mut vms = self
             .vms
             .lock()
@@ -301,47 +319,58 @@ impl VmDriver for CloudHvDriver {
         // SIGTERM → Cloud Hypervisor handles graceful ACPI shutdown
         // SAFETY: Sending SIGTERM to a PID we spawned. PID validity confirmed by prior operations.
         let ret = unsafe { libc::kill(process.identity.pid() as i32, libc::SIGTERM) };
-        if ret != 0 {
+        let wait_result = if ret != 0 {
             let errno = std::io::Error::last_os_error();
             tracing::warn!(
+                driver = "cloud_hv",
                 vm = %handle.name,
                 pid = process.identity.pid(),
                 error = %errno,
                 "SIGTERM failed (process may already be stopped)"
             );
+            Ok(())
         } else {
             // Wait for process to exit (up to 10s)
-            wait_for_exit(process.child, std::time::Duration::from_secs(10));
-        }
+            wait_for_exit(process.child, std::time::Duration::from_secs(10)).map_err(|e| {
+                VmError::StopFailed {
+                    name: handle.name.clone(),
+                    detail: format!(
+                        "cloud-hypervisor PID {} did not exit cleanly: {}",
+                        process.identity.pid(),
+                        e
+                    ),
+                }
+            })
+        };
 
         cleanup_taps(&process.tap_devices);
-        cleanup_virtiofsd(&process.virtiofsd_pids);
-        Ok(())
+        cleanup_virtiofsd(process.virtiofsd_children);
+        wait_result
     }
 
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
-        tracing::warn!(vm = %handle.name, "force-killing Cloud Hypervisor VM");
+        tracing::warn!(driver = "cloud_hv", vm = %handle.name, "force-killing Cloud Hypervisor VM");
         let mut vms = self
             .vms
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
-        let (identity, mut child, virtiofsd_pids) = if let Some(process) = vms.remove(&handle.name)
-        {
-            cleanup_taps(&process.tap_devices);
-            (
-                process.identity,
-                Some(process.child),
-                process.virtiofsd_pids,
-            )
-        } else if let Some(ref process) = handle.process {
-            validate_cloud_hypervisor_process(process, &handle.name)?;
-            (process.clone(), None, Vec::new())
-        } else {
-            return Err(VmError::NotFound {
-                name: handle.name.clone(),
-            });
-        };
+        let (identity, mut child, virtiofsd_children, tap_devices) =
+            if let Some(process) = vms.remove(&handle.name) {
+                (
+                    process.identity,
+                    Some(process.child),
+                    process.virtiofsd_children,
+                    process.tap_devices,
+                )
+            } else if let Some(ref process) = handle.process {
+                validate_cloud_hypervisor_process(process, &handle.name)?;
+                (process.clone(), None, Vec::new(), Vec::new())
+            } else {
+                return Err(VmError::NotFound {
+                    name: handle.name.clone(),
+                });
+            };
 
         let kill_result = if let Some(child) = child.as_mut() {
             child.kill().map_err(|e| VmError::StopFailed {
@@ -364,14 +393,21 @@ impl VmDriver for CloudHvDriver {
                 Ok(())
             }
         };
+        let wait_result = if let Some(child) = child {
+            wait_for_exit(child, std::time::Duration::from_secs(2)).map_err(|e| {
+                VmError::StopFailed {
+                    name: handle.name.clone(),
+                    detail: format!("failed to reap killed VM PID {}: {}", identity.pid(), e),
+                }
+            })
+        } else {
+            Ok(())
+        };
+
+        cleanup_taps(&tap_devices);
+        cleanup_virtiofsd(virtiofsd_children);
         kill_result?;
-
-        if let Some(child) = child {
-            wait_for_exit(child, std::time::Duration::from_secs(2));
-        }
-
-        cleanup_virtiofsd(&virtiofsd_pids);
-        Ok(())
+        wait_result
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
@@ -394,9 +430,9 @@ impl VmDriver for CloudHvDriver {
                     return Ok(VmState::Stopped);
                 }
                 if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
-                    return Ok(VmState::Running { ip });
+                    return Ok(VmState::Ready { ip });
                 }
-                return Ok(VmState::Starting);
+                return Ok(VmState::Running);
             }
         };
 
@@ -406,10 +442,10 @@ impl VmDriver for CloudHvDriver {
         }
 
         // Process alive — check serial log for readiness marker
-        if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
-            Ok(VmState::Running { ip })
+        if let Some(ip) = process.ready.scan(&handle.serial_log) {
+            Ok(VmState::Ready { ip })
         } else {
-            Ok(VmState::Starting)
+            Ok(VmState::Running)
         }
     }
 }
@@ -513,47 +549,53 @@ fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> bool {
     false
 }
 
-/// Kill virtiofsd sidecar processes.
-fn cleanup_virtiofsd(pids: &[u32]) {
-    for &pid in pids {
-        // SAFETY: Sending SIGKILL to PIDs we spawned.
-        let ret = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        if ret == 0 {
-            tracing::debug!(pid = pid, "virtiofsd killed");
-        } else {
-            let errno = std::io::Error::last_os_error();
-            tracing::warn!(pid = pid, error = %errno, "failed to kill virtiofsd sidecar");
+/// Kill and reap virtiofsd sidecar processes.
+fn cleanup_virtiofsd(children: Vec<Child>) {
+    for child in children {
+        let pid = child.id();
+        match wait_for_exit(child, std::time::Duration::from_secs(1)) {
+            Ok(()) => tracing::debug!(pid = pid, "virtiofsd exited"),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                tracing::debug!(pid = pid, "virtiofsd required forced termination: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!(pid = pid, error = %e, "failed to clean up virtiofsd sidecar");
+            }
         }
     }
 }
 
 /// Wait for a tracked child process to exit.
-/// If the process doesn't exit within the timeout, escalates to SIGKILL.
-fn wait_for_exit(mut child: Child, timeout: std::time::Duration) {
+/// If the process doesn't exit within the timeout, escalates to SIGKILL and
+/// reports that the graceful stop timed out.
+fn wait_for_exit(mut child: Child, timeout: std::time::Duration) -> std::io::Result<()> {
     let start = std::time::Instant::now();
     let pid = child.id();
     while start.elapsed() < timeout {
         match child.try_wait() {
             Ok(Some(status)) => {
                 tracing::debug!(pid = pid, %status, "process exited");
-                return;
+                return Ok(());
             }
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(pid = pid, error = %e, "failed to query child exit status");
-                break;
+                return Err(e);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     tracing::warn!(pid = pid, elapsed_ms = %timeout.as_millis(), "process did not exit within timeout, sending SIGKILL");
-    if let Err(e) = child.kill() {
-        tracing::warn!(pid = pid, error = %e, "SIGKILL failed while waiting for child exit");
-        return;
-    }
-    if let Err(e) = child.wait() {
-        tracing::warn!(pid = pid, error = %e, "failed to reap child after SIGKILL");
-    }
+    child.kill()?;
+    let _status = child.wait()?;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "PID {} required SIGKILL after waiting {} ms",
+            pid,
+            timeout.as_millis()
+        ),
+    ))
 }
 
 fn wait_for_pid_exit(

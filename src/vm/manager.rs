@@ -1,13 +1,9 @@
-//! VmManager — multi-VM lifecycle orchestration.
-//!
-//! Auto-selects the correct driver for the current platform:
-//! - macOS: AppleVzDriver (Apple Virtualization.framework)
-//! - Linux: CloudHvDriver (Cloud Hypervisor REST API)
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use super::disk;
+use super::platform::create_platform_driver;
 use crate::config::{VmConfig, VmHandle, VmState};
 use crate::driver::{VmDriver, VmError};
 
@@ -59,7 +55,6 @@ impl VmManager {
     pub fn start(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
         config.validate()?;
 
-        // Reserve the name up front so concurrent callers cannot boot the same VM twice.
         {
             let mut vms = self
                 .vms
@@ -86,7 +81,6 @@ impl VmManager {
             );
         }
 
-        // Ensure VM directory exists
         let vm_dir = self.vm_dir(&config.name);
         if let Err(e) = std::fs::create_dir_all(&vm_dir) {
             let mut vms = self
@@ -117,14 +111,11 @@ impl VmManager {
             }
         };
 
-        // Track the VM
-        {
-            let mut vms = self
-                .vms
-                .write()
-                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-            vms.insert(config.name.clone(), handle.clone());
-        }
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        vms.insert(config.name.clone(), handle.clone());
 
         Ok(handle)
     }
@@ -134,16 +125,7 @@ impl VmManager {
         tracing::info!(vm = %name, "stopping VM");
         let handle = self.get_handle(name)?;
         self.driver.stop(&handle)?;
-
-        // Update state
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(name) {
-            h.state = VmState::Stopped;
-        }
-        Ok(())
+        self.update_cached_state(name, VmState::Stopped)
     }
 
     /// Force-kill a VM.
@@ -151,62 +133,28 @@ impl VmManager {
         tracing::info!(vm = %name, "force-killing VM");
         let handle = self.get_handle(name)?;
         self.driver.kill(&handle)?;
-
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(name) {
-            h.state = VmState::Stopped;
-        }
-        Ok(())
+        self.update_cached_state(name, VmState::Stopped)
     }
 
     /// Stop a VM using a pre-built handle (e.g. restored from persisted metadata).
-    ///
-    /// Use this when the VM was started by a previous daemon process and isn't
-    /// tracked in the in-memory map.
     pub fn stop_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
         tracing::info!(vm = %handle.name, "stopping VM by handle");
         self.driver.stop(handle)?;
-
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(&handle.name) {
-            h.state = VmState::Stopped;
-        }
-        Ok(())
+        self.update_cached_state(&handle.name, VmState::Stopped)
     }
 
     /// Force-kill a VM using a pre-built handle (e.g. restored from persisted metadata).
     pub fn kill_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
         tracing::info!(vm = %handle.name, "force-killing VM by handle");
         self.driver.kill(handle)?;
-
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(&handle.name) {
-            h.state = VmState::Stopped;
-        }
-        Ok(())
+        self.update_cached_state(&handle.name, VmState::Stopped)
     }
 
     /// Pause a running VM.
     pub fn pause(&self, name: &str) -> Result<(), VmError> {
         let handle = self.get_handle(name)?;
         self.driver.pause(&handle)?;
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(name) {
-            h.state = VmState::Paused;
-        }
-        Ok(())
+        self.update_cached_state(name, VmState::Paused)
     }
 
     /// Resume a paused VM.
@@ -214,38 +162,20 @@ impl VmManager {
         let handle = self.get_handle(name)?;
         self.driver.resume(&handle)?;
         let resumed_state = self.driver.state(&handle)?;
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(name) {
-            h.state = resumed_state;
-        }
-        Ok(())
+        self.update_cached_state(name, resumed_state)
     }
 
     /// Query current state of a VM.
     pub fn state(&self, name: &str) -> Result<VmState, VmError> {
         let handle = self.get_handle(name)?;
         let state = self.driver.state(&handle)?;
-
-        // Update cached state
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(name) {
-            h.state = state.clone();
-        }
+        self.update_cached_state(name, state.clone())?;
         Ok(state)
     }
 
-    /// Get the IP address of a running VM.
+    /// Get the IP address of a ready VM.
     pub fn get_ip(&self, name: &str) -> Result<Option<String>, VmError> {
-        match self.state(name)? {
-            VmState::Running { ip } => Ok(Some(ip)),
-            _ => Ok(None),
-        }
+        Ok(self.state(name)?.ip().map(ToOwned::to_owned))
     }
 
     /// List all tracked VMs.
@@ -257,23 +187,14 @@ impl VmManager {
         Ok(vms.values().cloned().collect())
     }
 
-    /// Wait for all VMs to reach Running state (with timeout).
+    /// Wait for all VMs to emit the readiness marker within the timeout.
     pub fn wait_all_ready(&self, timeout_secs: u64) -> Result<(), VmError> {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
         loop {
             if start.elapsed() > timeout {
-                let pending: Vec<String> = {
-                    let vms = self
-                        .vms
-                        .read()
-                        .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-                    vms.iter()
-                        .filter(|(_, h)| !matches!(h.state, VmState::Running { .. }))
-                        .map(|(name, _)| name.clone())
-                        .collect()
-                };
+                let pending = self.pending_names(|state| state.is_ready())?;
                 return Err(VmError::Hypervisor(format!(
                     "timeout waiting for VMs: {}",
                     pending.join(", ")
@@ -281,17 +202,11 @@ impl VmManager {
             }
 
             let mut all_ready = true;
-            let names: Vec<String> = {
-                let vms = self
-                    .vms
-                    .read()
-                    .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-                vms.keys().cloned().collect()
-            };
+            let names = self.vm_names()?;
 
             for name in &names {
                 match self.state(name)? {
-                    VmState::Running { .. } => {}
+                    state if state.is_ready() => {}
                     VmState::Failed { reason } => {
                         return Err(VmError::BootFailed {
                             name: name.clone(),
@@ -308,21 +223,14 @@ impl VmManager {
                 return Ok(());
             }
 
-            {
-                let pending: Vec<String> = {
-                    let vms = self
-                        .vms
-                        .read()
-                        .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-                    vms.iter()
-                        .filter(|(_, h)| !matches!(h.state, VmState::Running { .. }))
-                        .map(|(name, _)| name.clone())
-                        .collect()
-                };
-                let elapsed = start.elapsed().as_secs();
-                if elapsed > 0 && elapsed.is_multiple_of(10) {
-                    tracing::info!(pending = ?pending, elapsed_secs = start.elapsed().as_secs(), "waiting for VMs to become ready");
-                }
+            let elapsed = start.elapsed().as_secs();
+            if elapsed > 0 && elapsed.is_multiple_of(10) {
+                let pending = self.pending_names(|state| state.is_ready())?;
+                tracing::info!(
+                    pending = ?pending,
+                    elapsed_secs = elapsed,
+                    "waiting for VMs to become ready"
+                );
             }
 
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -330,77 +238,8 @@ impl VmManager {
     }
 
     /// Create a disk image as a CoW clone of a base image.
-    ///
-    /// On macOS: APFS clone (`cp -c`), instant and zero-space.
-    /// On Linux: reflink (`cp --reflink=auto`), falls back to regular copy.
     pub fn clone_disk(base: &Path, target: &Path) -> Result<(), VmError> {
-        if target.exists() {
-            if let (Ok(base_meta), Ok(target_meta)) =
-                (std::fs::metadata(base), std::fs::metadata(target))
-            {
-                if base_meta.len() == target_meta.len() {
-                    tracing::debug!(target = %target.display(), "disk clone target already exists with matching size, skipping");
-                    return Ok(());
-                }
-                tracing::warn!(
-                    target = %target.display(),
-                    base_size = base_meta.len(),
-                    target_size = target_meta.len(),
-                    "disk clone target exists but size differs, re-cloning"
-                );
-                std::fs::remove_file(target).map_err(VmError::Io)?;
-            }
-        }
-
-        // Ensure parent directory exists
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(VmError::Io)?;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let status = std::process::Command::new("cp")
-                .args(["-c"])
-                .arg(base)
-                .arg(target)
-                .status()
-                .map_err(VmError::Io)?;
-            if !status.success() {
-                tracing::warn!(
-                    base = %base.display(),
-                    target = %target.display(),
-                    status = %status,
-                    "APFS clone failed; falling back to a full file copy"
-                );
-                std::fs::copy(base, target).map_err(VmError::Io)?;
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let status = std::process::Command::new("cp")
-                .args(["--reflink=auto"])
-                .arg(base)
-                .arg(target)
-                .status()
-                .map_err(VmError::Io)?;
-            if !status.success() {
-                tracing::warn!(
-                    base = %base.display(),
-                    target = %target.display(),
-                    status = %status,
-                    "reflink clone failed; falling back to a full file copy"
-                );
-                std::fs::copy(base, target).map_err(VmError::Io)?;
-            }
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            std::fs::copy(base, target).map_err(VmError::Io)?;
-        }
-
-        Ok(())
+        disk::clone_disk(base, target)
     }
 
     fn get_handle(&self, name: &str) -> Result<VmHandle, VmError> {
@@ -412,31 +251,36 @@ impl VmManager {
             name: name.to_string(),
         })
     }
-}
 
-/// Create the platform-appropriate VM driver.
-fn create_platform_driver() -> Result<Box<dyn VmDriver>, VmError> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(Box::new(crate::driver::apple_vz::AppleVzDriver::new()))
+    fn update_cached_state(&self, name: &str, state: VmState) -> Result<(), VmError> {
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        if let Some(handle) = vms.get_mut(name) {
+            handle.state = state;
+        }
+        Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        Ok(Box::new(crate::driver::cloud_hv::CloudHvDriver::new()))
+    fn vm_names(&self) -> Result<Vec<String>, VmError> {
+        let vms = self
+            .vms
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        Ok(vms.keys().cloned().collect())
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        Ok(Box::new(crate::driver::whp::WhpDriver::new()))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        Err(VmError::Hypervisor(format!(
-            "unsupported platform: {}",
-            std::env::consts::OS
-        )))
+    fn pending_names(&self, predicate: impl Fn(&VmState) -> bool) -> Result<Vec<String>, VmError> {
+        let vms = self
+            .vms
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        Ok(vms
+            .iter()
+            .filter(|(_, handle)| !predicate(&handle.state))
+            .map(|(name, _)| name.clone())
+            .collect())
     }
 }
 
@@ -454,6 +298,9 @@ mod tests {
     }
 
     struct FailedStateDriver;
+    struct ReadyAfterTwoPollsDriver {
+        polls: AtomicUsize,
+    }
 
     impl VmDriver for Arc<BlockingDriver> {
         fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
@@ -508,6 +355,38 @@ mod tests {
             Ok(VmState::Failed {
                 reason: "crashed".into(),
             })
+        }
+    }
+
+    impl VmDriver for ReadyAfterTwoPollsDriver {
+        fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
+            Ok(VmHandle {
+                name: config.name.clone(),
+                namespace: config.namespace.clone(),
+                state: VmState::Starting,
+                process: None,
+                serial_log: config.serial_log.clone(),
+                machine_id: None,
+            })
+        }
+
+        fn stop(&self, _handle: &VmHandle) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        fn kill(&self, _handle: &VmHandle) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        fn state(&self, _handle: &VmHandle) -> Result<VmState, VmError> {
+            let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+            if poll == 0 {
+                Ok(VmState::Running)
+            } else {
+                Ok(VmState::Ready {
+                    ip: "10.0.0.2".into(),
+                })
+            }
         }
     }
 
@@ -584,5 +463,27 @@ mod tests {
         manager
             .start(&config)
             .expect("restart after failed state should be allowed");
+    }
+
+    #[test]
+    fn wait_all_ready_waits_for_ready_not_just_running() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = VmManager::with_driver(
+            Box::new(ReadyAfterTwoPollsDriver {
+                polls: AtomicUsize::new(0),
+            }),
+            tmp.path().to_path_buf(),
+        )
+        .expect("manager");
+        let config = test_config(tmp.path());
+
+        manager.start(&config).expect("boot");
+        manager
+            .wait_all_ready(2)
+            .expect("wait_all_ready should wait until ready");
+        assert_eq!(
+            manager.get_ip(&config.name).expect("ip query"),
+            Some("10.0.0.2".into())
+        );
     }
 }

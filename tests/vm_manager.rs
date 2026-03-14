@@ -68,7 +68,7 @@ impl VmDriver for MockDriver {
         let handle = VmHandle {
             name: config.name.clone(),
             namespace: config.namespace.clone(),
-            state: VmState::Running {
+            state: VmState::Ready {
                 ip: "10.0.0.99".into(),
             },
             process: None,
@@ -82,7 +82,7 @@ impl VmDriver for MockDriver {
             .insert(
                 config.name.clone(),
                 MockVmState {
-                    state: VmState::Running {
+                    state: VmState::Ready {
                         ip: "10.0.0.99".into(),
                     },
                 },
@@ -129,7 +129,7 @@ impl VmDriver for MockDriver {
         let mut vms = self.vms.lock().expect("vms lock should not be poisoned");
         match vms.get_mut(&handle.name) {
             Some(vm) => {
-                if !matches!(vm.state, VmState::Running { .. }) {
+                if !vm.state.is_running() {
                     return Err(VmError::Hypervisor("can only pause a running VM".into()));
                 }
                 vm.state = VmState::Paused;
@@ -148,7 +148,7 @@ impl VmDriver for MockDriver {
                 if vm.state != VmState::Paused {
                     return Err(VmError::Hypervisor("can only resume a paused VM".into()));
                 }
-                vm.state = VmState::Running {
+                vm.state = VmState::Ready {
                     ip: "10.0.0.99".into(),
                 };
                 Ok(())
@@ -208,11 +208,11 @@ fn boot_and_state_transitions() {
     let handle = manager.start(&config).expect("boot should succeed");
     assert_eq!(handle.name, "mock-boot");
 
-    // State should be Running (mock returns Running immediately)
+    // State should be Ready (mock returns readiness immediately)
     let state = manager.state("mock-boot").expect("state query");
     assert!(
-        matches!(state, VmState::Running { .. }),
-        "expected Running, got: {}",
+        matches!(state, VmState::Ready { .. }),
+        "expected Ready, got: {}",
         state
     );
 }
@@ -387,14 +387,14 @@ fn concurrent_boots_different_names() {
 }
 
 #[test]
-fn wait_all_ready_succeeds_when_all_running() {
+fn wait_all_ready_succeeds_when_all_ready() {
     let driver = MockDriver::new();
     let manager = make_manager(driver);
 
     let config = make_config("mock-ready");
     manager.start(&config).expect("boot");
 
-    // Mock driver returns Running immediately, so wait should succeed fast
+    // Mock driver returns readiness immediately, so wait should succeed fast
     manager
         .wait_all_ready(5)
         .expect("wait_all_ready should succeed");
@@ -434,15 +434,15 @@ fn resume_paused_vm_returns_to_running() {
         .find(|vm| vm.name == "mock-resume")
         .expect("resumed VM should still be tracked");
     assert!(
-        matches!(listed_vm.state, VmState::Running { .. }),
-        "cached handle state should be Running after resume, got: {}",
+        matches!(listed_vm.state, VmState::Ready { .. }),
+        "cached handle state should be Ready after resume, got: {}",
         listed_vm.state
     );
 
     let state = manager.state("mock-resume").expect("state");
     assert!(
-        matches!(state, VmState::Running { .. }),
-        "VM should be running after resume, got: {}",
+        matches!(state, VmState::Ready { .. }),
+        "VM should be ready after resume, got: {}",
         state
     );
 }
@@ -504,7 +504,7 @@ fn pause_resume_cycle() {
 
     manager.resume("mock-cycle").expect("resume");
     let state = manager.state("mock-cycle").expect("state");
-    assert!(matches!(state, VmState::Running { .. }));
+    assert!(matches!(state, VmState::Ready { .. }));
 
     // Can pause again after resume
     manager.pause("mock-cycle").expect("second pause");

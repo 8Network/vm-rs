@@ -33,11 +33,16 @@ use crate::ffi::apple_vz::{
 };
 
 use crate::config::{NetworkAttachment, VmConfig, VmHandle, VmState};
-use crate::driver::{VmDriver, VmError};
+use crate::driver::{ReadyMarkerCache, VmDriver, VmError};
+
+struct RegisteredVm {
+    vm: VZVirtualMachine,
+    ready: ReadyMarkerCache,
+}
 
 /// Apple Virtualization.framework driver for macOS.
 pub struct AppleVzDriver {
-    vms: Mutex<std::collections::HashMap<String, VZVirtualMachine>>,
+    vms: Mutex<std::collections::HashMap<String, RegisteredVm>>,
 }
 
 impl AppleVzDriver {
@@ -52,18 +57,17 @@ impl AppleVzDriver {
         VZVirtualMachine::supported()
     }
 
-    fn vm_state(handle: &VmHandle, vm: &VZVirtualMachine) -> VmState {
+    fn vm_state(vm: &VZVirtualMachine, ready_ip: Option<String>) -> VmState {
         // SAFETY: VM references come from the driver's registry and stay alive
         // for the lifetime of the driver entry.
-        let ready_ip = super::check_ready_marker(&handle.serial_log);
         Self::map_native_state(unsafe { vm.state() }, ready_ip)
     }
 
     fn map_native_state(state: VZVirtualMachineState, ready_ip: Option<String>) -> VmState {
         match state {
             VZVirtualMachineState::VZVirtualMachineStateRunning => match ready_ip {
-                Some(ip) => VmState::Running { ip },
-                None => VmState::Starting,
+                Some(ip) => VmState::Ready { ip },
+                None => VmState::Running,
             },
             VZVirtualMachineState::VZVirtualMachineStatePaused
             | VZVirtualMachineState::VZVirtualMachineStatePausing
@@ -269,7 +273,13 @@ impl VmDriver for AppleVzDriver {
                 .vms
                 .lock()
                 .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-            registry.insert(name.to_string(), vm.clone());
+            registry.insert(
+                name.to_string(),
+                RegisteredVm {
+                    vm: vm.clone(),
+                    ready: ReadyMarkerCache::default(),
+                },
+            );
         }
 
         // Start VM on its dispatch queue with synchronous error reporting via channel
@@ -351,7 +361,7 @@ impl VmDriver for AppleVzDriver {
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?
             .get(&handle.name)
-            .cloned()
+            .map(|entry| entry.vm.clone())
             .ok_or_else(|| VmError::NotFound {
                 name: handle.name.clone(),
             })?;
@@ -373,7 +383,8 @@ impl VmDriver for AppleVzDriver {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            match Self::vm_state(handle, &vm) {
+            let ready_ip = super::check_ready_marker(&handle.serial_log);
+            match Self::vm_state(&vm, ready_ip) {
                 VmState::Stopped => {
                     self.vms
                         .lock()
@@ -415,16 +426,19 @@ impl VmDriver for AppleVzDriver {
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let registry = self
+        let mut registry = self
             .vms
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
-        let state = match registry.get(&handle.name) {
-            Some(vm) => Self::vm_state(handle, vm),
+        let state = match registry.get_mut(&handle.name) {
+            Some(entry) => {
+                let ready_ip = entry.ready.scan(&handle.serial_log);
+                Self::vm_state(&entry.vm, ready_ip)
+            }
             None => VmState::Stopped,
         };
 
-        tracing::debug!(vm = %handle.name, state = %state, "Apple VZ VM state queried");
+        tracing::debug!(driver = "apple_vz", vm = %handle.name, state = %state, "VM state queried");
         Ok(state)
     }
 }
@@ -485,7 +499,7 @@ mod tests {
                 VZVirtualMachineState::VZVirtualMachineStateRunning,
                 None,
             ),
-            VmState::Starting
+            VmState::Running
         );
     }
 
@@ -496,7 +510,7 @@ mod tests {
                 VZVirtualMachineState::VZVirtualMachineStateRunning,
                 Some("10.0.0.2".into()),
             ),
-            VmState::Running {
+            VmState::Ready {
                 ip: "10.0.0.2".into(),
             }
         );

@@ -21,7 +21,7 @@ macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 | Boot VM | Verified | Verified | Direct Linux boot or UEFI |
 | Stop (graceful) | Verified | Verified | VZ: requestStopWithError. CH: SIGTERM (ACPI) |
 | Kill (force) | Verified | Verified | VZ: stopWithCompletionHandler. CH: SIGKILL |
-| Query state | Verified | Verified | Starting → Running → Stopped / Failed |
+| Query state | Verified | Verified | Starting → Running → Ready → Stopped / Failed |
 | Pause / Resume | Wired | Planned | VZ: wired + mock-tested. CH: needs API mode |
 | Save / Restore | FFI only | Planned | VZ: saveMachineStateTo/restoreMachineStateFrom (14+) |
 | Delete/cleanup | Verified | Verified | Registry removal / process reap |
@@ -121,7 +121,7 @@ VZSpiceAgentPortAttachment.
 | `tests/seed_iso.rs` | 4 | Cloud-init ISO creation with hdiutil/genisoimage |
 | `tests/disk_clone.rs` | 4 | APFS/reflink CoW cloning |
 
-**Total: 156 tests.** CI runs on both macOS and Linux.
+The default CI runs on macOS and Linux. Real hypervisor lifecycle coverage is still opt-in because it requires signed binaries or external kernel/initramfs assets.
 
 ## Roadmap
 

@@ -39,8 +39,11 @@ let config = VmConfig {
 };
 
 let handle = manager.start(&config)?;
-// VM is booting — poll state until Running
+// VM is booting — poll state until Ready
 let state = manager.state("my-vm")?;
+if state.is_ready() {
+    eprintln!("guest IP = {}", state.ip().unwrap());
+}
 ```
 
 ## Features
@@ -118,7 +121,7 @@ Each platform driver is an in-process implementation optimized for its hyperviso
 
 ## Testing
 
-156 tests across 8 test suites. CI runs on macOS (aarch64), Linux (x86_64), and Windows (x86_64).
+The default CI runs on macOS and Linux. Real hypervisor lifecycle tests are available, but they are opt-in because they require signed binaries or test kernel assets.
 
 ```bash
 cargo test                        # everything
@@ -127,6 +130,8 @@ cargo test --test vm_manager      # VmManager with mock driver
 cargo test --test network_switch  # L2 switch integration
 cargo test --test oci_pull        # OCI registry (needs internet)
 cargo test --test ffi_smoke       # Apple VZ FFI (macOS only)
+cargo test --test vm_lifecycle -- --ignored
+                                 # real hypervisor lifecycle tests with assets
 ```
 
 ## License
