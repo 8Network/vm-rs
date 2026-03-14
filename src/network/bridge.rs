@@ -16,7 +16,10 @@ fn validate_interface_name(name: &str) -> Result<(), VmError> {
             name.len()
         )));
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(VmError::InvalidConfig(format!(
             "interface name '{}' contains invalid characters (only alphanumeric, hyphen, underscore allowed)",
             name
@@ -81,6 +84,7 @@ pub fn create_tap(name: &str) -> Result<(), VmError> {
 /// Add a TAP device to a bridge.
 pub fn add_to_bridge(tap: &str, bridge: &str) -> Result<(), VmError> {
     validate_interface_name(tap)?;
+    validate_interface_name(bridge)?;
     run_ip(&["link", "set", tap, "master", bridge])?;
     tracing::debug!(tap = %tap, bridge = %bridge, "TAP added to bridge");
     Ok(())
@@ -132,9 +136,17 @@ fn setup_nat(bridge: &str, subnet: &str) -> Result<(), VmError> {
     // Check if rule already exists
     let check = Command::new("iptables")
         .args([
-            "-t", "nat", "-C", "POSTROUTING",
-            "-s", subnet, "!", "-o", bridge,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "!",
+            "-o",
+            bridge,
+            "-j",
+            "MASQUERADE",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -149,9 +161,17 @@ fn setup_nat(bridge: &str, subnet: &str) -> Result<(), VmError> {
     // Add the rule
     let status = Command::new("iptables")
         .args([
-            "-t", "nat", "-A", "POSTROUTING",
-            "-s", subnet, "!", "-o", bridge,
-            "-j", "MASQUERADE",
+            "-t",
+            "nat",
+            "-A",
+            "POSTROUTING",
+            "-s",
+            subnet,
+            "!",
+            "-o",
+            bridge,
+            "-j",
+            "MASQUERADE",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

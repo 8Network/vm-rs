@@ -10,6 +10,9 @@ pub mod apple_vz;
 #[cfg(target_os = "linux")]
 pub mod cloud_hv;
 
+#[cfg(target_os = "windows")]
+pub mod whp;
+
 use crate::config::{VmConfig, VmHandle, VmState};
 
 /// Platform-agnostic VM lifecycle.
@@ -119,5 +122,9 @@ pub(crate) fn check_ready_marker(log_path: &std::path::Path) -> Option<String> {
     let pos = content.find(crate::config::READY_MARKER)?;
     let after = &content[pos + crate::config::READY_MARKER.len()..];
     let ip = after.split_whitespace().next()?.trim().to_string();
-    if ip.is_empty() { None } else { Some(ip) }
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip)
+    }
 }

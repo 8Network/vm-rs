@@ -1,6 +1,6 @@
 //! storage device module
 
-use super::base::{Id, NIL, NSError, NSURL};
+use super::base::{Id, NSError, NIL, NSURL};
 
 use objc::runtime::BOOL;
 use objc::{class, msg_send, sel, sel_impl};
@@ -102,8 +102,12 @@ impl VZDiskImageStorageDeviceAttachmentBuilder<String, bool> {
     pub fn build(self) -> Result<VZDiskImageStorageDeviceAttachment, NSError> {
         let read_only = if self.read_only { YES } else { NO };
         if self.caching_mode.is_some() || self.sync_mode.is_some() {
-            let caching = self.caching_mode.unwrap_or(VZDiskImageCachingMode::Automatic) as isize;
-            let sync = self.sync_mode.unwrap_or(VZDiskImageSynchronizationMode::Full) as isize;
+            let caching = self
+                .caching_mode
+                .unwrap_or(VZDiskImageCachingMode::Automatic) as isize;
+            let sync = self
+                .sync_mode
+                .unwrap_or(VZDiskImageSynchronizationMode::Full) as isize;
             unsafe {
                 VZDiskImageStorageDeviceAttachment::new_with_modes(
                     self.path.as_str(),

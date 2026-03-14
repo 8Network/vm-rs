@@ -3,7 +3,9 @@
 //! These tests create actual ISO files and verify their contents.
 //! Requires: hdiutil (macOS) or genisoimage/mkisofs (Linux).
 
-use vm_rs::setup::{create_seed_iso, HealthCheckConfig, NicConfig, ProcessConfig, SeedConfig, VolumeMountConfig};
+use vm_rs::setup::{
+    create_seed_iso, HealthCheckConfig, NicConfig, ProcessConfig, SeedConfig, VolumeMountConfig,
+};
 
 fn has_iso_tool() -> bool {
     #[cfg(target_os = "macos")]
@@ -144,11 +146,21 @@ fn seed_iso_cleans_up_temp_dir() {
 
     create_seed_iso(&iso_path, &config).expect("ISO creation failed");
 
-    // The temp dir .seed-<hostname> should be cleaned up
-    let seed_tmp = tmp.path().join(".seed-cleanup-test");
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .expect("read_dir")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            file_name
+                .starts_with(".seed-cleanup-test-")
+                .then_some(file_name.to_string())
+        })
+        .collect();
     assert!(
-        !seed_tmp.exists(),
-        "temp dir should be cleaned up after ISO creation"
+        leftovers.is_empty(),
+        "temp dirs should be cleaned up after ISO creation, found: {:?}",
+        leftovers
     );
 }
 

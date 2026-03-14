@@ -17,7 +17,7 @@ extern "C" {}
 extern "C" {
     pub fn dispatch_queue_create(label: *const libc::c_char, attr: Id) -> Id;
     pub fn dispatch_async(queue: Id, block: &Block<(), ()>);
-// pub fn dispatch_async(queue: Id, block: *mut c_void);
+    // pub fn dispatch_async(queue: Id, block: *mut c_void);
 }
 
 pub type Id = *mut Object;
@@ -164,9 +164,7 @@ impl NSFileHandle {
     /// lifetime expected by the created Objective-C file handle.
     pub unsafe fn file_handle_with_fd(fd: i32) -> NSFileHandle {
         let alloc: Id = msg_send![class!(NSFileHandle), alloc];
-        let p = StrongPtr::new(
-            msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: YES],
-        );
+        let p = StrongPtr::new(msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: YES]);
         NSFileHandle(p)
     }
 }
@@ -255,7 +253,11 @@ impl NSError {
 
         // Helper: safely print an NSString that may be backed by nil
         fn safe_str(s: &NSString) -> Cow<'_, str> {
-            if *s.0 == NIL { Cow::Borrowed("(nil)") } else { s.as_str() }
+            if *s.0 == NIL {
+                Cow::Borrowed("(nil)")
+            } else {
+                s.as_str()
+            }
         }
 
         let desc = self.localized_description();

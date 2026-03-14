@@ -114,22 +114,14 @@ fn resolve_ubuntu(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
     Ok(vec![
         ImageAsset {
             filename: "vmlinuz",
-            source_filename: format!(
-                "ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"
-            ),
-            url: format!(
-                "{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"
-            ),
+            source_filename: format!("ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"),
+            url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"),
             checksum_url: Some(format!("{unpacked}/SHA256SUMS")),
         },
         ImageAsset {
             filename: "initramfs",
-            source_filename: format!(
-                "ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"
-            ),
-            url: format!(
-                "{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"
-            ),
+            source_filename: format!("ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"),
+            url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"),
             checksum_url: Some(format!("{unpacked}/SHA256SUMS")),
         },
         ImageAsset {
@@ -176,8 +168,13 @@ pub async fn prepare_image(
         let path = image_dir.join(asset.filename);
         let expected_sha256 = match asset.checksum_url.as_deref() {
             Some(checksum_url) => Some(
-                expected_sha256(&client, checksum_url, &asset.source_filename, &mut checksum_cache)
-                    .await?,
+                expected_sha256(
+                    &client,
+                    checksum_url,
+                    &asset.source_filename,
+                    &mut checksum_cache,
+                )
+                .await?,
             ),
             None => None,
         };
@@ -278,13 +275,9 @@ async fn download_file(
     path: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<(), SetupError> {
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| {
-            SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
-        })?;
+    let resp = client.get(url).send().await.map_err(|e| {
+        SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
+    })?;
 
     if !resp.status().is_success() {
         return Err(SetupError::AssetDownload(format!(
@@ -295,10 +288,7 @@ async fn download_file(
     }
 
     let bytes = resp.bytes().await.map_err(|e| {
-        SetupError::AssetDownload(format!(
-            "failed to read response body from {}: {}",
-            url, e
-        ))
+        SetupError::AssetDownload(format!("failed to read response body from {}: {}", url, e))
     })?;
 
     if let Some(expected) = expected_sha256 {
@@ -349,16 +339,12 @@ async fn fetch_checksum_manifest(
     client: &reqwest::Client,
     checksum_url: &str,
 ) -> Result<HashMap<String, String>, SetupError> {
-    let resp = client
-        .get(checksum_url)
-        .send()
-        .await
-        .map_err(|e| {
-            SetupError::AssetDownload(format!(
-                "failed to fetch checksum manifest {}: {}",
-                checksum_url, e
-            ))
-        })?;
+    let resp = client.get(checksum_url).send().await.map_err(|e| {
+        SetupError::AssetDownload(format!(
+            "failed to fetch checksum manifest {}: {}",
+            checksum_url, e
+        ))
+    })?;
 
     if !resp.status().is_success() {
         return Err(SetupError::AssetDownload(format!(
@@ -393,10 +379,7 @@ fn parse_checksum_manifest(body: &str) -> Result<HashMap<String, String>, SetupE
         };
         let (digest, path) = line.split_at(split_at);
         let digest = digest.trim();
-        let filename = path
-            .trim()
-            .trim_start_matches('*')
-            .trim_start_matches("./");
+        let filename = path.trim().trim_start_matches('*').trim_start_matches("./");
         if digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
             manifest.insert(filename.to_string(), digest.to_ascii_lowercase());
         }

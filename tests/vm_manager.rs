@@ -80,13 +80,13 @@ impl VmDriver for MockDriver {
             .lock()
             .expect("vms lock should not be poisoned")
             .insert(
-            config.name.clone(),
-            MockVmState {
-                state: VmState::Running {
-                    ip: "10.0.0.99".into(),
+                config.name.clone(),
+                MockVmState {
+                    state: VmState::Running {
+                        ip: "10.0.0.99".into(),
+                    },
                 },
-            },
-        );
+            );
 
         Ok(handle)
     }
@@ -428,9 +428,17 @@ fn resume_paused_vm_returns_to_running() {
         .resume("mock-resume")
         .expect("resume should succeed");
 
-    // After resume, the manager sets state to Starting (waiting for ready marker).
-    // But the mock driver already set it to Running internally.
-    // The next state() call will pick up Running from the driver.
+    let listed = manager.list().expect("list");
+    let listed_vm = listed
+        .into_iter()
+        .find(|vm| vm.name == "mock-resume")
+        .expect("resumed VM should still be tracked");
+    assert!(
+        matches!(listed_vm.state, VmState::Running { .. }),
+        "cached handle state should be Running after resume, got: {}",
+        listed_vm.state
+    );
+
     let state = manager.state("mock-resume").expect("state");
     assert!(
         matches!(state, VmState::Running { .. }),
@@ -556,7 +564,9 @@ fn config_machine_id_roundtrip() {
     let id = vec![1, 2, 3, 4, 5, 6, 7, 8];
     config.machine_id = Some(id.clone());
     assert_eq!(
-        config.machine_id.expect("machine_id should be present after assignment"),
+        config
+            .machine_id
+            .expect("machine_id should be present after assignment"),
         id
     );
 }

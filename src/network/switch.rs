@@ -96,9 +96,7 @@ impl NetworkSwitch {
     pub fn add_port(&self, network_id: &str, _label: &str) -> io::Result<VmSocketEndpoint> {
         let (switch_fd, vm_fd) = create_socketpair()?;
 
-        let port = SwitchPort {
-            fd: switch_fd,
-        };
+        let port = SwitchPort { fd: switch_fd };
 
         let mut networks = self
             .networks
@@ -202,7 +200,12 @@ fn create_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
         if flags == -1 {
             return Err(io::Error::last_os_error());
         }
-        if libc::fcntl(switch_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+        if libc::fcntl(
+            switch_fd.as_raw_fd(),
+            libc::F_SETFL,
+            flags | libc::O_NONBLOCK,
+        ) == -1
+        {
             return Err(io::Error::last_os_error());
         }
     }
@@ -266,8 +269,7 @@ fn forwarding_loop(
         }
 
         // SAFETY: poll(2) on fds we own. pollfds array is valid and properly sized.
-        let ready =
-            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
 
         if ready <= 0 {
             continue;
@@ -282,14 +284,8 @@ fn forwarding_loop(
 
             // Read one Ethernet frame
             // SAFETY: Reading from our own fd into a stack buffer of MAX_FRAME_SIZE.
-            let n = unsafe {
-                libc::recv(
-                    pfd.fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    0,
-                )
-            };
+            let n =
+                unsafe { libc::recv(pfd.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
 
             if n < MIN_FRAME_SIZE as isize {
                 continue;
@@ -387,8 +383,7 @@ mod tests {
 
     #[test]
     fn mac_from_bytes_valid() {
-        let mac = MacAddress::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
-            .expect("valid MAC");
+        let mac = MacAddress::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).expect("valid MAC");
         assert_eq!(mac.0, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
     }
 
@@ -469,7 +464,9 @@ mod tests {
     #[test]
     fn switch_add_ports_different_networks() {
         let switch = NetworkSwitch::new();
-        let fd1 = switch.add_port("frontend", "web").expect("add frontend port");
+        let fd1 = switch
+            .add_port("frontend", "web")
+            .expect("add frontend port");
         let fd2 = switch.add_port("backend", "db").expect("add backend port");
         assert_ne!(fd1.as_raw_fd(), fd2.as_raw_fd());
     }
@@ -478,7 +475,9 @@ mod tests {
     fn switch_frame_delivery_same_network() {
         let switch = NetworkSwitch::new();
         let fd1 = switch.add_port("net0", "sender").expect("add sender port");
-        let fd2 = switch.add_port("net0", "receiver").expect("add receiver port");
+        let fd2 = switch
+            .add_port("net0", "receiver")
+            .expect("add receiver port");
         switch.start().expect("start switch");
 
         // Build a minimal Ethernet frame: dst(6) + src(6) + ethertype(2) = 14 bytes
@@ -516,7 +515,10 @@ mod tests {
                 libc::MSG_DONTWAIT,
             )
         };
-        assert_eq!(recvd, 14, "broadcast frame should be forwarded to the other port");
+        assert_eq!(
+            recvd, 14,
+            "broadcast frame should be forwarded to the other port"
+        );
         assert_eq!(&buf[..14], &frame[..14]);
 
         switch.stop();
@@ -526,7 +528,9 @@ mod tests {
     fn switch_no_cross_network_forwarding() {
         let switch = NetworkSwitch::new();
         let fd1 = switch.add_port("net-a", "sender").expect("add sender port");
-        let fd2 = switch.add_port("net-b", "isolated").expect("add isolated port");
+        let fd2 = switch
+            .add_port("net-b", "isolated")
+            .expect("add isolated port");
         switch.start().expect("start switch");
 
         // Broadcast frame from net-a

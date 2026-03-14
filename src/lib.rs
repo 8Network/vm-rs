@@ -28,8 +28,7 @@ pub mod vm;
 #[cfg(unix)]
 pub use config::VmSocketEndpoint;
 pub use config::{
-    NetworkAttachment, SharedDir, VmConfig, VmHandle, VmState, VmmProcess,
-    READY_MARKER,
+    NetworkAttachment, SharedDir, VmConfig, VmHandle, VmState, VmmProcess, READY_MARKER,
 };
 pub use driver::{VmDriver, VmError};
 pub use vm::VmManager;

@@ -24,8 +24,8 @@ struct VmProcess {
     identity: VmmProcess,
     /// Child handle retained so we can reap exit status and avoid zombie confusion.
     child: Child,
-    /// TAP device name (for cleanup on stop).
-    tap_device: Option<String>,
+    /// TAP device names (for cleanup on stop).
+    tap_devices: Vec<String>,
     /// virtiofsd sidecar PIDs (for VirtioFS shared dirs, cleaned up on stop).
     virtiofsd_pids: Vec<u32>,
 }
@@ -90,28 +90,33 @@ impl VmDriver for CloudHvDriver {
 
         // Memory — shared=on required when using VirtioFS
         if config.shared_dirs.is_empty() {
-            cmd.arg("--memory").arg(format!("size={}M", config.memory_mb));
+            cmd.arg("--memory")
+                .arg(format!("size={}M", config.memory_mb));
         } else {
-            cmd.arg("--memory").arg(format!("size={}M,shared=on", config.memory_mb));
+            cmd.arg("--memory")
+                .arg(format!("size={}M,shared=on", config.memory_mb));
         }
 
         // Disks: only attach if provided (initramfs boot needs no disks)
         if let Some(ref root_disk) = config.root_disk {
-            cmd.arg("--disk").arg(format!("path={}", root_disk.display()));
+            cmd.arg("--disk")
+                .arg(format!("path={}", root_disk.display()));
         }
         if let Some(ref seed_iso) = config.seed_iso {
-            cmd.arg("--disk").arg(format!("path={},readonly=on", seed_iso.display()));
+            cmd.arg("--disk")
+                .arg(format!("path={},readonly=on", seed_iso.display()));
         }
         if let Some(ref data_disk) = config.data_disk {
-            cmd.arg("--disk").arg(format!("path={}", data_disk.display()));
+            cmd.arg("--disk")
+                .arg(format!("path={}", data_disk.display()));
         }
 
         // Network
-        let mut tap_name = None;
+        let mut tap_devices = Vec::new();
         for net in &config.networks {
             match net {
                 NetworkAttachment::Tap { name: tap, mac } => {
-                    tap_name = Some(tap.clone());
+                    tap_devices.push(tap.clone());
                     let mac_str = mac.clone().unwrap_or_else(|| generate_mac(name));
                     cmd.arg("--net").arg(format!("tap={},mac={}", tap, mac_str));
                 }
@@ -124,7 +129,8 @@ impl VmDriver for CloudHvDriver {
         }
 
         // Serial console → file
-        cmd.arg("--serial").arg(format!("file={}", config.serial_log.display()));
+        cmd.arg("--serial")
+            .arg(format!("file={}", config.serial_log.display()));
         cmd.arg("--console").arg("off");
 
         // VirtioFS shared directories via virtiofsd sidecar processes.
@@ -215,32 +221,32 @@ impl VmDriver for CloudHvDriver {
 
         // Brief pause then check if process exited immediately (bad binary, permissions, etc.)
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Some(status) = process
-            .try_wait()
-            .map_err(|e| VmError::Io(e))?
-        {
+        if let Some(status) = process.try_wait().map_err(|e| VmError::Io(e))? {
             // Clean up virtiofsd processes since VM failed
             cleanup_virtiofsd(&virtiofsd_pids);
             return Err(VmError::BootFailed {
                 name: name.clone(),
                 detail: format!(
                     "cloud-hypervisor process (PID {}) exited immediately with {}. Check {}",
-                    pid, status, vmm_log_path.display()
+                    pid,
+                    status,
+                    vmm_log_path.display()
                 ),
             });
         }
 
         // Track
         {
-            let mut vms = self.vms.lock().map_err(|e| {
-                VmError::Hypervisor(format!("lock poisoned: {}", e))
-            })?;
+            let mut vms = self
+                .vms
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
             vms.insert(
                 name.clone(),
                 VmProcess {
                     child: process,
                     identity: identity.clone(),
-                    tap_device: tap_name,
+                    tap_devices,
                     virtiofsd_pids,
                 },
             );
@@ -258,9 +264,10 @@ impl VmDriver for CloudHvDriver {
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
         tracing::info!(vm = %handle.name, "requesting graceful stop via Cloud Hypervisor");
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("lock poisoned: {}", e))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         let process = if let Some(process) = vms.remove(&handle.name) {
             process
         } else if let Some(ref process) = handle.process {
@@ -301,25 +308,33 @@ impl VmDriver for CloudHvDriver {
             wait_for_exit(process.child, std::time::Duration::from_secs(10));
         }
 
-        cleanup_tap(&process.tap_device);
+        cleanup_taps(&process.tap_devices);
         cleanup_virtiofsd(&process.virtiofsd_pids);
         Ok(())
     }
 
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
         tracing::warn!(vm = %handle.name, "force-killing Cloud Hypervisor VM");
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("lock poisoned: {}", e))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
-        let (identity, mut child, virtiofsd_pids) = if let Some(process) = vms.remove(&handle.name) {
-            cleanup_tap(&process.tap_device);
-            (process.identity, Some(process.child), process.virtiofsd_pids)
+        let (identity, mut child, virtiofsd_pids) = if let Some(process) = vms.remove(&handle.name)
+        {
+            cleanup_taps(&process.tap_devices);
+            (
+                process.identity,
+                Some(process.child),
+                process.virtiofsd_pids,
+            )
         } else if let Some(ref process) = handle.process {
             validate_cloud_hypervisor_process(process, &handle.name)?;
             (process.clone(), None, Vec::new())
         } else {
-            return Err(VmError::NotFound { name: handle.name.clone() });
+            return Err(VmError::NotFound {
+                name: handle.name.clone(),
+            });
         };
 
         let kill_result = if let Some(child) = child.as_mut() {
@@ -354,9 +369,10 @@ impl VmDriver for CloudHvDriver {
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let mut vms = self.vms.lock().map_err(|e| {
-            VmError::Hypervisor(format!("lock poisoned: {}", e))
-        })?;
+        let mut vms = self
+            .vms
+            .lock()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
 
         let process = match vms.get_mut(&handle.name) {
             Some(p) => p,
@@ -378,12 +394,7 @@ impl VmDriver for CloudHvDriver {
             }
         };
 
-        if process
-            .child
-            .try_wait()
-            .map_err(VmError::Io)?
-            .is_some()
-        {
+        if process.child.try_wait().map_err(VmError::Io)?.is_some() {
             vms.remove(&handle.name);
             return Ok(VmState::Stopped);
         }
@@ -434,7 +445,8 @@ fn find_ch_binary() -> Result<PathBuf, VmError> {
 
     Err(VmError::InvalidConfig(
         "cloud-hypervisor binary not found on PATH or in /usr/bin, /usr/local/bin. \
-         Install from https://github.com/cloud-hypervisor/cloud-hypervisor/releases".into(),
+         Install from https://github.com/cloud-hypervisor/cloud-hypervisor/releases"
+            .into(),
     ))
 }
 
@@ -443,10 +455,7 @@ fn find_ch_binary() -> Result<PathBuf, VmError> {
 fn generate_mac(name: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(name.as_bytes());
-    format!(
-        "52:54:00:{:02x}:{:02x}:{:02x}",
-        hash[0], hash[1], hash[2]
-    )
+    format!("52:54:00:{:02x}:{:02x}:{:02x}", hash[0], hash[1], hash[2])
 }
 
 /// Find the virtiofsd binary on PATH or well-known locations.
@@ -464,7 +473,11 @@ fn find_virtiofsd() -> Result<PathBuf, VmError> {
         {
             Ok(status) if status.success() => return Ok(PathBuf::from(name)),
             Ok(status) => {
-                tracing::warn!("virtiofsd candidate '{}' found but exited with {}", name, status);
+                tracing::warn!(
+                    "virtiofsd candidate '{}' found but exited with {}",
+                    name,
+                    status
+                );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Expected: candidate not at this location, try next
@@ -557,7 +570,11 @@ fn wait_for_pid_exit(
         let errno = std::io::Error::last_os_error();
         return Err(VmError::StopFailed {
             name: vm_name.to_string(),
-            detail: format!("failed to SIGKILL restored VM PID {}: {}", process.pid(), errno),
+            detail: format!(
+                "failed to SIGKILL restored VM PID {}: {}",
+                process.pid(),
+                errno
+            ),
         });
     }
     // Brief wait for SIGKILL to take effect
@@ -572,7 +589,10 @@ fn wait_for_pid_exit(
     tracing::error!(pid = process.pid(), "process still alive after SIGKILL");
     Err(VmError::StopFailed {
         name: vm_name.to_string(),
-        detail: format!("restored VM PID {} remained alive after SIGKILL", process.pid()),
+        detail: format!(
+            "restored VM PID {} remained alive after SIGKILL",
+            process.pid()
+        ),
     })
 }
 
@@ -632,9 +652,9 @@ fn read_proc_start_time(pid: u32) -> Option<u64> {
     fields.get(19)?.parse().ok()
 }
 
-/// Clean up a TAP device if one was created.
-fn cleanup_tap(tap_device: &Option<String>) {
-    if let Some(ref tap) = tap_device {
+/// Clean up all TAP devices created for a VM.
+fn cleanup_taps(tap_devices: &[String]) {
+    for tap in tap_devices {
         let status = Command::new("ip")
             .args(["tuntap", "del", "dev", tap, "mode", "tap"])
             .stdout(Stdio::null())

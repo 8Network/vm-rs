@@ -55,18 +55,20 @@ impl AppleVzDriver {
     fn vm_state(handle: &VmHandle, vm: &VZVirtualMachine) -> VmState {
         // SAFETY: VM references come from the driver's registry and stay alive
         // for the lifetime of the driver entry.
-        match unsafe { vm.state() } {
-            VZVirtualMachineState::VZVirtualMachineStateRunning => {
-                if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
-                    VmState::Running { ip }
-                } else {
-                    VmState::Starting
-                }
-            }
-            VZVirtualMachineState::VZVirtualMachineStateStarting
+        let ready_ip = super::check_ready_marker(&handle.serial_log);
+        Self::map_native_state(unsafe { vm.state() }, ready_ip)
+    }
+
+    fn map_native_state(state: VZVirtualMachineState, ready_ip: Option<String>) -> VmState {
+        match state {
+            VZVirtualMachineState::VZVirtualMachineStateRunning => match ready_ip {
+                Some(ip) => VmState::Running { ip },
+                None => VmState::Starting,
+            },
+            VZVirtualMachineState::VZVirtualMachineStatePaused
             | VZVirtualMachineState::VZVirtualMachineStatePausing
-            | VZVirtualMachineState::VZVirtualMachineStateResuming
-            | VZVirtualMachineState::VZVirtualMachineStatePaused => VmState::Starting,
+            | VZVirtualMachineState::VZVirtualMachineStateResuming => VmState::Paused,
+            VZVirtualMachineState::VZVirtualMachineStateStarting => VmState::Starting,
             VZVirtualMachineState::VZVirtualMachineStateStopped => VmState::Stopped,
             VZVirtualMachineState::VZVirtualMachineStateError => VmState::Failed {
                 reason: "Apple Virtualization.framework reported an internal error".into(),
@@ -188,11 +190,9 @@ impl VmDriver for AppleVzDriver {
                 .caching_mode(VZDiskImageCachingMode::Automatic)
                 .sync_mode(VZDiskImageSynchronizationMode::Full)
                 .build()
-                .map_err(|e| {
-                    VmError::BootFailed {
-                        name: name.clone(),
-                        detail: format!("failed to attach root disk: code {}", e.code()),
-                    }
+                .map_err(|e| VmError::BootFailed {
+                    name: name.clone(),
+                    detail: format!("failed to attach root disk: code {}", e.code()),
                 })?;
             storage_devices.push(VZVirtioBlockDeviceConfiguration::new(root_attachment));
         }
@@ -202,11 +202,9 @@ impl VmDriver for AppleVzDriver {
                 .path(seed_path)
                 .read_only(true)
                 .build()
-                .map_err(|e| {
-                    VmError::BootFailed {
-                        name: name.clone(),
-                        detail: format!("failed to attach seed ISO: code {}", e.code()),
-                    }
+                .map_err(|e| VmError::BootFailed {
+                    name: name.clone(),
+                    detail: format!("failed to attach seed ISO: code {}", e.code()),
                 })?;
             storage_devices.push(VZVirtioBlockDeviceConfiguration::new(seed_attachment));
         }
@@ -256,8 +254,8 @@ impl VmDriver for AppleVzDriver {
         })?;
 
         // Create dispatch queue with unique label per VM
-        let label = std::ffi::CString::new(format!("rs.vm.{}", name))
-            .map_err(|e| VmError::BootFailed {
+        let label =
+            std::ffi::CString::new(format!("rs.vm.{}", name)).map_err(|e| VmError::BootFailed {
                 name: name.clone(),
                 detail: format!("invalid VM name for queue label: {}", e),
             })?;
@@ -295,11 +293,7 @@ impl VmDriver for AppleVzDriver {
                         error.code(),
                         error.localized_description().as_str()
                     );
-                    tracing::error!(
-                        "VM '{}' start FAILED {}",
-                        name_err,
-                        msg
-                    );
+                    tracing::error!("VM '{}' start FAILED {}", name_err, msg);
                     let _ = tx_clone.send(Err(msg));
                 }
             });
@@ -334,7 +328,8 @@ impl VmDriver for AppleVzDriver {
                     .remove(name);
                 return Err(VmError::BootFailed {
                     name: name.clone(),
-                    detail: "Apple VZ start completion handler did not fire within 10 seconds".into(),
+                    detail: "Apple VZ start completion handler did not fire within 10 seconds"
+                        .into(),
                 });
             }
         }
@@ -364,12 +359,16 @@ impl VmDriver for AppleVzDriver {
         let mut vm_clone = vm.clone();
         // SAFETY: vm_clone is a valid VZVirtualMachine reference from the registry.
         unsafe {
-            vm_clone.request_stop_with_error().map_err(|e| {
-                VmError::StopFailed {
+            vm_clone
+                .request_stop_with_error()
+                .map_err(|e| VmError::StopFailed {
                     name: handle.name.clone(),
-                    detail: format!("error code {}: {}", e.code(), e.localized_description().as_str()),
-                }
-            })?;
+                    detail: format!(
+                        "error code {}: {}",
+                        e.code(),
+                        e.localized_description().as_str()
+                    ),
+                })?;
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -378,7 +377,9 @@ impl VmDriver for AppleVzDriver {
                 VmState::Stopped => {
                     self.vms
                         .lock()
-                        .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?
+                        .map_err(|e| {
+                            VmError::Hypervisor(format!("VM registry lock poisoned: {}", e))
+                        })?
                         .remove(&handle.name);
                     tracing::info!(vm = %handle.name, "Apple VZ VM stopped");
                     return Ok(());
@@ -386,7 +387,9 @@ impl VmDriver for AppleVzDriver {
                 VmState::Failed { reason } => {
                     self.vms
                         .lock()
-                        .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?
+                        .map_err(|e| {
+                            VmError::Hypervisor(format!("VM registry lock poisoned: {}", e))
+                        })?
                         .remove(&handle.name);
                     return Err(VmError::StopFailed {
                         name: handle.name.clone(),
@@ -440,4 +443,62 @@ fn resolve_path(path: &Path, label: &str) -> Result<String, VmError> {
         .to_str()
         .ok_or_else(|| VmError::InvalidConfig(format!("non-UTF8 {} path", label)))
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paused_native_state_maps_to_paused() {
+        assert_eq!(
+            AppleVzDriver::map_native_state(
+                VZVirtualMachineState::VZVirtualMachineStatePaused,
+                None,
+            ),
+            VmState::Paused
+        );
+    }
+
+    #[test]
+    fn pausing_and_resuming_native_states_map_to_paused() {
+        assert_eq!(
+            AppleVzDriver::map_native_state(
+                VZVirtualMachineState::VZVirtualMachineStatePausing,
+                None,
+            ),
+            VmState::Paused
+        );
+        assert_eq!(
+            AppleVzDriver::map_native_state(
+                VZVirtualMachineState::VZVirtualMachineStateResuming,
+                None,
+            ),
+            VmState::Paused
+        );
+    }
+
+    #[test]
+    fn running_without_ready_marker_stays_starting() {
+        assert_eq!(
+            AppleVzDriver::map_native_state(
+                VZVirtualMachineState::VZVirtualMachineStateRunning,
+                None,
+            ),
+            VmState::Starting
+        );
+    }
+
+    #[test]
+    fn running_with_ready_marker_maps_to_running() {
+        assert_eq!(
+            AppleVzDriver::map_native_state(
+                VZVirtualMachineState::VZVirtualMachineStateRunning,
+                Some("10.0.0.2".into()),
+            ),
+            VmState::Running {
+                ip: "10.0.0.2".into(),
+            }
+        );
+    }
 }

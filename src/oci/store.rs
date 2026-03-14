@@ -125,7 +125,8 @@ impl ImageStore {
     /// Read a blob's bytes.
     pub fn get_blob(&self, digest: &str) -> Result<Vec<u8>, OciError> {
         let path = self.blob_path(digest);
-        std::fs::read(&path).map_err(|e| OciError::Blob(format!("failed to read blob {}: {}", digest, e)))
+        std::fs::read(&path)
+            .map_err(|e| OciError::Blob(format!("failed to read blob {}: {}", digest, e)))
     }
 
     /// Save a manifest for an image reference.
@@ -200,7 +201,9 @@ impl ImageStore {
         let raw: RawManifest = serde_json::from_slice(data)
             .map_err(|e| OciError::ManifestParse(format!("invalid JSON: {}", e)))?;
 
-        let media_type = raw.media_type.as_deref()
+        let media_type = raw
+            .media_type
+            .as_deref()
             .or_else(|| raw.schema_version.map(|_| ""))
             .unwrap_or("");
 
@@ -208,11 +211,13 @@ impl ImageStore {
             return Err(OciError::ManifestList);
         }
 
-        let config_digest = raw.config
+        let config_digest = raw
+            .config
             .and_then(|c| c.digest)
             .ok_or_else(|| OciError::ManifestParse("missing config digest".into()))?;
 
-        let layers = raw.layers
+        let layers = raw
+            .layers
             .ok_or_else(|| OciError::ManifestParse("missing layers".into()))?;
         let layer_digests: Vec<String> = layers
             .into_iter()
@@ -249,9 +254,13 @@ impl ImageStore {
                 let port = key
                     .split('/')
                     .next()
-                    .ok_or_else(|| OciError::ManifestParse(format!("invalid exposed port '{}'", key)))?
+                    .ok_or_else(|| {
+                        OciError::ManifestParse(format!("invalid exposed port '{}'", key))
+                    })?
                     .parse::<u16>()
-                    .map_err(|e| OciError::ManifestParse(format!("invalid exposed port '{}': {}", key, e)))?;
+                    .map_err(|e| {
+                        OciError::ManifestParse(format!("invalid exposed port '{}': {}", key, e))
+                    })?;
                 ports.push(port);
             }
             ports
@@ -270,11 +279,7 @@ impl ImageStore {
     }
 
     /// Extract all layers of an image into a target directory (for rootfs preparation).
-    pub fn extract_layers(
-        &self,
-        manifest: &ImageManifest,
-        target: &Path,
-    ) -> Result<(), OciError> {
+    pub fn extract_layers(&self, manifest: &ImageManifest, target: &Path) -> Result<(), OciError> {
         std::fs::create_dir_all(target)?;
 
         for (i, digest) in manifest.layer_digests.iter().enumerate() {
@@ -322,11 +327,20 @@ impl ImageStore {
                             if let Some(parent) = path.parent() {
                                 let full_parent = target.join(parent);
                                 if full_parent.exists() {
-                                    let entries = std::fs::read_dir(&full_parent)
-                                        .map_err(|e| OciError::Blob(format!("opaque whiteout read_dir failed for {}: {}", full_parent.display(), e)))?;
+                                    let entries = std::fs::read_dir(&full_parent).map_err(|e| {
+                                        OciError::Blob(format!(
+                                            "opaque whiteout read_dir failed for {}: {}",
+                                            full_parent.display(),
+                                            e
+                                        ))
+                                    })?;
                                     for child in entries.flatten() {
                                         let child_path = child.path();
-                                        let remove_result = if child.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                                        let remove_result = if child
+                                            .file_type()
+                                            .map(|ft| ft.is_dir())
+                                            .unwrap_or(false)
+                                        {
                                             std::fs::remove_dir_all(&child_path)
                                         } else {
                                             std::fs::remove_file(&child_path)
@@ -353,7 +367,10 @@ impl ImageStore {
                 // Skip absolute paths and path traversal.
                 // Check each component individually — "foo..bar" is safe, "../foo" is not.
                 let has_traversal = path.components().any(|c| {
-                    matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir)
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
                 });
                 if has_traversal {
                     tracing::warn!(path = %path_str, "skipping tar entry with path traversal");
@@ -417,8 +434,8 @@ mod tests {
             ]
         }"#;
 
-        let manifest = ImageStore::parse_manifest(manifest_json.as_bytes())
-            .expect("manifest should parse");
+        let manifest =
+            ImageStore::parse_manifest(manifest_json.as_bytes()).expect("manifest should parse");
         assert_eq!(manifest.config_digest, "sha256:abc123");
         assert_eq!(manifest.layer_digests.len(), 2);
     }
@@ -434,8 +451,7 @@ mod tests {
             }
         }"#;
 
-        let config = ImageStore::parse_config(config_json.as_bytes())
-            .expect("config should parse");
+        let config = ImageStore::parse_config(config_json.as_bytes()).expect("config should parse");
         assert_eq!(config.cmd, vec!["nginx", "-g", "daemon off;"]);
         assert_eq!(config.env.len(), 2);
         assert_eq!(config.exposed_ports, vec![80]);
@@ -446,7 +462,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = ImageStore::new(tmp.path()).expect("store");
         let path = store.blob_path("sha256:abc123def456");
-        assert!(path.to_string_lossy().ends_with("blobs/sha256/abc123def456"));
+        assert!(path
+            .to_string_lossy()
+            .ends_with("blobs/sha256/abc123def456"));
     }
 
     #[test]
@@ -480,15 +498,15 @@ mod tests {
             "config": { "digest": "sha256:cfg" },
             "layers": [{}, { "digest": "sha256:layer2" }]
         }"#;
-        let err = ImageStore::parse_manifest(manifest_json.as_bytes()).expect_err("missing digest should fail");
+        let err = ImageStore::parse_manifest(manifest_json.as_bytes())
+            .expect_err("missing digest should fail");
         assert!(err.to_string().contains("missing layer digest"));
     }
 
     #[test]
     fn parse_config_minimal() {
         let config_json = r#"{"config": {}}"#;
-        let config = ImageStore::parse_config(config_json.as_bytes())
-            .expect("config should parse");
+        let config = ImageStore::parse_config(config_json.as_bytes()).expect("config should parse");
         assert!(config.cmd.is_empty());
         assert!(config.env.is_empty());
         assert!(config.exposed_ports.is_empty());
@@ -502,8 +520,7 @@ mod tests {
                 "Cmd": ["nginx"]
             }
         }"#;
-        let config = ImageStore::parse_config(config_json.as_bytes())
-            .expect("config should parse");
+        let config = ImageStore::parse_config(config_json.as_bytes()).expect("config should parse");
         assert_eq!(config.entrypoint, vec!["/docker-entrypoint.sh"]);
         assert_eq!(config.cmd, vec!["nginx"]);
     }
@@ -515,8 +532,7 @@ mod tests {
                 "ExposedPorts": { "80/tcp": {}, "443/tcp": {}, "8080/tcp": {} }
             }
         }"#;
-        let config = ImageStore::parse_config(config_json.as_bytes())
-            .expect("config should parse");
+        let config = ImageStore::parse_config(config_json.as_bytes()).expect("config should parse");
         let mut ports = config.exposed_ports.clone();
         ports.sort();
         assert_eq!(ports, vec![80, 443, 8080]);

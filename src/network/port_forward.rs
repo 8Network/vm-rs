@@ -45,12 +45,13 @@ impl PortForwarder {
             .parse()
             .map_err(|e| PortForwardError::InvalidTarget(format!("{}", e)))?;
 
-        let listener = TcpListener::bind(bind_addr)
-            .await
-            .map_err(|e| PortForwardError::BindFailed {
-                address: bind_addr,
-                detail: format!("{}", e),
-            })?;
+        let listener =
+            TcpListener::bind(bind_addr)
+                .await
+                .map_err(|e| PortForwardError::BindFailed {
+                    address: bind_addr,
+                    detail: format!("{}", e),
+                })?;
 
         tracing::info!(bind = %bind_addr, target = %target, "port forwarder started");
 

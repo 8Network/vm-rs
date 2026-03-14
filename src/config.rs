@@ -129,24 +129,37 @@ impl VmConfig {
             return Err(VmError::InvalidConfig("VM name must not be empty".into()));
         }
         if self.name.len() > 128 {
-            return Err(VmError::InvalidConfig("VM name must be 128 characters or fewer".into()));
-        }
-        if !self.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
             return Err(VmError::InvalidConfig(
-                "VM name must contain only alphanumeric characters, hyphens, underscores, and dots".into(),
+                "VM name must be 128 characters or fewer".into(),
+            ));
+        }
+        if !self
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(VmError::InvalidConfig(
+                "VM name must contain only alphanumeric characters, hyphens, underscores, and dots"
+                    .into(),
             ));
         }
         if self.name.starts_with('.') || self.name.starts_with('-') {
-            return Err(VmError::InvalidConfig("VM name must not start with '.' or '-'".into()));
+            return Err(VmError::InvalidConfig(
+                "VM name must not start with '.' or '-'".into(),
+            ));
         }
         if self.cpus == 0 {
             return Err(VmError::InvalidConfig("cpus must be at least 1".into()));
         }
         if self.memory_mb == 0 {
-            return Err(VmError::InvalidConfig("memory_mb must be at least 1".into()));
+            return Err(VmError::InvalidConfig(
+                "memory_mb must be at least 1".into(),
+            ));
         }
         if self.kernel.as_os_str().is_empty() {
-            return Err(VmError::InvalidConfig("kernel path must not be empty".into()));
+            return Err(VmError::InvalidConfig(
+                "kernel path must not be empty".into(),
+            ));
         }
         Ok(())
     }
@@ -312,8 +325,11 @@ mod tests {
             .validate()
             .expect_err("path traversal characters should fail validation")
             .to_string();
-        assert!(err.contains("alphanumeric") || err.contains("characters"),
-            "expected name validation error: {}", err);
+        assert!(
+            err.contains("alphanumeric") || err.contains("characters"),
+            "expected name validation error: {}",
+            err
+        );
     }
 
     #[test]
@@ -330,6 +346,8 @@ mod tests {
     #[test]
     fn validate_accepts_valid_config() {
         let config = test_vm_config("my-vm.01");
-        config.validate().expect("valid config should pass validation");
+        config
+            .validate()
+            .expect("valid config should pass validation");
     }
 }

@@ -89,7 +89,9 @@ impl VmManager {
         // Ensure VM directory exists
         let vm_dir = self.vm_dir(&config.name);
         if let Err(e) = std::fs::create_dir_all(&vm_dir) {
-            let mut vms = self.vms.write()
+            let mut vms = self
+                .vms
+                .write()
                 .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
             vms.remove(&config.name);
             return Err(VmError::Io(e));
@@ -117,7 +119,10 @@ impl VmManager {
 
         // Track the VM
         {
-            let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+            let mut vms = self
+                .vms
+                .write()
+                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
             vms.insert(config.name.clone(), handle.clone());
         }
 
@@ -131,7 +136,10 @@ impl VmManager {
         self.driver.stop(&handle)?;
 
         // Update state
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = VmState::Stopped;
         }
@@ -144,7 +152,10 @@ impl VmManager {
         let handle = self.get_handle(name)?;
         self.driver.kill(&handle)?;
 
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = VmState::Stopped;
         }
@@ -159,7 +170,10 @@ impl VmManager {
         tracing::info!(vm = %handle.name, "stopping VM by handle");
         self.driver.stop(handle)?;
 
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(&handle.name) {
             h.state = VmState::Stopped;
         }
@@ -171,7 +185,10 @@ impl VmManager {
         tracing::info!(vm = %handle.name, "force-killing VM by handle");
         self.driver.kill(handle)?;
 
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(&handle.name) {
             h.state = VmState::Stopped;
         }
@@ -182,7 +199,10 @@ impl VmManager {
     pub fn pause(&self, name: &str) -> Result<(), VmError> {
         let handle = self.get_handle(name)?;
         self.driver.pause(&handle)?;
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = VmState::Paused;
         }
@@ -193,9 +213,13 @@ impl VmManager {
     pub fn resume(&self, name: &str) -> Result<(), VmError> {
         let handle = self.get_handle(name)?;
         self.driver.resume(&handle)?;
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let resumed_state = self.driver.state(&handle)?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
-            h.state = VmState::Starting;
+            h.state = resumed_state;
         }
         Ok(())
     }
@@ -206,7 +230,10 @@ impl VmManager {
         let state = self.driver.state(&handle)?;
 
         // Update cached state
-        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = state.clone();
         }
@@ -223,7 +250,10 @@ impl VmManager {
 
     /// List all tracked VMs.
     pub fn list(&self) -> Result<Vec<VmHandle>, VmError> {
-        let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let vms = self
+            .vms
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         Ok(vms.values().cloned().collect())
     }
 
@@ -235,7 +265,10 @@ impl VmManager {
         loop {
             if start.elapsed() > timeout {
                 let pending: Vec<String> = {
-                    let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                    let vms = self
+                        .vms
+                        .read()
+                        .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
                     vms.iter()
                         .filter(|(_, h)| !matches!(h.state, VmState::Running { .. }))
                         .map(|(name, _)| name.clone())
@@ -249,7 +282,10 @@ impl VmManager {
 
             let mut all_ready = true;
             let names: Vec<String> = {
-                let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                let vms = self
+                    .vms
+                    .read()
+                    .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
                 vms.keys().cloned().collect()
             };
 
@@ -274,7 +310,10 @@ impl VmManager {
 
             {
                 let pending: Vec<String> = {
-                    let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                    let vms = self
+                        .vms
+                        .read()
+                        .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
                     vms.iter()
                         .filter(|(_, h)| !matches!(h.state, VmState::Running { .. }))
                         .map(|(name, _)| name.clone())
@@ -296,7 +335,9 @@ impl VmManager {
     /// On Linux: reflink (`cp --reflink=auto`), falls back to regular copy.
     pub fn clone_disk(base: &Path, target: &Path) -> Result<(), VmError> {
         if target.exists() {
-            if let (Ok(base_meta), Ok(target_meta)) = (std::fs::metadata(base), std::fs::metadata(target)) {
+            if let (Ok(base_meta), Ok(target_meta)) =
+                (std::fs::metadata(base), std::fs::metadata(target))
+            {
                 if base_meta.len() == target_meta.len() {
                     tracing::debug!(target = %target.display(), "disk clone target already exists with matching size, skipping");
                     return Ok(());
@@ -363,12 +404,13 @@ impl VmManager {
     }
 
     fn get_handle(&self, name: &str) -> Result<VmHandle, VmError> {
-        let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        vms.get(name)
-            .cloned()
-            .ok_or_else(|| VmError::NotFound {
-                name: name.to_string(),
-            })
+        let vms = self
+            .vms
+            .read()
+            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        vms.get(name).cloned().ok_or_else(|| VmError::NotFound {
+            name: name.to_string(),
+        })
     }
 }
 
@@ -384,7 +426,12 @@ fn create_platform_driver() -> Result<Box<dyn VmDriver>, VmError> {
         Ok(Box::new(crate::driver::cloud_hv::CloudHvDriver::new()))
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(crate::driver::whp::WhpDriver::new()))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Err(VmError::Hypervisor(format!(
             "unsupported platform: {}",
@@ -509,11 +556,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let err = manager.start(&config).expect_err("second concurrent start should fail");
+        let err = manager
+            .start(&config)
+            .expect_err("second concurrent start should fail");
         assert!(err.to_string().contains("already exists"));
 
         release_tx.send(()).expect("release first boot");
-        boot_thread.join().expect("join").expect("first boot should succeed");
+        boot_thread
+            .join()
+            .expect("join")
+            .expect("first boot should succeed");
 
         assert_eq!(driver.boot_calls.load(Ordering::SeqCst), 1);
     }
@@ -529,6 +581,8 @@ mod tests {
         let state = manager.state(&config.name).expect("state query");
         assert!(matches!(state, VmState::Failed { .. }));
 
-        manager.start(&config).expect("restart after failed state should be allowed");
+        manager
+            .start(&config)
+            .expect("restart after failed state should be allowed");
     }
 }
