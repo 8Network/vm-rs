@@ -134,7 +134,7 @@ jobs:
   vm-macos:
     name: VM Lifecycle (macOS)
     runs-on: macos-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_vm_tests && hashFiles('testdata/vmlinuz', 'testdata/initramfs') != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_vm_tests }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -151,7 +151,7 @@ jobs:
   vm-linux:
     name: VM Lifecycle (Linux)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_vm_tests && hashFiles('testdata/vmlinuz', 'testdata/initramfs') != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_vm_tests }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
