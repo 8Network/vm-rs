@@ -54,6 +54,7 @@ pub struct ImageSpec {
 
 /// A prepared image — all files needed to boot a VM.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct PreparedImage {
     /// Path to the kernel image.
     pub kernel: PathBuf,
@@ -164,7 +165,11 @@ pub async fn prepare_image(
     std::fs::create_dir_all(&image_dir).map_err(SetupError::Io)?;
 
     let assets = resolve_image(spec)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| SetupError::AssetDownload(format!("failed to create HTTP client: {}", e)))?;
     let mut checksum_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     for asset in &assets {
@@ -300,7 +305,15 @@ async fn download_file(
         verify_bytes(&bytes, expected, url)?;
     }
 
-    std::fs::write(path, &bytes).map_err(SetupError::Io)?;
+    // Write to temp file then atomic rename to avoid corrupt files on crash
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, &bytes).map_err(SetupError::Io)?;
+    // fsync the file to ensure data is on disk before rename
+    {
+        let f = std::fs::File::open(&tmp_path).map_err(SetupError::Io)?;
+        f.sync_all().map_err(SetupError::Io)?;
+    }
+    std::fs::rename(&tmp_path, path).map_err(SetupError::Io)?;
     tracing::info!(
         path = %path.display(),
         bytes = bytes.len(),

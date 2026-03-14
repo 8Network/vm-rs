@@ -376,7 +376,7 @@ impl VmDriver for WhpDriver {
             name: name.clone(),
             namespace: config.namespace.clone(),
             state: VmState::Starting,
-            pid: None, // In-process, no separate PID
+            process: None, // In-process, no separate PID
             serial_log,
             machine_id: None,
         })
@@ -808,6 +808,7 @@ fn handle_io_port(
                     if !ip.is_empty() {
                         tracing::info!(vm = %vm_name, ip = %ip, "VM ready");
                         update_state(state, VmState::Running { ip });
+                        serial_buffer.clear();
                     }
                 }
             }

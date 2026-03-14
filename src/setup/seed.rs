@@ -5,8 +5,12 @@
 //! SSH keys, network config, startup scripts, and health checks.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::SetupError;
+
+static SEED_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -89,10 +93,21 @@ pub struct HealthCheckConfig {
 /// On macOS: uses `hdiutil makehybrid` to create the ISO.
 /// On Linux: uses `genisoimage` or `mkisofs`.
 pub fn create_seed_iso(iso_path: &Path, config: &SeedConfig<'_>) -> Result<(), SetupError> {
-    let tmp_dir = iso_path
+    let parent = iso_path
         .parent()
-        .ok_or_else(|| SetupError::Config("no parent directory for ISO path".into()))?
-        .join(format!(".seed-{}", config.hostname));
+        .ok_or_else(|| SetupError::Config("no parent directory for ISO path".into()))?;
+    let counter = SEED_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let tmp_dir = parent.join(format!(
+        ".seed-{}-{}-{}-{}",
+        config.hostname,
+        std::process::id(),
+        timestamp_nanos,
+        counter
+    ));
 
     std::fs::create_dir_all(&tmp_dir).map_err(SetupError::Io)?;
 

@@ -1,7 +1,9 @@
 //! VM configuration types — everything needed to boot and manage a VM.
 
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
 
 /// Readiness marker written to the serial console when the VM is ready.
@@ -9,9 +11,11 @@ use std::sync::Arc;
 pub const READY_MARKER: &str = "VMRS_READY";
 
 /// Owned VM network endpoint backed by a Unix datagram socket file descriptor.
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct VmSocketEndpoint(Arc<OwnedFd>);
 
+#[cfg(unix)]
 impl VmSocketEndpoint {
     pub fn new(fd: OwnedFd) -> Self {
         Self(Arc::new(fd))
@@ -28,6 +32,7 @@ impl VmSocketEndpoint {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for VmSocketEndpoint {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
@@ -106,6 +111,45 @@ pub struct VmConfig {
     /// Linux network namespace to run the VM in (optional).
     /// When set, the VMM process is spawned inside `ip netns exec <netns>`.
     pub netns: Option<String>,
+    /// Enable vsock device for host-guest communication.
+    pub vsock: bool,
+    /// Persistent machine identifier (opaque bytes, driver-specific).
+    pub machine_id: Option<Vec<u8>>,
+    /// Path to EFI variable store for UEFI boot (optional).
+    pub efi_variable_store: Option<PathBuf>,
+    /// Enable Rosetta translation layer (macOS only, Apple Silicon).
+    pub rosetta: bool,
+}
+
+impl VmConfig {
+    /// Validate configuration invariants.
+    pub fn validate(&self) -> Result<(), crate::driver::VmError> {
+        use crate::driver::VmError;
+        if self.name.is_empty() {
+            return Err(VmError::InvalidConfig("VM name must not be empty".into()));
+        }
+        if self.name.len() > 128 {
+            return Err(VmError::InvalidConfig("VM name must be 128 characters or fewer".into()));
+        }
+        if !self.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err(VmError::InvalidConfig(
+                "VM name must contain only alphanumeric characters, hyphens, underscores, and dots".into(),
+            ));
+        }
+        if self.name.starts_with('.') || self.name.starts_with('-') {
+            return Err(VmError::InvalidConfig("VM name must not start with '.' or '-'".into()));
+        }
+        if self.cpus == 0 {
+            return Err(VmError::InvalidConfig("cpus must be at least 1".into()));
+        }
+        if self.memory_mb == 0 {
+            return Err(VmError::InvalidConfig("memory_mb must be at least 1".into()));
+        }
+        if self.kernel.as_os_str().is_empty() {
+            return Err(VmError::InvalidConfig("kernel path must not be empty".into()));
+        }
+        Ok(())
+    }
 }
 
 /// Network attachment for a VM.
@@ -113,6 +157,7 @@ pub struct VmConfig {
 pub enum NetworkAttachment {
     /// Owned socket endpoint for an L2 switch port (macOS).
     /// The endpoint is the VM's end of a socketpair — the switch holds the other end.
+    #[cfg(unix)]
     SocketPairFd(VmSocketEndpoint),
     /// TAP device name (Linux).
     Tap { name: String, mac: Option<String> },
@@ -142,10 +187,13 @@ pub struct VmHandle {
     pub process: Option<VmmProcess>,
     /// Serial console log path.
     pub serial_log: PathBuf,
+    /// Persistent machine identifier (opaque bytes, driver-specific).
+    pub machine_id: Option<Vec<u8>>,
 }
 
 /// VM lifecycle state.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub enum VmState {
     /// VM is being created / booting.
     Starting,
@@ -154,6 +202,8 @@ pub enum VmState {
         /// IP address assigned to the VM.
         ip: String,
     },
+    /// VM is paused (execution suspended, state preserved).
+    Paused,
     /// VM was stopped gracefully.
     Stopped,
     /// VM failed to boot or crashed.
@@ -168,6 +218,7 @@ impl std::fmt::Display for VmState {
         match self {
             VmState::Starting => write!(f, "starting"),
             VmState::Running { ip } => write!(f, "running ({})", ip),
+            VmState::Paused => write!(f, "paused"),
             VmState::Stopped => write!(f, "stopped"),
             VmState::Failed { reason } => write!(f, "failed: {}", reason),
         }
@@ -214,5 +265,71 @@ mod tests {
     #[test]
     fn ready_marker_value() {
         assert_eq!(READY_MARKER, "VMRS_READY");
+    }
+
+    #[test]
+    fn vm_state_display_paused() {
+        assert_eq!(VmState::Paused.to_string(), "paused");
+    }
+
+    fn test_vm_config(name: &str) -> VmConfig {
+        VmConfig {
+            name: name.into(),
+            namespace: "test".into(),
+            kernel: std::path::PathBuf::from("/tmp/kernel"),
+            initramfs: None,
+            root_disk: None,
+            data_disk: None,
+            seed_iso: None,
+            cpus: 1,
+            memory_mb: 256,
+            networks: vec![],
+            shared_dirs: vec![],
+            serial_log: std::path::PathBuf::from("/tmp/serial.log"),
+            cmdline: None,
+            netns: None,
+            vsock: false,
+            machine_id: None,
+            efi_variable_store: None,
+            rosetta: false,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let config = test_vm_config("");
+        let err = config
+            .validate()
+            .expect_err("empty VM name should fail validation")
+            .to_string();
+        assert!(err.contains("empty"), "expected 'empty' in error: {}", err);
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal() {
+        let config = test_vm_config("../etc");
+        let err = config
+            .validate()
+            .expect_err("path traversal characters should fail validation")
+            .to_string();
+        assert!(err.contains("alphanumeric") || err.contains("characters"),
+            "expected name validation error: {}", err);
+    }
+
+    #[test]
+    fn validate_rejects_zero_cpus() {
+        let mut config = test_vm_config("good-name");
+        config.cpus = 0;
+        let err = config
+            .validate()
+            .expect_err("zero CPUs should fail validation")
+            .to_string();
+        assert!(err.contains("cpus"), "expected 'cpus' in error: {}", err);
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let config = test_vm_config("my-vm.01");
+        config.validate().expect("valid config should pass validation");
     }
 }

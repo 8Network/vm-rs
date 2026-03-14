@@ -83,6 +83,8 @@ pub async fn pull(image: &str, store: &ImageStore) -> Result<ImageManifest, OciE
     let image_ref = parse_image_ref(image);
     let client = reqwest::Client::builder()
         .user_agent("vm-rs/0.1")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| OciError::Http(format!("failed to create HTTP client: {}", e)))?;
 

@@ -252,6 +252,7 @@ impl VmDriver for CloudHvDriver {
             state: VmState::Starting,
             process: Some(identity),
             serial_log: config.serial_log.clone(),
+            machine_id: None,
         })
     }
 
@@ -276,7 +277,7 @@ impl VmDriver for CloudHvDriver {
                     ),
                 });
             }
-            wait_for_pid_exit(process, std::time::Duration::from_secs(10));
+            wait_for_pid_exit(process, &handle.name, std::time::Duration::from_secs(10))?;
             return Ok(());
         } else {
             return Err(VmError::NotFound {
@@ -370,7 +371,7 @@ impl VmDriver for CloudHvDriver {
                 } else {
                     return Ok(VmState::Stopped);
                 }
-                if let Some(ip) = check_ready_marker(&handle.serial_log) {
+                if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
                     return Ok(VmState::Running { ip });
                 }
                 return Ok(VmState::Starting);
@@ -388,7 +389,7 @@ impl VmDriver for CloudHvDriver {
         }
 
         // Process alive — check serial log for readiness marker
-        if let Some(ip) = check_ready_marker(&handle.serial_log) {
+        if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
             Ok(VmState::Running { ip })
         } else {
             Ok(VmState::Starting)
@@ -440,18 +441,11 @@ fn find_ch_binary() -> Result<PathBuf, VmError> {
 /// Generate a deterministic MAC address from a VM name.
 /// Uses the QEMU OUI prefix (52:54:00) for locally administered addresses.
 fn generate_mac(name: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    let hash = hasher.finish();
-
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(name.as_bytes());
     format!(
         "52:54:00:{:02x}:{:02x}:{:02x}",
-        (hash >> 16) as u8,
-        (hash >> 8) as u8,
-        hash as u8
+        hash[0], hash[1], hash[2]
     )
 }
 
@@ -514,27 +508,6 @@ fn cleanup_virtiofsd(pids: &[u32]) {
     }
 }
 
-/// Check the serial console log for the readiness marker.
-/// The guest writes `VMRS_READY <ip>` when boot completes.
-fn check_ready_marker(log_path: &Path) -> Option<String> {
-    let content = match std::fs::read_to_string(log_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(path = %log_path.display(), "failed to read serial log: {}", e);
-            return None;
-        }
-    };
-    let pos = content.find(crate::config::READY_MARKER)?;
-    let after = &content[pos + crate::config::READY_MARKER.len()..];
-    let ip = after.split_whitespace().next()?.trim().to_string();
-    if ip.is_empty() {
-        None
-    } else {
-        Some(ip)
-    }
-}
-
 /// Wait for a tracked child process to exit.
 /// If the process doesn't exit within the timeout, escalates to SIGKILL.
 fn wait_for_exit(mut child: Child, timeout: std::time::Duration) {
@@ -564,16 +537,43 @@ fn wait_for_exit(mut child: Child, timeout: std::time::Duration) {
     }
 }
 
-fn wait_for_pid_exit(process: &VmmProcess, timeout: std::time::Duration) {
+fn wait_for_pid_exit(
+    process: &VmmProcess,
+    vm_name: &str,
+    timeout: std::time::Duration,
+) -> Result<(), VmError> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if !pid_exists(process) {
             tracing::debug!(pid = process.pid(), "process exited");
-            return;
+            return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    tracing::warn!(pid = process.pid(), elapsed_ms = %timeout.as_millis(), "process did not exit within timeout");
+    tracing::warn!(pid = process.pid(), elapsed_ms = %timeout.as_millis(), "process did not exit within timeout, sending SIGKILL");
+    // SAFETY: Sending SIGKILL to a PID we validated still belongs to our process.
+    let ret = unsafe { libc::kill(process.pid() as i32, libc::SIGKILL) };
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error();
+        return Err(VmError::StopFailed {
+            name: vm_name.to_string(),
+            detail: format!("failed to SIGKILL restored VM PID {}: {}", process.pid(), errno),
+        });
+    }
+    // Brief wait for SIGKILL to take effect
+    let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < kill_deadline {
+        if !pid_exists(process) {
+            tracing::debug!(pid = process.pid(), "process exited after SIGKILL");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    tracing::error!(pid = process.pid(), "process still alive after SIGKILL");
+    Err(VmError::StopFailed {
+        name: vm_name.to_string(),
+        detail: format!("restored VM PID {} remained alive after SIGKILL", process.pid()),
+    })
 }
 
 fn pid_exists(process: &VmmProcess) -> bool {

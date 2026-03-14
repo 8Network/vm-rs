@@ -57,7 +57,7 @@ impl AppleVzDriver {
         // for the lifetime of the driver entry.
         match unsafe { vm.state() } {
             VZVirtualMachineState::VZVirtualMachineStateRunning => {
-                if let Some(ip) = check_ready_marker(&handle.serial_log) {
+                if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
                     VmState::Running { ip }
                 } else {
                     VmState::Starting
@@ -274,25 +274,33 @@ impl VmDriver for AppleVzDriver {
             registry.insert(name.to_string(), vm.clone());
         }
 
-        // Start VM on its dispatch queue
+        // Start VM on its dispatch queue with synchronous error reporting via channel
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let name_for_log = name.to_string();
         let name_for_err = name.to_string();
         let vm_for_start = vm.clone();
         let dispatch_block = ConcreteBlock::new(move || {
             tracing::debug!("dispatch block running for VM '{}'", name_for_log);
             let name_err = name_for_err.clone();
+            let tx_clone = tx.clone();
             let completion_handler = ConcreteBlock::new(move |err: Id| {
                 if err == NIL {
                     tracing::info!("VM '{}' started successfully", name_err);
+                    let _ = tx_clone.send(Ok(()));
                 } else {
                     // SAFETY: err is a valid NSError pointer from the framework.
                     let error = unsafe { NSError(StrongPtr::retain(err)) };
-                    tracing::error!(
-                        "VM '{}' start FAILED (code {}): {}",
-                        name_err,
+                    let msg = format!(
+                        "code {}: {}",
                         error.code(),
                         error.localized_description().as_str()
                     );
+                    tracing::error!(
+                        "VM '{}' start FAILED {}",
+                        name_err,
+                        msg
+                    );
+                    let _ = tx_clone.send(Err(msg));
                 }
             });
             let completion_handler = completion_handler.copy();
@@ -306,8 +314,30 @@ impl VmDriver for AppleVzDriver {
             dispatch_async(queue, dispatch_block);
         }
 
-        // Give dispatch queue a moment to fire
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Wait for the completion handler to fire (up to 10 seconds)
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error_msg)) => {
+                self.vms
+                    .lock()
+                    .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?
+                    .remove(name);
+                return Err(VmError::BootFailed {
+                    name: name.clone(),
+                    detail: format!("Apple VZ start failed: {}", error_msg),
+                });
+            }
+            Err(_) => {
+                self.vms
+                    .lock()
+                    .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?
+                    .remove(name);
+                return Err(VmError::BootFailed {
+                    name: name.clone(),
+                    detail: "Apple VZ start completion handler did not fire within 10 seconds".into(),
+                });
+            }
+        }
 
         Ok(VmHandle {
             name: name.clone(),
@@ -315,6 +345,7 @@ impl VmDriver for AppleVzDriver {
             state: VmState::Starting,
             process: None, // Apple VZ runs in-process, no separate VM monitor PID
             serial_log: config.serial_log.clone(),
+            machine_id: None,
         })
     }
 
@@ -381,7 +412,7 @@ impl VmDriver for AppleVzDriver {
     }
 
     fn state(&self, handle: &VmHandle) -> Result<VmState, VmError> {
-        let mut registry = self
+        let registry = self
             .vms
             .lock()
             .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
@@ -389,10 +420,6 @@ impl VmDriver for AppleVzDriver {
             Some(vm) => Self::vm_state(handle, vm),
             None => VmState::Stopped,
         };
-
-        if matches!(state, VmState::Stopped | VmState::Failed { .. }) {
-            registry.remove(&handle.name);
-        }
 
         tracing::debug!(vm = %handle.name, state = %state, "Apple VZ VM state queried");
         Ok(state)
@@ -413,99 +440,4 @@ fn resolve_path(path: &Path, label: &str) -> Result<String, VmError> {
         .to_str()
         .ok_or_else(|| VmError::InvalidConfig(format!("non-UTF8 {} path", label)))
         .map(|s| s.to_string())
-}
-
-/// Check the console log for the readiness marker and extract the IP.
-///
-/// The init script writes `VMRS_READY <ip>` to the console
-/// when the VM is fully booted and ready for connections.
-fn check_ready_marker(log_path: &Path) -> Option<String> {
-    let content = match fs::read_to_string(log_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            tracing::warn!(path = %log_path.display(), "failed to read serial log: {}", e);
-            return None;
-        }
-    };
-    let pos = content.find(crate::config::READY_MARKER)?;
-    let after = &content[pos + crate::config::READY_MARKER.len()..];
-    let ip = after.split_whitespace().next()?.trim().to_string();
-    if ip.is_empty() {
-        None
-    } else {
-        Some(ip)
-    }
-}
-
-/// Watch a console log file for the VM readiness marker.
-///
-/// Blocks until either the marker is found or the stop flag is set.
-/// Returns the IP address if found.
-pub fn watch_for_ready(
-    log_path: &Path,
-    stop: &std::sync::atomic::AtomicBool,
-) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    use std::sync::atomic::Ordering;
-
-    let mut last_size = 0u64;
-    let mut accumulated = String::new();
-
-    while !stop.load(Ordering::Relaxed) {
-        let file = match fs::File::open(log_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Log file not created yet — normal during early boot
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(path = %log_path.display(), "failed to open serial log: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-        };
-
-        let metadata = match file.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(path = %log_path.display(), "failed to read serial log metadata: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-        };
-
-        let current_size = metadata.len();
-        if current_size > last_size {
-            let mut file = file;
-            if let Err(e) = file.seek(SeekFrom::Start(last_size)) {
-                tracing::warn!(path = %log_path.display(), "failed to seek serial log: {}", e);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-            let mut buf = vec![0u8; (current_size - last_size) as usize];
-            match file.read(&mut buf) {
-                Ok(n) => accumulated.push_str(&String::from_utf8_lossy(&buf[..n])),
-                Err(e) => {
-                    tracing::warn!(path = %log_path.display(), "failed to read serial log: {}", e);
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    continue;
-                }
-            }
-            last_size = current_size;
-
-            if let Some(pos) = accumulated.find(crate::config::READY_MARKER) {
-                let after = &accumulated[pos + crate::config::READY_MARKER.len()..];
-                if let Some(ip) = after.split_whitespace().next() {
-                    let ip = ip.trim().to_string();
-                    if !ip.is_empty() {
-                        return Some(ip);
-                    }
-                }
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    None
 }

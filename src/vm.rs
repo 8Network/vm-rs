@@ -57,6 +57,8 @@ impl VmManager {
 
     /// Boot a VM. Creates the VM directory and delegates to the driver.
     pub fn start(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
+        config.validate()?;
+
         // Reserve the name up front so concurrent callers cannot boot the same VM twice.
         {
             let mut vms = self
@@ -64,7 +66,7 @@ impl VmManager {
                 .write()
                 .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
             if let Some(existing) = vms.get(&config.name) {
-                if existing.state != VmState::Stopped {
+                if !matches!(existing.state, VmState::Stopped | VmState::Failed { .. }) {
                     return Err(VmError::BootFailed {
                         name: config.name.clone(),
                         detail: format!("VM already exists in state: {}", existing.state),
@@ -79,13 +81,19 @@ impl VmManager {
                     state: VmState::Starting,
                     process: None,
                     serial_log: config.serial_log.clone(),
+                    machine_id: None,
                 },
             );
         }
 
         // Ensure VM directory exists
         let vm_dir = self.vm_dir(&config.name);
-        std::fs::create_dir_all(&vm_dir).map_err(VmError::Io)?;
+        if let Err(e) = std::fs::create_dir_all(&vm_dir) {
+            let mut vms = self.vms.write()
+                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+            vms.remove(&config.name);
+            return Err(VmError::Io(e));
+        }
 
         tracing::info!(
             vm = %config.name,
@@ -97,6 +105,7 @@ impl VmManager {
         let handle = match self.driver.boot(config) {
             Ok(handle) => handle,
             Err(err) => {
+                tracing::warn!(vm = %config.name, error = %err, "VM boot failed, cleaning up reservation");
                 let mut vms = self
                     .vms
                     .write()
@@ -117,6 +126,7 @@ impl VmManager {
 
     /// Stop a VM gracefully.
     pub fn stop(&self, name: &str) -> Result<(), VmError> {
+        tracing::info!(vm = %name, "stopping VM");
         let handle = self.get_handle(name)?;
         self.driver.stop(&handle)?;
 
@@ -130,6 +140,7 @@ impl VmManager {
 
     /// Force-kill a VM.
     pub fn kill(&self, name: &str) -> Result<(), VmError> {
+        tracing::info!(vm = %name, "force-killing VM");
         let handle = self.get_handle(name)?;
         self.driver.kill(&handle)?;
 
@@ -145,6 +156,7 @@ impl VmManager {
     /// Use this when the VM was started by a previous daemon process and isn't
     /// tracked in the in-memory map.
     pub fn stop_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
+        tracing::info!(vm = %handle.name, "stopping VM by handle");
         self.driver.stop(handle)?;
 
         let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
@@ -156,11 +168,34 @@ impl VmManager {
 
     /// Force-kill a VM using a pre-built handle (e.g. restored from persisted metadata).
     pub fn kill_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
+        tracing::info!(vm = %handle.name, "force-killing VM by handle");
         self.driver.kill(handle)?;
 
         let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(&handle.name) {
             h.state = VmState::Stopped;
+        }
+        Ok(())
+    }
+
+    /// Pause a running VM.
+    pub fn pause(&self, name: &str) -> Result<(), VmError> {
+        let handle = self.get_handle(name)?;
+        self.driver.pause(&handle)?;
+        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        if let Some(h) = vms.get_mut(name) {
+            h.state = VmState::Paused;
+        }
+        Ok(())
+    }
+
+    /// Resume a paused VM.
+    pub fn resume(&self, name: &str) -> Result<(), VmError> {
+        let handle = self.get_handle(name)?;
+        self.driver.resume(&handle)?;
+        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        if let Some(h) = vms.get_mut(name) {
+            h.state = VmState::Starting;
         }
         Ok(())
     }
@@ -237,6 +272,20 @@ impl VmManager {
                 return Ok(());
             }
 
+            {
+                let pending: Vec<String> = {
+                    let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                    vms.iter()
+                        .filter(|(_, h)| !matches!(h.state, VmState::Running { .. }))
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                };
+                let elapsed = start.elapsed().as_secs();
+                if elapsed > 0 && elapsed.is_multiple_of(10) {
+                    tracing::info!(pending = ?pending, elapsed_secs = start.elapsed().as_secs(), "waiting for VMs to become ready");
+                }
+            }
+
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
@@ -247,8 +296,19 @@ impl VmManager {
     /// On Linux: reflink (`cp --reflink=auto`), falls back to regular copy.
     pub fn clone_disk(base: &Path, target: &Path) -> Result<(), VmError> {
         if target.exists() {
-            tracing::debug!(target = %target.display(), "disk clone target already exists, skipping");
-            return Ok(());
+            if let (Ok(base_meta), Ok(target_meta)) = (std::fs::metadata(base), std::fs::metadata(target)) {
+                if base_meta.len() == target_meta.len() {
+                    tracing::debug!(target = %target.display(), "disk clone target already exists with matching size, skipping");
+                    return Ok(());
+                }
+                tracing::warn!(
+                    target = %target.display(),
+                    base_size = base_meta.len(),
+                    target_size = target_meta.len(),
+                    "disk clone target exists but size differs, re-cloning"
+                );
+                std::fs::remove_file(target).map_err(VmError::Io)?;
+            }
         }
 
         // Ensure parent directory exists
@@ -292,6 +352,11 @@ impl VmManager {
                 );
                 std::fs::copy(base, target).map_err(VmError::Io)?;
             }
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            std::fs::copy(base, target).map_err(VmError::Io)?;
         }
 
         Ok(())
@@ -341,6 +406,8 @@ mod tests {
         release_rx: Mutex<Option<mpsc::Receiver<()>>>,
     }
 
+    struct FailedStateDriver;
+
     impl VmDriver for Arc<BlockingDriver> {
         fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
             self.boot_calls.fetch_add(1, Ordering::SeqCst);
@@ -353,6 +420,7 @@ mod tests {
                 state: VmState::Starting,
                 process: None,
                 serial_log: config.serial_log.clone(),
+                machine_id: None,
             })
         }
 
@@ -366,6 +434,33 @@ mod tests {
 
         fn state(&self, _handle: &VmHandle) -> Result<VmState, VmError> {
             Ok(VmState::Stopped)
+        }
+    }
+
+    impl VmDriver for FailedStateDriver {
+        fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
+            Ok(VmHandle {
+                name: config.name.clone(),
+                namespace: config.namespace.clone(),
+                state: VmState::Starting,
+                process: None,
+                serial_log: config.serial_log.clone(),
+                machine_id: None,
+            })
+        }
+
+        fn stop(&self, _handle: &VmHandle) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        fn kill(&self, _handle: &VmHandle) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        fn state(&self, _handle: &VmHandle) -> Result<VmState, VmError> {
+            Ok(VmState::Failed {
+                reason: "crashed".into(),
+            })
         }
     }
 
@@ -385,6 +480,10 @@ mod tests {
             serial_log: base_dir.join("serial.log"),
             cmdline: None,
             netns: None,
+            vsock: false,
+            machine_id: None,
+            efi_variable_store: None,
+            rosetta: false,
         }
     }
 
@@ -417,5 +516,19 @@ mod tests {
         boot_thread.join().expect("join").expect("first boot should succeed");
 
         assert_eq!(driver.boot_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn restart_is_allowed_after_failed_state_is_observed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = VmManager::with_driver(Box::new(FailedStateDriver), tmp.path().to_path_buf())
+            .expect("manager");
+        let config = test_config(tmp.path());
+
+        manager.start(&config).expect("first boot");
+        let state = manager.state(&config.name).expect("state query");
+        assert!(matches!(state, VmState::Failed { .. }));
+
+        manager.start(&config).expect("restart after failed state should be allowed");
     }
 }

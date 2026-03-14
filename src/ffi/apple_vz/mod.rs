@@ -20,6 +20,7 @@ pub mod boot_loader;
 pub mod entropy_device;
 pub mod memory_device;
 pub mod network_device;
+pub mod platform;
 pub mod serial_port;
 pub mod shared_directory;
 pub mod socket_device;

@@ -58,12 +58,12 @@ impl std::fmt::Display for MacAddress {
 #[derive(Debug)]
 struct SwitchPort {
     /// The switch's end of the socketpair. The other end goes to the VM.
-    fd: RawFd,
+    fd: OwnedFd,
 }
 
 impl AsRawFd for SwitchPort {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
@@ -115,8 +115,7 @@ impl NetworkSwitch {
             .map_err(|e| io::Error::other(format!("lock poisoned: {}", e)))?;
         mac_tables.entry(network_id.to_string()).or_default();
 
-        // SAFETY: `socketpair` returned a fresh owned file descriptor for the VM side.
-        Ok(VmSocketEndpoint::new(unsafe { OwnedFd::from_raw_fd(vm_fd) }))
+        Ok(VmSocketEndpoint::new(vm_fd))
     }
 
     /// Start the forwarding loop on a background thread.
@@ -178,29 +177,12 @@ impl Default for NetworkSwitch {
 impl Drop for NetworkSwitch {
     fn drop(&mut self) {
         self.stop();
-        match self.networks.lock() {
-            Ok(networks) => {
-                for ports in networks.values() {
-                    for port in ports {
-                        // SAFETY: Closing file descriptors we created in add_port().
-                        let ret = unsafe { libc::close(port.fd) };
-                        if ret != 0 {
-                            // Log but don't panic in Drop — best we can do.
-                            let err = std::io::Error::last_os_error();
-                            eprintln!("vm-rs: failed to close switch port fd {}: {}", port.fd, err);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("vm-rs: network switch lock poisoned during drop: {}", e);
-            }
-        }
+        // OwnedFd in SwitchPort handles closing file descriptors automatically.
     }
 }
 
 /// Create a Unix SOCK_DGRAM socketpair. Returns (switch_fd, vm_fd).
-fn create_socketpair() -> io::Result<(RawFd, RawFd)> {
+fn create_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
     // SAFETY: Standard POSIX socketpair call with valid fd array.
     let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
@@ -208,25 +190,24 @@ fn create_socketpair() -> io::Result<(RawFd, RawFd)> {
         return Err(io::Error::last_os_error());
     }
 
+    // SAFETY: socketpair just created these fresh file descriptors; wrapping
+    // them in OwnedFd transfers ownership so they are closed on drop.
+    let switch_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let vm_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
     // Set switch side non-blocking for the poll loop.
     // SAFETY: fcntl on file descriptors we just created in the socketpair above.
     unsafe {
-        let flags = libc::fcntl(fds[0], libc::F_GETFL);
+        let flags = libc::fcntl(switch_fd.as_raw_fd(), libc::F_GETFL);
         if flags == -1 {
-            let err = io::Error::last_os_error();
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-            return Err(err);
+            return Err(io::Error::last_os_error());
         }
-        if libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
-            let err = io::Error::last_os_error();
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-            return Err(err);
+        if libc::fcntl(switch_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+            return Err(io::Error::last_os_error());
         }
     }
 
-    Ok((fds[0], fds[1]))
+    Ok((switch_fd, vm_fd))
 }
 
 /// The main forwarding loop. Runs until `running` is set to false.
@@ -266,11 +247,11 @@ fn forwarding_loop(
         let mut port_fds: HashMap<String, Vec<RawFd>> = HashMap::new();
 
         for (net_id, ports) in nets.iter() {
-            let fds: Vec<RawFd> = ports.iter().map(|p| p.fd).collect();
+            let fds: Vec<RawFd> = ports.iter().map(|p| p.fd.as_raw_fd()).collect();
             port_fds.insert(net_id.clone(), fds);
             for (idx, port) in ports.iter().enumerate() {
                 pollfds.push(libc::pollfd {
-                    fd: port.fd,
+                    fd: port.fd.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 });
@@ -377,6 +358,7 @@ fn forwarding_loop(
             }
         }
     }
+    running.store(false, Ordering::SeqCst);
 }
 
 /// Send a single Ethernet frame to a socket fd. Best-effort (drops if buffer full).

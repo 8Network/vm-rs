@@ -111,7 +111,14 @@ impl ImageStore {
         }
 
         let path = self.blob_path(digest);
-        std::fs::write(&path, data)?;
+        // Write to temp file then atomic rename to avoid corrupt files on crash
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, data)?;
+        {
+            let f = std::fs::File::open(&tmp_path)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &path)?;
         Ok(path)
     }
 
@@ -318,8 +325,14 @@ impl ImageStore {
                                     let entries = std::fs::read_dir(&full_parent)
                                         .map_err(|e| OciError::Blob(format!("opaque whiteout read_dir failed for {}: {}", full_parent.display(), e)))?;
                                     for child in entries.flatten() {
-                                        if let Err(e) = std::fs::remove_dir_all(child.path()) {
-                                            tracing::warn!(path = %child.path().display(), "opaque whiteout cleanup failed: {}", e);
+                                        let child_path = child.path();
+                                        let remove_result = if child.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                                            std::fs::remove_dir_all(&child_path)
+                                        } else {
+                                            std::fs::remove_file(&child_path)
+                                        };
+                                        if let Err(e) = remove_result {
+                                            tracing::warn!(path = %child_path.display(), "opaque whiteout cleanup failed: {}", e);
                                         }
                                     }
                                 }
@@ -373,11 +386,7 @@ fn sanitize_name(s: &str) -> String {
 }
 
 fn unsanitize_name(s: &str) -> String {
-    let result = s.replace("_slash_", "/").replace("_colon_", ":");
-    if result == s && s.contains('_') && !s.contains('/') {
-        return s.replacen('_', "/", 1);
-    }
-    result
+    s.replace("_slash_", "/").replace("_colon_", ":")
 }
 
 #[cfg(test)]

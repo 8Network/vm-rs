@@ -54,6 +54,14 @@ pub const GDT_DATA_SELECTOR: u16 = 0x10;
 /// `memory_mb` of physical address space 1:1 (virtual = physical).
 ///
 /// Layout: PML4[0] → PDPT[0] → PD[0..N] (2MB pages each)
+///
+/// # Limitation
+///
+/// A single Page Directory has 512 entries of 2 MB each, covering at most
+/// 1 GB (1024 MB). Callers requesting more than 1024 MB of guest memory
+/// must validate beforehand or the mapping will silently cap at 1 GB.
+/// Support for multiple Page Directories (>1 GB) will be added in a future
+/// release.
 pub fn setup_page_tables(memory: &mut [u8], memory_mb: usize) {
     let pml4 = PML4_ADDR as usize;
     let pdpt = PDPT_ADDR as usize;
@@ -124,6 +132,14 @@ pub fn load_kernel_from_bytes(
     cmdline: &str,
     memory_mb: usize,
 ) -> Result<u64, VmError> {
+    if memory_mb > 1024 {
+        return Err(VmError::InvalidConfig(format!(
+            "direct boot currently supports up to 1024 MB guest memory (got {} MB); \
+             support for larger memory will be added in a future release",
+            memory_mb
+        )));
+    }
+
     if kernel_data.len() < 0x250 {
         return Err(VmError::InvalidConfig(
             "kernel image too small for bzImage".into(),
