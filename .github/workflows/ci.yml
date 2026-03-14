@@ -110,6 +110,10 @@ jobs:
       - name: Network switch tests
         run: cargo test --test network_switch --target ${{ matrix.target }}
 
+      - name: Apple VZ FFI smoke tests
+        if: runner.os == 'macOS'
+        run: cargo test --test ffi_smoke --target ${{ matrix.target }}
+
   # ── OCI registry tests (requires internet) ─────────────────────────
   oci:
     name: OCI Pull

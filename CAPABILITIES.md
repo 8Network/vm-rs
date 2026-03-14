@@ -13,7 +13,7 @@ Status: experimental and under active development. This matrix reflects current 
 | Boot VM | Supported | Supported | Kernel + initramfs + root disk |
 | Stop (graceful) | Supported | Supported | ACPI shutdown |
 | Kill (force) | Supported | Supported | Immediate termination |
-| Query state | Supported | Supported | Starting → Running → Stopped / Failed |
+| Query state | Supported | Supported | Starting → Running → Ready → Stopped / Failed |
 | Reboot | Not supported | Planned | CH: `vm.reboot` or `ch-remote reboot` |
 | Delete/cleanup | Supported | Supported | Remove VM state and resources |
 | **CPU** | | | |
@@ -49,7 +49,7 @@ Status: experimental and under active development. This matrix reflects current 
 | Read-only mounts | Supported | Planned | Immutable shared data |
 | **Serial Console** | | | |
 | File output | Supported | Supported | Log serial to file |
-| Readiness detection | Supported | Supported | Parse `8STACK_READY` marker from console |
+| Readiness detection | Supported | Supported | Parse `VMRS_READY <ip>` marker from console |
 | **Entropy** | | | |
 | VirtIO RNG | Supported | Supported | /dev/random in guest |
 | **Advanced (API mode)** | | | |

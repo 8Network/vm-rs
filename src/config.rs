@@ -210,8 +210,10 @@ pub struct VmHandle {
 pub enum VmState {
     /// VM is being created / booting.
     Starting,
-    /// VM is running and reachable.
-    Running {
+    /// VM is executing according to the hypervisor, but guest readiness is not confirmed yet.
+    Running,
+    /// VM is running and has reported readiness.
+    Ready {
         /// IP address assigned to the VM.
         ip: String,
     },
@@ -226,11 +228,32 @@ pub enum VmState {
     },
 }
 
+impl VmState {
+    /// Returns true when the hypervisor reports the VM as executing.
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running | Self::Ready { .. })
+    }
+
+    /// Returns true when the guest has emitted the readiness marker.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Returns the guest IP address once readiness has been confirmed.
+    pub fn ip(&self) -> Option<&str> {
+        match self {
+            Self::Ready { ip } => Some(ip),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for VmState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VmState::Starting => write!(f, "starting"),
-            VmState::Running { ip } => write!(f, "running ({})", ip),
+            VmState::Running => write!(f, "running"),
+            VmState::Ready { ip } => write!(f, "ready ({})", ip),
             VmState::Paused => write!(f, "paused"),
             VmState::Stopped => write!(f, "stopped"),
             VmState::Failed { reason } => write!(f, "failed: {}", reason),
@@ -249,10 +272,15 @@ mod tests {
 
     #[test]
     fn vm_state_display_running() {
-        let state = VmState::Running {
+        let state = VmState::Ready {
             ip: "10.0.1.2".into(),
         };
-        assert_eq!(state.to_string(), "running (10.0.1.2)");
+        assert_eq!(state.to_string(), "ready (10.0.1.2)");
+    }
+
+    #[test]
+    fn vm_state_display_running_without_ready_ip() {
+        assert_eq!(VmState::Running.to_string(), "running");
     }
 
     #[test]
@@ -273,6 +301,19 @@ mod tests {
         assert_eq!(VmState::Starting, VmState::Starting);
         assert_eq!(VmState::Stopped, VmState::Stopped);
         assert_ne!(VmState::Starting, VmState::Stopped);
+    }
+
+    #[test]
+    fn vm_state_helper_methods() {
+        let ready = VmState::Ready {
+            ip: "10.0.1.2".into(),
+        };
+        assert!(VmState::Running.is_running());
+        assert!(!VmState::Running.is_ready());
+        assert!(ready.is_running());
+        assert!(ready.is_ready());
+        assert_eq!(ready.ip(), Some("10.0.1.2"));
+        assert_eq!(VmState::Starting.ip(), None);
     }
 
     #[test]

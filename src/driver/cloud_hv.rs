@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use crate::config::{NetworkAttachment, VmConfig, VmHandle, VmState, VmmProcess};
-use crate::driver::{VmDriver, VmError};
+use crate::driver::{ReadyMarkerCache, VmDriver, VmError};
 
 // ---------------------------------------------------------------------------
 // Internal VM tracking
@@ -28,6 +28,8 @@ struct VmProcess {
     tap_devices: Vec<String>,
     /// virtiofsd sidecar PIDs (for VirtioFS shared dirs, cleaned up on stop).
     virtiofsd_pids: Vec<u32>,
+    /// Cached guest readiness marker from the serial log.
+    ready: ReadyMarkerCache,
 }
 
 /// Cloud Hypervisor driver for Linux.
@@ -58,6 +60,7 @@ impl VmDriver for CloudHvDriver {
         let name = &config.name;
 
         tracing::info!(
+            driver = "cloud_hv",
             vm = %name,
             cpus = config.cpus,
             memory_mb = config.memory_mb,
@@ -167,6 +170,7 @@ impl VmDriver for CloudHvDriver {
                 })?;
 
             tracing::info!(
+                driver = "cloud_hv",
                 vm = %name,
                 tag = %vol.tag,
                 pid = child.id(),
@@ -216,7 +220,7 @@ impl VmDriver for CloudHvDriver {
 
         let pid = process.id();
         let identity = process_identity(pid, name)?;
-        tracing::info!(vm = %name, pid = pid, "Cloud Hypervisor process started");
+        tracing::info!(driver = "cloud_hv", vm = %name, pid = pid, "Cloud Hypervisor process started");
 
         // Collect virtiofsd PIDs for cleanup, then drop the Child handles.
         // Dropping Child on Unix does NOT kill the process — it only closes our
@@ -254,6 +258,7 @@ impl VmDriver for CloudHvDriver {
                     identity: identity.clone(),
                     tap_devices,
                     virtiofsd_pids,
+                    ready: ReadyMarkerCache::default(),
                 },
             );
         }
@@ -269,7 +274,7 @@ impl VmDriver for CloudHvDriver {
     }
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
-        tracing::info!(vm = %handle.name, "requesting graceful stop via Cloud Hypervisor");
+        tracing::info!(driver = "cloud_hv", vm = %handle.name, "requesting graceful stop via Cloud Hypervisor");
         let mut vms = self
             .vms
             .lock()
@@ -304,6 +309,7 @@ impl VmDriver for CloudHvDriver {
         if ret != 0 {
             let errno = std::io::Error::last_os_error();
             tracing::warn!(
+                driver = "cloud_hv",
                 vm = %handle.name,
                 pid = process.identity.pid(),
                 error = %errno,
@@ -311,7 +317,16 @@ impl VmDriver for CloudHvDriver {
             );
         } else {
             // Wait for process to exit (up to 10s)
-            wait_for_exit(process.child, std::time::Duration::from_secs(10));
+            wait_for_exit(process.child, std::time::Duration::from_secs(10)).map_err(|e| {
+                VmError::StopFailed {
+                    name: handle.name.clone(),
+                    detail: format!(
+                        "cloud-hypervisor PID {} did not exit cleanly: {}",
+                        process.identity.pid(),
+                        e
+                    ),
+                }
+            })?;
         }
 
         cleanup_taps(&process.tap_devices);
@@ -320,7 +335,7 @@ impl VmDriver for CloudHvDriver {
     }
 
     fn kill(&self, handle: &VmHandle) -> Result<(), VmError> {
-        tracing::warn!(vm = %handle.name, "force-killing Cloud Hypervisor VM");
+        tracing::warn!(driver = "cloud_hv", vm = %handle.name, "force-killing Cloud Hypervisor VM");
         let mut vms = self
             .vms
             .lock()
@@ -367,7 +382,12 @@ impl VmDriver for CloudHvDriver {
         kill_result?;
 
         if let Some(child) = child {
-            wait_for_exit(child, std::time::Duration::from_secs(2));
+            wait_for_exit(child, std::time::Duration::from_secs(2)).map_err(|e| {
+                VmError::StopFailed {
+                    name: handle.name.clone(),
+                    detail: format!("failed to reap killed VM PID {}: {}", identity.pid(), e),
+                }
+            })?;
         }
 
         cleanup_virtiofsd(&virtiofsd_pids);
@@ -394,9 +414,9 @@ impl VmDriver for CloudHvDriver {
                     return Ok(VmState::Stopped);
                 }
                 if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
-                    return Ok(VmState::Running { ip });
+                    return Ok(VmState::Ready { ip });
                 }
-                return Ok(VmState::Starting);
+                return Ok(VmState::Running);
             }
         };
 
@@ -406,10 +426,10 @@ impl VmDriver for CloudHvDriver {
         }
 
         // Process alive — check serial log for readiness marker
-        if let Some(ip) = super::check_ready_marker(&handle.serial_log) {
-            Ok(VmState::Running { ip })
+        if let Some(ip) = process.ready.scan(&handle.serial_log) {
+            Ok(VmState::Ready { ip })
         } else {
-            Ok(VmState::Starting)
+            Ok(VmState::Running)
         }
     }
 }
@@ -529,31 +549,27 @@ fn cleanup_virtiofsd(pids: &[u32]) {
 
 /// Wait for a tracked child process to exit.
 /// If the process doesn't exit within the timeout, escalates to SIGKILL.
-fn wait_for_exit(mut child: Child, timeout: std::time::Duration) {
+fn wait_for_exit(mut child: Child, timeout: std::time::Duration) -> std::io::Result<()> {
     let start = std::time::Instant::now();
     let pid = child.id();
     while start.elapsed() < timeout {
         match child.try_wait() {
             Ok(Some(status)) => {
                 tracing::debug!(pid = pid, %status, "process exited");
-                return;
+                return Ok(());
             }
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(pid = pid, error = %e, "failed to query child exit status");
-                break;
+                return Err(e);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     tracing::warn!(pid = pid, elapsed_ms = %timeout.as_millis(), "process did not exit within timeout, sending SIGKILL");
-    if let Err(e) = child.kill() {
-        tracing::warn!(pid = pid, error = %e, "SIGKILL failed while waiting for child exit");
-        return;
-    }
-    if let Err(e) = child.wait() {
-        tracing::warn!(pid = pid, error = %e, "failed to reap child after SIGKILL");
-    }
+    child.kill()?;
+    let _status = child.wait()?;
+    Ok(())
 }
 
 fn wait_for_pid_exit(
