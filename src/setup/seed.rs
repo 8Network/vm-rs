@@ -287,7 +287,12 @@ fn build_network_config(config: &SeedConfig<'_>) -> Result<String, SetupError> {
     Ok(nc)
 }
 
-fn create_iso_image(iso_path: &Path, source_dir: &Path) -> Result<(), SetupError> {
+fn create_iso_image(
+    #[cfg(any(target_os = "macos", target_os = "linux"))] iso_path: &Path,
+    #[cfg(any(target_os = "macos", target_os = "linux"))] source_dir: &Path,
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))] _iso_path: &Path,
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))] _source_dir: &Path,
+) -> Result<(), SetupError> {
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("hdiutil")

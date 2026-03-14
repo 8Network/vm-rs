@@ -19,6 +19,7 @@ pub mod whp;
 mod ready;
 
 use crate::config::{VmConfig, VmHandle, VmState};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) use ready::{check_ready_marker, ReadyMarkerCache};
 
 /// Platform-agnostic VM lifecycle.

@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/). During `0.x`, m
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-03-14
+
+### CI and release
+- Fix the Windows release build by declaring the WHP `windows` crate dependency explicitly
+- Avoid Windows-only clippy failures from readiness helper re-exports and seed ISO helper arguments
+
 ## [0.2.0] — 2026-03-14
 
 ### Lifecycle and state

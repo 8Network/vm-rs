@@ -1,6 +1,6 @@
 [package]
 name = "vm-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Cross-platform VM lifecycle management — Apple Virtualization.framework (macOS) + Cloud Hypervisor (Linux)"
 license = "MIT"
@@ -47,6 +47,13 @@ indicatif = "0.17"
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"
 objc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_Memory",
+] }
 
 [dev-dependencies]
 tempfile = "3"
