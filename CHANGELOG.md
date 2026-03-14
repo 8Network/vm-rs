@@ -6,10 +6,22 @@ This project follows [Semantic Versioning](https://semver.org/). During `0.x`, m
 
 ## [Unreleased]
 
-- Windows: crate compiles and tests pass on `x86_64-pc-windows-msvc` (no VM driver yet)
-- CI/CD: tag-triggered release pipeline (validate → test 3 platforms → publish → GitHub release)
-- cfg-gate Unix-only APIs (`SocketPairFd`, `NetworkSwitch`, `libc`)
-- `USERPROFILE` fallback for data directory on Windows
+## [0.2.0] — 2026-03-14
+
+### Lifecycle and state
+- Split VM lifecycle reporting into `Starting`, `Running`, and `Ready`
+- Make readiness detection explicit instead of conflating hypervisor execution with guest readiness
+- Add incremental serial-log readiness caching for Apple VZ and Cloud Hypervisor backends
+
+### Reliability
+- Harden Cloud Hypervisor cleanup and stop/kill failure handling
+- Reap `virtiofsd` sidecars consistently and clean them up on boot failures
+- Improve logging around readiness detection and lifecycle transitions
+
+### CI and platform support
+- Add Apple VZ FFI smoke coverage to normal macOS CI
+- Keep the crate building and testing on `x86_64-pc-windows-msvc`
+- Clarify the project's experimental status and current verification surface in the docs
 
 ## [0.1.0] — 2026-03-12
 
