@@ -3,6 +3,8 @@
 Cross-platform VM lifecycle management for Rust.
 Boot, stop, and orchestrate lightweight virtual machines on macOS, Linux, and Windows from a single API.
 
+> Status: `vm-rs` is experimental and under active development. Interfaces, capabilities, and platform support may change, and parts of the project are not yet production-ready.
+
 - **macOS**: Apple Virtualization.framework (in-process, via Objective-C FFI)
 - **Linux**: Cloud Hypervisor (separate VMM process, CLI mode)
 - **Windows**: Windows Hypervisor Platform (in-process, same technology as WSL2)

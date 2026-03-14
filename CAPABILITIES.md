@@ -3,6 +3,8 @@
 Cross-platform VM lifecycle management.
 macOS via Apple Virtualization.framework, Linux via Cloud Hypervisor.
 
+Status: experimental and under active development. This matrix reflects current implementation work, not a maturity or production-readiness guarantee.
+
 ## Platform Support
 
 | Capability | macOS (Apple VZ) | Linux (Cloud Hypervisor) | Notes |
