@@ -16,6 +16,7 @@ pub mod boot;
 #[cfg(target_os = "windows")]
 pub mod whp;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod ready;
 
 use crate::config::{VmConfig, VmHandle, VmState};

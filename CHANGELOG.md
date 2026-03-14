@@ -6,6 +6,12 @@ This project follows [Semantic Versioning](https://semver.org/). During `0.x`, m
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-03-14
+
+### Windows
+- Exclude readiness-marker helpers from Windows builds where they are unused
+- Resolve remaining WHP clippy issues on the Windows release runner
+
 ## [0.2.2] — 2026-03-14
 
 ### Windows

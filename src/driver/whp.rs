@@ -243,11 +243,8 @@ impl VmDriver for WhpDriver {
 
         // ── Step 3: Allocate and map guest memory ──
 
-        let mut memory = GuestMemory::allocate(memory_bytes).map_err(|e| {
-            unsafe {
-                let _ = WHvDeletePartition(partition);
-            }
-            e
+        let mut memory = GuestMemory::allocate(memory_bytes).inspect_err(|_| unsafe {
+            let _ = WHvDeletePartition(partition);
         })?;
 
         // SAFETY: memory.as_ptr() is page-aligned (VirtualAlloc guarantee),
@@ -317,12 +314,9 @@ impl VmDriver for WhpDriver {
             }
         })?;
 
-        setup_initial_registers(partition, entry_point).map_err(|e| {
-            unsafe {
-                let _ = WHvDeleteVirtualProcessor(partition, 0);
-                let _ = WHvDeletePartition(partition);
-            }
-            e
+        setup_initial_registers(partition, entry_point).inspect_err(|_| unsafe {
+            let _ = WHvDeleteVirtualProcessor(partition, 0);
+            let _ = WHvDeletePartition(partition);
         })?;
 
         // ── Step 6: Spawn vCPU thread ──
@@ -745,61 +739,52 @@ fn vcpu_loop(
             break;
         }
 
-        match exit_context.ExitReason {
-            WHvRunVpExitReasonX64IoPortAccess => {
-                // SAFETY: ExitReason is IoPortAccess, so the union field is valid.
-                let io = unsafe { &exit_context.Anonymous.IoPortAccess };
-                handle_io_port(
-                    partition,
-                    &exit_context,
-                    io,
-                    &mut serial_file,
-                    &mut serial_buffer,
-                    &state,
-                    vm_name,
-                );
-            }
-
-            WHvRunVpExitReasonX64Halt => {
-                // Check RFLAGS.IF — if interrupts enabled, this is idle (HLT loop).
-                // If disabled, the kernel has halted.
-                let rflags = exit_context.VpContext.Rflags;
-                if rflags & 0x200 != 0 {
-                    // Idle — sleep briefly and resume
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    advance_rip(partition, &exit_context);
-                } else {
-                    // Halted with interrupts disabled — VM is done
-                    tracing::info!(vm = %vm_name, "VM halted (interrupts disabled)");
-                    update_state(&state, VmState::Stopped);
-                    break;
-                }
-            }
-
-            WHvRunVpExitReasonCanceled => {
-                // Cancellation requested (stop or pause)
-                tracing::debug!(vm = %vm_name, "vCPU execution cancelled");
-                break;
-            }
-
-            WHvRunVpExitReasonMemoryAccess => {
-                // Unmapped memory access — fatal
-                let gpa = unsafe { exit_context.Anonymous.MemoryAccess.Gpa };
-                let reason = format!("unmapped memory access at GPA 0x{:x}", gpa);
-                tracing::error!(vm = %vm_name, "{}", reason);
-                update_state(&state, VmState::Failed { reason });
-                break;
-            }
-
-            other => {
-                // Unknown exit — log and advance past the instruction
-                tracing::debug!(
-                    vm = %vm_name,
-                    exit_reason = other.0,
-                    "unhandled VM exit"
-                );
+        let exit_reason = exit_context.ExitReason;
+        if exit_reason == WHvRunVpExitReasonX64IoPortAccess {
+            // SAFETY: ExitReason is IoPortAccess, so the union field is valid.
+            let io = unsafe { &exit_context.Anonymous.IoPortAccess };
+            handle_io_port(
+                partition,
+                &exit_context,
+                io,
+                &mut serial_file,
+                &mut serial_buffer,
+                &state,
+                vm_name,
+            );
+        } else if exit_reason == WHvRunVpExitReasonX64Halt {
+            // Check RFLAGS.IF — if interrupts enabled, this is idle (HLT loop).
+            // If disabled, the kernel has halted.
+            let rflags = exit_context.VpContext.Rflags;
+            if rflags & 0x200 != 0 {
+                // Idle — sleep briefly and resume
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 advance_rip(partition, &exit_context);
+            } else {
+                // Halted with interrupts disabled — VM is done
+                tracing::info!(vm = %vm_name, "VM halted (interrupts disabled)");
+                update_state(&state, VmState::Stopped);
+                break;
             }
+        } else if exit_reason == WHvRunVpExitReasonCanceled {
+            // Cancellation requested (stop or pause)
+            tracing::debug!(vm = %vm_name, "vCPU execution cancelled");
+            break;
+        } else if exit_reason == WHvRunVpExitReasonMemoryAccess {
+            // Unmapped memory access — fatal
+            let gpa = unsafe { exit_context.Anonymous.MemoryAccess.Gpa };
+            let reason = format!("unmapped memory access at GPA 0x{:x}", gpa);
+            tracing::error!(vm = %vm_name, "{}", reason);
+            update_state(&state, VmState::Failed { reason });
+            break;
+        } else {
+            // Unknown exit — log and advance past the instruction
+            tracing::debug!(
+                vm = %vm_name,
+                exit_reason = exit_reason.0,
+                "unhandled VM exit"
+            );
+            advance_rip(partition, &exit_context);
         }
     }
 }
