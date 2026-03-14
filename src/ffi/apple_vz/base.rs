@@ -1,5 +1,6 @@
 //! base module
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::slice;
 use std::str;
@@ -16,8 +17,10 @@ extern "C" {}
 #[link(name = "Foundation", kind = "framework")]
 extern "C" {
     pub fn dispatch_queue_create(label: *const libc::c_char, attr: Id) -> Id;
+    // pub fn dispatch_sync(queue: Id, block: &Block<(), ()>);
     pub fn dispatch_sync(queue: Id, block: *mut c_void);
     pub fn dispatch_async(queue: Id, block: &Block<(), ()>);
+// pub fn dispatch_async(queue: Id, block: *mut c_void);
 }
 
 pub type Id = *mut Object;
@@ -31,9 +34,7 @@ pub struct NSArray<T> {
 impl<T> NSArray<T> {
     pub fn array_with_objects(objects: Vec<Id>) -> NSArray<T> {
         unsafe {
-            // arrayWithObjects:count: is a factory method returning autoreleased (+0).
-            // Must use StrongPtr::retain to add +1 before taking ownership.
-            let p = StrongPtr::retain(
+            let p = StrongPtr::new(
                 msg_send![class!(NSArray), arrayWithObjects:objects.as_slice().as_ptr() count:objects.len()],
             );
             NSArray {
@@ -77,7 +78,7 @@ impl NSString {
         self.len() == 0
     }
 
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> Cow<'_, str> {
         unsafe {
             let bytes = {
                 let bytes: *const libc::c_char = msg_send![*self.0, UTF8String];
@@ -85,7 +86,7 @@ impl NSString {
             };
             let len = self.len();
             let bytes = slice::from_raw_parts(bytes, len);
-            str::from_utf8(bytes).expect("NSString contained invalid UTF-8")
+            String::from_utf8_lossy(bytes)
         }
     }
 }
@@ -135,12 +136,6 @@ impl NSURL {
 
 pub struct NSFileHandle(pub StrongPtr);
 
-impl Default for NSFileHandle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NSFileHandle {
     pub fn new() -> NSFileHandle {
         unsafe {
@@ -166,52 +161,28 @@ impl NSFileHandle {
         }
     }
 
-    /// Create an `NSFileHandle` that does NOT take ownership of the fd.
-    /// The caller must ensure the fd outlives this handle.
-    ///
     /// # Safety
-    /// `fd` must be a valid, open file descriptor.
-    pub unsafe fn file_handle_with_fd_borrowed(fd: i32) -> NSFileHandle {
+    ///
+    /// `fd` must be a valid, open file descriptor that remains valid for the
+    /// lifetime expected by the created Objective-C file handle.
+    pub unsafe fn file_handle_with_fd(fd: i32) -> NSFileHandle {
         let alloc: Id = msg_send![class!(NSFileHandle), alloc];
-        let p = StrongPtr::new(msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: NO]);
+        let p = StrongPtr::new(
+            msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: NO],
+        );
         NSFileHandle(p)
     }
+}
 
-    /// Create an `NSFileHandle` that takes ownership of the fd.
-    /// The fd will be closed when the Objective-C object is deallocated.
-    ///
-    /// # Safety
-    /// `fd` must be a valid, open file descriptor. The caller must NOT close it
-    /// after this call — ownership transfers to the `NSFileHandle`.
-    pub unsafe fn file_handle_with_fd_owned(fd: i32) -> NSFileHandle {
-        let alloc: Id = msg_send![class!(NSFileHandle), alloc];
-        let p = StrongPtr::new(msg_send![alloc, initWithFileDescriptor: fd closeOnDealloc: YES]);
-        NSFileHandle(p)
+impl Default for NSFileHandle {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 pub struct NSDictionary(pub StrongPtr);
 
 impl NSDictionary {
-    /// Create an NSDictionary from key-value pairs.
-    ///
-    /// # Safety
-    /// All `Id` values in `pairs` must be valid, retained Objective-C objects.
-    pub fn from_pairs(pairs: &[(Id, Id)]) -> NSDictionary {
-        unsafe {
-            let keys: Vec<Id> = pairs.iter().map(|(k, _)| *k).collect();
-            let values: Vec<Id> = pairs.iter().map(|(_, v)| *v).collect();
-            // dictionaryWithObjects:forKeys:count: is a factory method returning autoreleased (+0).
-            let p = StrongPtr::retain(msg_send![
-                class!(NSDictionary),
-                dictionaryWithObjects:values.as_ptr()
-                forKeys:keys.as_ptr()
-                count:pairs.len()
-            ]);
-            NSDictionary(p)
-        }
-    }
-
     pub fn all_keys<T>(&self) -> NSArray<T> {
         unsafe {
             NSArray {
@@ -287,12 +258,8 @@ impl NSError {
         println!("code: {}", code);
 
         // Helper: safely print an NSString that may be backed by nil
-        fn safe_str(s: &NSString) -> &str {
-            if *s.0 == NIL {
-                "(nil)"
-            } else {
-                s.as_str()
-            }
+        fn safe_str(s: &NSString) -> Cow<'_, str> {
+            if *s.0 == NIL { Cow::Borrowed("(nil)") } else { s.as_str() }
         }
 
         let desc = self.localized_description();
@@ -303,21 +270,5 @@ impl NSError {
         println!("localizedRecoverySuggestion : {}", safe_str(&suggestion));
         let anchor = self.help_anchor();
         println!("helpAnchor : {}", safe_str(&anchor));
-    }
-
-    /// Create a synthetic NSError with a domain and description.
-    ///
-    /// Used when an ObjC API returns nil without an error object (macOS 16+).
-    pub fn from_description(domain: &str, description: &str) -> Self {
-        unsafe {
-            let ns_domain = NSString::new(domain);
-            let ns_desc = NSString::new(description);
-            let desc_key = NSString::new("NSLocalizedDescription");
-            let user_info = NSDictionary::from_pairs(&[(*desc_key.0, *ns_desc.0)]);
-            let p: Id = msg_send![class!(NSError), errorWithDomain:*ns_domain.0
-                                                   code:(-1isize)
-                                                   userInfo:*user_info.0];
-            NSError(StrongPtr::retain(p))
-        }
     }
 }

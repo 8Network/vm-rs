@@ -13,18 +13,18 @@ pub trait VZNetworkDeviceAttachment {
 /// configure of NAT network device attachment
 pub struct VZNATNetworkDeviceAttachment(StrongPtr);
 
-impl Default for VZNATNetworkDeviceAttachment {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl VZNATNetworkDeviceAttachment {
     pub fn new() -> VZNATNetworkDeviceAttachment {
         unsafe {
             let p = StrongPtr::new(msg_send![class!(VZNATNetworkDeviceAttachment), new]);
             VZNATNetworkDeviceAttachment(p)
         }
+    }
+}
+
+impl Default for VZNATNetworkDeviceAttachment {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -38,13 +38,13 @@ impl VZNetworkDeviceAttachment for VZNATNetworkDeviceAttachment {
 pub trait VZBridgedNetworkInterface {
     fn id(&self) -> Id;
     fn localized_display_name(&self) -> NSString {
-        let obj = self.id();
-        let p = unsafe { StrongPtr::retain(msg_send![obj, localizedDisplayName]) };
+        let _obj = self.id();
+        let p = unsafe { StrongPtr::retain(msg_send![class!(_obj), localizedDisplayName]) };
         NSString(p)
     }
     fn identifier(&self) -> NSString {
-        let obj = self.id();
-        let p = unsafe { StrongPtr::retain(msg_send![obj, identifier]) };
+        let _obj = self.id();
+        let p = unsafe { StrongPtr::retain(msg_send![class!(_obj), identifier]) };
         NSString(p)
     }
 }
@@ -97,22 +97,14 @@ impl VZNetworkDeviceAttachment for VZFileHandleNetworkDeviceAttachment {
 /// MAC address
 pub struct VZMACAddress(pub StrongPtr);
 
-impl Default for VZMACAddress {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl VZMACAddress {
     pub fn new() -> VZMACAddress {
         let p = unsafe { StrongPtr::new(msg_send![class!(VZMACAddress), new]) };
         VZMACAddress(p)
     }
     pub fn random_locally_administered_address() -> VZMACAddress {
-        // randomLocallyAdministeredAddress is a factory method returning autoreleased (+0).
-        // Must use StrongPtr::retain to add +1 before taking ownership.
         let p = unsafe {
-            StrongPtr::retain(msg_send![
+            StrongPtr::new(msg_send![
                 class!(VZMACAddress),
                 randomLocallyAdministeredAddress
             ])
@@ -122,11 +114,15 @@ impl VZMACAddress {
 
     pub fn init_with_string(s: &str) -> VZMACAddress {
         let string = NSString::new(s);
-        unsafe {
-            let alloc: Id = msg_send![class!(VZMACAddress), alloc];
-            let p = StrongPtr::new(msg_send![alloc, initWithString:*string.0]);
-            VZMACAddress(p)
-        }
+        let p =
+            unsafe { StrongPtr::new(msg_send![class!(VZMACAddress), initWithString:*string.0]) };
+        VZMACAddress(p)
+    }
+}
+
+impl Default for VZMACAddress {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

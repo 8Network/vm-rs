@@ -36,22 +36,14 @@ fn clone_disk_idempotent() {
     VmManager::clone_disk(&base, &target).expect("second clone");
 
     let content = std::fs::read(&target).expect("read clone");
-    assert_eq!(
-        content, b"original",
-        "idempotent clone should NOT overwrite"
-    );
+    assert_eq!(content, b"original", "idempotent clone should NOT overwrite");
 }
 
 #[test]
 fn clone_disk_creates_parent_dirs() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("base.img");
-    let target = tmp
-        .path()
-        .join("deep")
-        .join("nested")
-        .join("dir")
-        .join("clone.img");
+    let target = tmp.path().join("deep").join("nested").join("dir").join("clone.img");
 
     std::fs::write(&base, b"data").expect("write base");
 

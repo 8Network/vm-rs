@@ -10,9 +10,11 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+
+use crate::config::VmSocketEndpoint;
 
 /// Minimum Ethernet frame size (without FCS).
 const MIN_FRAME_SIZE: usize = 14;
@@ -54,13 +56,9 @@ impl std::fmt::Display for MacAddress {
 
 /// A port on the switch -- one end of a Unix datagram socketpair connected to a VM's NIC.
 #[derive(Debug)]
-pub struct SwitchPort {
+struct SwitchPort {
     /// The switch's end of the socketpair. The other end goes to the VM.
-    pub fd: RawFd,
-    /// Which network this port belongs to.
-    pub network_id: String,
-    /// Human-readable label (service name).
-    pub label: String,
+    fd: RawFd,
 }
 
 impl AsRawFd for SwitchPort {
@@ -77,13 +75,7 @@ pub struct NetworkSwitch {
     networks: Arc<Mutex<HashMap<String, Vec<SwitchPort>>>>,
     mac_tables: Arc<RwLock<HashMap<String, MacTable>>>,
     running: Arc<std::sync::atomic::AtomicBool>,
-    thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-impl Default for NetworkSwitch {
-    fn default() -> Self {
-        Self::new()
-    }
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl NetworkSwitch {
@@ -92,7 +84,7 @@ impl NetworkSwitch {
             networks: Arc::new(Mutex::new(HashMap::new())),
             mac_tables: Arc::new(RwLock::new(HashMap::new())),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            thread_handle: Mutex::new(None),
+            worker: Mutex::new(None),
         }
     }
 
@@ -101,13 +93,11 @@ impl NetworkSwitch {
     /// Creates a Unix SOCK_DGRAM socketpair. One end is kept by the switch (for
     /// reading/writing Ethernet frames), the other is returned so the caller can
     /// pass it to VZFileHandleNetworkDeviceAttachment.
-    pub fn add_port(&self, network_id: &str, label: &str) -> io::Result<RawFd> {
+    pub fn add_port(&self, network_id: &str, _label: &str) -> io::Result<VmSocketEndpoint> {
         let (switch_fd, vm_fd) = create_socketpair()?;
 
         let port = SwitchPort {
             fd: switch_fd,
-            network_id: network_id.to_string(),
-            label: label.to_string(),
         };
 
         let mut networks = self
@@ -125,7 +115,8 @@ impl NetworkSwitch {
             .map_err(|e| io::Error::other(format!("lock poisoned: {}", e)))?;
         mac_tables.entry(network_id.to_string()).or_default();
 
-        Ok(vm_fd)
+        // SAFETY: `socketpair` returned a fresh owned file descriptor for the VM side.
+        Ok(VmSocketEndpoint::new(unsafe { OwnedFd::from_raw_fd(vm_fd) }))
     }
 
     /// Start the forwarding loop on a background thread.
@@ -150,29 +141,37 @@ impl NetworkSwitch {
                 forwarding_loop(&networks, &mac_tables, &running);
             })?;
 
-        if let Ok(mut h) = self.thread_handle.lock() {
-            *h = Some(handle);
-        }
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|e| io::Error::other(format!("lock poisoned: {}", e)))?;
+        *worker = Some(handle);
 
         Ok(())
     }
 
-    /// Stop the forwarding loop and wait for the thread to exit.
-    ///
-    /// Joins the background thread before returning, ensuring no reads/writes
-    /// are in flight when file descriptors are later closed in `Drop`.
+    /// Stop the forwarding loop.
     pub fn stop(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
-
-        // Join the forwarding thread so it exits before we close any fds
-        if let Ok(mut handle) = self.thread_handle.lock() {
-            if let Some(h) = handle.take() {
-                if let Err(e) = h.join() {
-                    eprintln!("vm-rs: network switch thread panicked: {:?}", e);
+        match self.worker.lock() {
+            Ok(mut worker) => {
+                if let Some(handle) = worker.take() {
+                    if let Err(e) = handle.join() {
+                        tracing::error!("network switch thread panicked: {:?}", e);
+                    }
                 }
             }
+            Err(e) => {
+                tracing::error!("network switch worker lock poisoned during stop: {}", e);
+            }
         }
+    }
+}
+
+impl Default for NetworkSwitch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -286,7 +285,8 @@ fn forwarding_loop(
         }
 
         // SAFETY: poll(2) on fds we own. pollfds array is valid and properly sized.
-        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
+        let ready =
+            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 50) };
 
         if ready <= 0 {
             continue;
@@ -301,8 +301,14 @@ fn forwarding_loop(
 
             // Read one Ethernet frame
             // SAFETY: Reading from our own fd into a stack buffer of MAX_FRAME_SIZE.
-            let n =
-                unsafe { libc::recv(pfd.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            let n = unsafe {
+                libc::recv(
+                    pfd.fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                )
+            };
 
             if n < MIN_FRAME_SIZE as isize {
                 continue;
@@ -376,7 +382,7 @@ fn forwarding_loop(
 /// Send a single Ethernet frame to a socket fd. Best-effort (drops if buffer full).
 fn send_frame(fd: RawFd, frame: &[u8]) {
     // SAFETY: Sending to our own fd. MSG_DONTWAIT prevents blocking on full buffer.
-    let ret = unsafe {
+    let sent = unsafe {
         libc::send(
             fd,
             frame.as_ptr() as *const libc::c_void,
@@ -384,16 +390,10 @@ fn send_frame(fd: RawFd, frame: &[u8]) {
             libc::MSG_DONTWAIT,
         )
     };
-    if ret < 0 {
-        let err = io::Error::last_os_error();
-        let errno = err.raw_os_error();
-        if errno == Some(libc::EAGAIN) || errno == Some(libc::EWOULDBLOCK) {
-            // Buffer full — expected in best-effort mode, drop silently.
-        } else if errno == Some(libc::EBADF) || errno == Some(libc::EPIPE) {
-            tracing::warn!(fd = fd, error = %err, "send_frame failed: socket closed or invalid");
-        } else {
-            tracing::warn!(fd = fd, error = %err, "send_frame failed");
-        }
+
+    if sent < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::debug!(fd = fd, error = %err, "dropping frame because send failed");
     }
 }
 
@@ -405,7 +405,8 @@ mod tests {
 
     #[test]
     fn mac_from_bytes_valid() {
-        let mac = MacAddress::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).unwrap();
+        let mac = MacAddress::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+            .expect("valid MAC");
         assert_eq!(mac.0, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
     }
 
@@ -421,7 +422,7 @@ mod tests {
 
     #[test]
     fn mac_from_bytes_extra_bytes_ignored() {
-        let mac = MacAddress::from_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let mac = MacAddress::from_bytes(&[1, 2, 3, 4, 5, 6, 7, 8]).expect("invalid MAC");
         assert_eq!(mac.0, [1, 2, 3, 4, 5, 6]);
     }
 
@@ -471,32 +472,32 @@ mod tests {
     #[test]
     fn switch_add_port_returns_fd() {
         let switch = NetworkSwitch::new();
-        let vm_fd = switch.add_port("net0", "web").unwrap();
-        assert!(vm_fd >= 0);
+        let vm_fd = switch.add_port("net0", "web").expect("add port");
+        assert!(vm_fd.as_raw_fd() >= 0);
     }
 
     #[test]
     fn switch_add_multiple_ports_same_network() {
         let switch = NetworkSwitch::new();
-        let fd1 = switch.add_port("net0", "web").unwrap();
-        let fd2 = switch.add_port("net0", "db").unwrap();
-        assert_ne!(fd1, fd2);
+        let fd1 = switch.add_port("net0", "web").expect("add web port");
+        let fd2 = switch.add_port("net0", "db").expect("add db port");
+        assert_ne!(fd1.as_raw_fd(), fd2.as_raw_fd());
     }
 
     #[test]
     fn switch_add_ports_different_networks() {
         let switch = NetworkSwitch::new();
-        let fd1 = switch.add_port("frontend", "web").unwrap();
-        let fd2 = switch.add_port("backend", "db").unwrap();
-        assert_ne!(fd1, fd2);
+        let fd1 = switch.add_port("frontend", "web").expect("add frontend port");
+        let fd2 = switch.add_port("backend", "db").expect("add backend port");
+        assert_ne!(fd1.as_raw_fd(), fd2.as_raw_fd());
     }
 
     #[test]
     fn switch_frame_delivery_same_network() {
         let switch = NetworkSwitch::new();
-        let fd1 = switch.add_port("net0", "sender").unwrap();
-        let fd2 = switch.add_port("net0", "receiver").unwrap();
-        switch.start().unwrap();
+        let fd1 = switch.add_port("net0", "sender").expect("add sender port");
+        let fd2 = switch.add_port("net0", "receiver").expect("add receiver port");
+        switch.start().expect("start switch");
 
         // Build a minimal Ethernet frame: dst(6) + src(6) + ethertype(2) = 14 bytes
         let mut frame = [0u8; 14];
@@ -509,8 +510,14 @@ mod tests {
 
         // Send from fd1 (the VM's end of the socketpair)
         // SAFETY: Writing to our own socketpair fd.
-        let sent =
-            unsafe { libc::send(fd1, frame.as_ptr() as *const libc::c_void, frame.len(), 0) };
+        let sent = unsafe {
+            libc::send(
+                fd1.as_raw_fd(),
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
+            )
+        };
         assert_eq!(sent, 14);
 
         // Wait briefly for the switch forwarding loop
@@ -521,16 +528,13 @@ mod tests {
         // SAFETY: Reading from our own socketpair fd.
         let recvd = unsafe {
             libc::recv(
-                fd2,
+                fd2.as_raw_fd(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
                 libc::MSG_DONTWAIT,
             )
         };
-        assert_eq!(
-            recvd, 14,
-            "broadcast frame should be forwarded to the other port"
-        );
+        assert_eq!(recvd, 14, "broadcast frame should be forwarded to the other port");
         assert_eq!(&buf[..14], &frame[..14]);
 
         switch.stop();
@@ -539,9 +543,9 @@ mod tests {
     #[test]
     fn switch_no_cross_network_forwarding() {
         let switch = NetworkSwitch::new();
-        let fd1 = switch.add_port("net-a", "sender").unwrap();
-        let fd2 = switch.add_port("net-b", "isolated").unwrap();
-        switch.start().unwrap();
+        let fd1 = switch.add_port("net-a", "sender").expect("add sender port");
+        let fd2 = switch.add_port("net-b", "isolated").expect("add isolated port");
+        switch.start().expect("start switch");
 
         // Broadcast frame from net-a
         let mut frame = [0u8; 14];
@@ -551,7 +555,12 @@ mod tests {
 
         // SAFETY: Writing to our own socketpair fd.
         unsafe {
-            libc::send(fd1, frame.as_ptr() as *const libc::c_void, frame.len(), 0);
+            libc::send(
+                fd1.as_raw_fd(),
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
+            );
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -561,7 +570,7 @@ mod tests {
         // SAFETY: Reading from our own socketpair fd.
         let recvd = unsafe {
             libc::recv(
-                fd2,
+                fd2.as_raw_fd(),
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len(),
                 libc::MSG_DONTWAIT,

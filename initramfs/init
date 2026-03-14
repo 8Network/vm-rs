@@ -141,14 +141,10 @@ echo "root:x:0:0:root:/root:/bin/sh" > /etc/passwd
 echo "${VM_USER}:x:1000:1000:${VM_USER}:/home/${VM_USER}:/bin/sh" >> /etc/passwd
 echo "root:x:0:" > /etc/group
 echo "${VM_USER}:x:1000:" >> /etc/group
-if [ -n "$VM_SSH_KEY" ]; then
-    echo "root::0:0:99999:7:::" > /etc/shadow
-    echo "${VM_USER}::0:0:99999:7:::" >> /etc/shadow
-else
-    # Locked accounts — no password login possible
-    echo "root:*:0:0:99999:7:::" > /etc/shadow
-    echo "${VM_USER}:*:0:0:99999:7:::" >> /etc/shadow
-fi
+# Empty password field = blank password (works with dropbear -B)
+# '*' means locked account, '' means blank password
+echo "root::0:0:99999:7:::" > /etc/shadow
+echo "${VM_USER}::0:0:99999:7:::" >> /etc/shadow
 chmod 640 /etc/shadow
 
 chown 1000:1000 /home/"$VM_USER"
@@ -176,28 +172,21 @@ fi
 dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
 dropbearkey -t rsa     -f /etc/dropbear/dropbear_rsa_host_key     2>/dev/null
 
-# Start dropbear SSH daemon only when an SSH key is provided.
-# -R = generate host keys on first run
-# -s = disable password logins (key-only auth)
-# Blank-password auth (-B) is never allowed — network-reachable guests must not
-# expose an unauthenticated shell.
-if [ -n "$VM_SSH_KEY" ]; then
-    DROPBEAR_OPTS="-R -p 22 -s"
-    echo "[init] ssh: key-only auth (password login disabled)"
-    if dropbear $DROPBEAR_OPTS 2>/tmp/dropbear-start.log; then
-        sleep 0.2
-        if pidof dropbear >/dev/null 2>&1; then
-            echo "[init] ssh: dropbear started on port 22 (pid $(pidof dropbear))"
-        else
-            echo "[init] ssh: dropbear exited immediately"
-            cat /tmp/dropbear-start.log 2>/dev/null
-        fi
+# Start dropbear (background daemon, allow root login, no password auth)
+# Debug: log authorized_keys
+echo "[init] ssh: authorized_keys fingerprint: $(cat /root/.ssh/authorized_keys 2>/dev/null | awk '{print $1, $2}' | head -c 40)..."
+
+if dropbear -R -B -p 22 2>/tmp/dropbear-start.log; then
+    sleep 0.2
+    if pidof dropbear >/dev/null 2>&1; then
+        echo "[init] ssh: dropbear started on port 22 (pid $(pidof dropbear))"
     else
-        echo "[init] ssh: dropbear FAILED to start"
+        echo "[init] ssh: dropbear exited immediately"
         cat /tmp/dropbear-start.log 2>/dev/null
     fi
 else
-    echo "[init] ssh: DISABLED (no SSH key provided, refusing to start with blank password)"
+    echo "[init] ssh: dropbear FAILED to start"
+    cat /tmp/dropbear-start.log 2>/dev/null
 fi
 
 # ── Mount VM config (env, hosts, volumes, startup script) ────────────────────
@@ -330,12 +319,9 @@ elif [ -n "$VM_WORKLOAD" ]; then
         mount --bind /dev  /mnt/rootfs/dev  2>/dev/null || true
         mount --bind /tmp  /mnt/rootfs/tmp  2>/dev/null || true
 
-        # Execute workload directly — no sh -c wrapping to avoid injection via
-        # cmdline string concatenation. Word splitting on the unquoted variables
-        # is intentional: VM_WORKLOAD is the binary, VM_WORKLOAD_ARGS its args.
-        chroot /mnt/rootfs $VM_WORKLOAD $VM_WORKLOAD_ARGS &
+        chroot /mnt/rootfs sh -c "$VM_WORKLOAD $VM_WORKLOAD_ARGS" &
     else
-        $VM_WORKLOAD $VM_WORKLOAD_ARGS &
+        sh -c "$VM_WORKLOAD $VM_WORKLOAD_ARGS" &
     fi
 fi
 

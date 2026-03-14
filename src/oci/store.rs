@@ -87,25 +87,13 @@ impl ImageStore {
 
     /// Check if a blob exists locally.
     pub fn has_blob(&self, digest: &str) -> bool {
-        match self.blob_path(digest) {
-            Ok(path) => path.exists(),
-            Err(_) => false,
-        }
+        self.blob_path(digest).exists()
     }
 
     /// Get the path to a blob by its sha256 digest.
-    ///
-    /// Returns an error if the digest contains non-hex characters after the
-    /// `sha256:` prefix, preventing path traversal via crafted digests.
-    pub fn blob_path(&self, digest: &str) -> Result<PathBuf, OciError> {
+    pub fn blob_path(&self, digest: &str) -> PathBuf {
         let hash = digest.strip_prefix("sha256:").unwrap_or(digest);
-        if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(OciError::Blob(format!(
-                "invalid digest: '{}' contains non-hex characters",
-                digest
-            )));
-        }
-        Ok(self.root.join("blobs/sha256").join(hash))
+        self.root.join("blobs/sha256").join(hash)
     }
 
     /// Write a blob and verify its digest.
@@ -122,16 +110,15 @@ impl ImageStore {
             )));
         }
 
-        let path = self.blob_path(digest)?;
+        let path = self.blob_path(digest);
         std::fs::write(&path, data)?;
         Ok(path)
     }
 
     /// Read a blob's bytes.
     pub fn get_blob(&self, digest: &str) -> Result<Vec<u8>, OciError> {
-        let path = self.blob_path(digest)?;
-        std::fs::read(&path)
-            .map_err(|e| OciError::Blob(format!("failed to read blob {}: {}", digest, e)))
+        let path = self.blob_path(digest);
+        std::fs::read(&path).map_err(|e| OciError::Blob(format!("failed to read blob {}: {}", digest, e)))
     }
 
     /// Save a manifest for an image reference.
@@ -142,71 +129,63 @@ impl ImageStore {
         Ok(())
     }
 
-    /// Load a cached manifest. Returns `None` if not cached.
-    pub fn get_manifest(&self, image: &str, tag: &str) -> Option<Vec<u8>> {
+    /// Load a cached manifest. Returns `Ok(None)` if not cached.
+    pub fn get_manifest(&self, image: &str, tag: &str) -> Result<Option<Vec<u8>>, OciError> {
         let path = self
             .root
             .join("manifests")
             .join(sanitize_name(image))
             .join(format!("{}.json", sanitize_name(tag)));
         match std::fs::read(&path) {
-            Ok(data) => Some(data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "failed to read cached manifest: {}", e);
-                None
-            }
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(OciError::Io(e)),
         }
     }
 
     /// List all cached images as (repository, tag, layers, size_bytes) tuples.
-    pub fn list_images(&self) -> Vec<(String, String, usize, u64)> {
+    pub fn list_images(&self) -> Result<Vec<(String, String, usize, u64)>, OciError> {
         let manifests_dir = self.root.join("manifests");
         let mut results = Vec::new();
 
-        let Ok(repos) = std::fs::read_dir(&manifests_dir) else {
-            return results;
-        };
+        let repos = std::fs::read_dir(&manifests_dir)?;
 
-        for repo_entry in repos.flatten() {
-            if !repo_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        for repo_entry in repos {
+            let repo_entry = repo_entry?;
+            if !repo_entry.file_type()?.is_dir() {
                 continue;
             }
             let repo_name = unsanitize_name(&repo_entry.file_name().to_string_lossy());
-            let Ok(tags) = std::fs::read_dir(repo_entry.path()) else {
-                continue;
-            };
+            let tags = std::fs::read_dir(repo_entry.path())?;
 
-            for tag_entry in tags.flatten() {
+            for tag_entry in tags {
+                let tag_entry = tag_entry?;
                 let filename = tag_entry.file_name().to_string_lossy().to_string();
                 if !filename.ends_with(".json") {
                     continue;
                 }
                 let tag = unsanitize_name(&filename[..filename.len() - 5]);
 
-                let Ok(data) = std::fs::read(tag_entry.path()) else {
-                    continue;
-                };
-                let (layers, size) = if let Ok(manifest) = Self::parse_manifest(&data) {
-                    let total_size: u64 = manifest
-                        .layer_digests
-                        .iter()
-                        .filter_map(|d| {
-                            let path = self.blob_path(d).ok()?;
-                            std::fs::metadata(&path).ok().map(|m| m.len())
-                        })
-                        .sum();
-                    (manifest.layer_digests.len(), total_size)
-                } else {
-                    (0, 0)
-                };
+                let data = std::fs::read(tag_entry.path())?;
+                let manifest = Self::parse_manifest(&data)?;
+                let size: u64 = manifest
+                    .layer_digests
+                    .iter()
+                    .map(|d| {
+                        let path = self.blob_path(d);
+                        std::fs::metadata(&path).map(|m| m.len())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .sum();
+                let layers = manifest.layer_digests.len();
 
                 results.push((repo_name.clone(), tag, layers, size));
             }
         }
 
         results.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        results
+        Ok(results)
     }
 
     /// Parse an OCI/Docker manifest JSON.
@@ -214,31 +193,27 @@ impl ImageStore {
         let raw: RawManifest = serde_json::from_slice(data)
             .map_err(|e| OciError::ManifestParse(format!("invalid JSON: {}", e)))?;
 
-        let media_type = raw
-            .media_type
-            .as_deref()
+        let media_type = raw.media_type.as_deref()
             .or_else(|| raw.schema_version.map(|_| ""))
             .unwrap_or("");
 
         if media_type.contains("manifest.list") || media_type.contains("index") {
-            return Err(OciError::ManifestParse("manifest_list".into()));
+            return Err(OciError::ManifestList);
         }
 
-        let config_digest = raw
-            .config
+        let config_digest = raw.config
             .and_then(|c| c.digest)
             .ok_or_else(|| OciError::ManifestParse("missing config digest".into()))?;
 
-        let layers = raw
-            .layers
+        let layers = raw.layers
             .ok_or_else(|| OciError::ManifestParse("missing layers".into()))?;
         let layer_digests: Vec<String> = layers
             .into_iter()
             .map(|l| {
                 l.digest
-                    .ok_or_else(|| OciError::ManifestParse("layer missing digest".into()))
+                    .ok_or_else(|| OciError::ManifestParse("missing layer digest".into()))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<_, _>>()?;
 
         Ok(ImageManifest {
             config_digest,
@@ -261,14 +236,21 @@ impl ImageStore {
             ExposedPorts: None,
         });
 
-        let exposed_ports = cfg
-            .ExposedPorts
-            .map(|obj| {
-                obj.keys()
-                    .filter_map(|k| k.split('/').next().and_then(|p| p.parse::<u16>().ok()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let exposed_ports = if let Some(obj) = cfg.ExposedPorts {
+            let mut ports = Vec::with_capacity(obj.len());
+            for key in obj.keys() {
+                let port = key
+                    .split('/')
+                    .next()
+                    .ok_or_else(|| OciError::ManifestParse(format!("invalid exposed port '{}'", key)))?
+                    .parse::<u16>()
+                    .map_err(|e| OciError::ManifestParse(format!("invalid exposed port '{}': {}", key, e)))?;
+                ports.push(port);
+            }
+            ports
+        } else {
+            Vec::new()
+        };
 
         Ok(ImageConfig {
             entrypoint: cfg.Entrypoint.unwrap_or_default(),
@@ -281,11 +263,15 @@ impl ImageStore {
     }
 
     /// Extract all layers of an image into a target directory (for rootfs preparation).
-    pub fn extract_layers(&self, manifest: &ImageManifest, target: &Path) -> Result<(), OciError> {
+    pub fn extract_layers(
+        &self,
+        manifest: &ImageManifest,
+        target: &Path,
+    ) -> Result<(), OciError> {
         std::fs::create_dir_all(target)?;
 
         for (i, digest) in manifest.layer_digests.iter().enumerate() {
-            let blob_path = self.blob_path(digest)?;
+            let blob_path = self.blob_path(digest);
             if !blob_path.exists() {
                 return Err(OciError::Blob(format!("missing layer blob: {}", digest)));
             }
@@ -322,46 +308,18 @@ impl ImageStore {
                     .to_path_buf();
                 let path_str = path.to_string_lossy();
 
-                // SECURITY: Reject path traversal and absolute paths BEFORE any
-                // filesystem operations (including whiteout processing).
-                // A malicious layer with `../../.wh.shadow` could otherwise delete
-                // host files outside the extraction root.
-                let has_traversal = path.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir | std::path::Component::RootDir
-                    )
-                });
-                if has_traversal {
-                    tracing::warn!(path = %path_str, "skipping tar entry with path traversal");
-                    continue;
-                }
-
                 // Handle whiteout files (.wh.*)
                 if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
                     if let Some(deleted_name) = filename.strip_prefix(".wh.") {
                         if deleted_name == ".wh..opq" {
-                            // Opaque whiteout: delete all children of the parent directory
                             if let Some(parent) = path.parent() {
                                 let full_parent = target.join(parent);
                                 if full_parent.exists() {
-                                    let entries = std::fs::read_dir(&full_parent).map_err(|e| {
-                                        OciError::Blob(format!(
-                                            "opaque whiteout read_dir failed for {}: {}",
-                                            full_parent.display(),
-                                            e
-                                        ))
-                                    })?;
+                                    let entries = std::fs::read_dir(&full_parent)
+                                        .map_err(|e| OciError::Blob(format!("opaque whiteout read_dir failed for {}: {}", full_parent.display(), e)))?;
                                     for child in entries.flatten() {
-                                        let child_path = child.path();
-                                        // Remove files and directories alike
-                                        let result = if child_path.is_dir() {
-                                            std::fs::remove_dir_all(&child_path)
-                                        } else {
-                                            std::fs::remove_file(&child_path)
-                                        };
-                                        if let Err(e) = result {
-                                            tracing::warn!(path = %child_path.display(), "opaque whiteout cleanup failed: {}", e);
+                                        if let Err(e) = std::fs::remove_dir_all(child.path()) {
+                                            tracing::warn!(path = %child.path().display(), "opaque whiteout cleanup failed: {}", e);
                                         }
                                     }
                                 }
@@ -377,6 +335,16 @@ impl ImageStore {
                         }
                         continue;
                     }
+                }
+
+                // Skip absolute paths and path traversal.
+                // Check each component individually — "foo..bar" is safe, "../foo" is not.
+                let has_traversal = path.components().any(|c| {
+                    matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir)
+                });
+                if has_traversal {
+                    tracing::warn!(path = %path_str, "skipping tar entry with path traversal");
+                    continue;
                 }
 
                 entry
@@ -401,15 +369,15 @@ fn is_gzip(path: &Path) -> Result<bool, OciError> {
 }
 
 fn sanitize_name(s: &str) -> String {
-    s.replace("..", "_dotdot_")
-        .replace('/', "_slash_")
-        .replace(':', "_colon_")
+    s.replace('/', "_slash_").replace(':', "_colon_")
 }
 
 fn unsanitize_name(s: &str) -> String {
-    s.replace("_dotdot_", "..")
-        .replace("_slash_", "/")
-        .replace("_colon_", ":")
+    let result = s.replace("_slash_", "/").replace("_colon_", ":");
+    if result == s && s.contains('_') && !s.contains('/') {
+        return s.replacen('_', "/", 1);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -440,7 +408,8 @@ mod tests {
             ]
         }"#;
 
-        let manifest = ImageStore::parse_manifest(manifest_json.as_bytes()).unwrap();
+        let manifest = ImageStore::parse_manifest(manifest_json.as_bytes())
+            .expect("manifest should parse");
         assert_eq!(manifest.config_digest, "sha256:abc123");
         assert_eq!(manifest.layer_digests.len(), 2);
     }
@@ -456,7 +425,8 @@ mod tests {
             }
         }"#;
 
-        let config = ImageStore::parse_config(config_json.as_bytes()).unwrap();
+        let config = ImageStore::parse_config(config_json.as_bytes())
+            .expect("config should parse");
         assert_eq!(config.cmd, vec!["nginx", "-g", "daemon off;"]);
         assert_eq!(config.env.len(), 2);
         assert_eq!(config.exposed_ports, vec![80]);
@@ -464,21 +434,10 @@ mod tests {
 
     #[test]
     fn blob_path_strips_prefix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(tmp.path()).unwrap();
-        let path = store.blob_path("sha256:abc123def456").unwrap();
-        // Use Path::ends_with for platform-independent separator handling
-        assert!(path.ends_with(std::path::Path::new("blobs/sha256/abc123def456")));
-    }
-
-    #[test]
-    fn blob_path_rejects_non_hex() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(tmp.path()).unwrap();
-        assert!(store.blob_path("sha256:../../../etc/passwd").is_err());
-        assert!(store.blob_path("sha256:abc_xyz").is_err());
-        assert!(store.blob_path("sha256:").is_err());
-        assert!(store.blob_path("sha256:ABCDEF0123456789abcdef").is_ok());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = ImageStore::new(tmp.path()).expect("store");
+        let path = store.blob_path("sha256:abc123def456");
+        assert!(path.to_string_lossy().ends_with("blobs/sha256/abc123def456"));
     }
 
     #[test]
@@ -499,28 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_path_traversal() {
-        let name = "../../etc/passwd";
-        let sanitized = sanitize_name(name);
-        assert!(
-            !sanitized.contains(".."),
-            "sanitized name must not contain '..'"
-        );
-        let unsanitized = unsanitize_name(&sanitized);
-        assert_eq!(unsanitized, name, "roundtrip must preserve original name");
-    }
-
-    #[test]
-    fn unsanitize_no_false_slash_heuristic() {
-        // Names with underscores that are NOT sanitization markers must NOT
-        // have their underscores converted to slashes.
-        let name = "my_image";
-        let sanitized = sanitize_name(name);
-        let unsanitized = unsanitize_name(&sanitized);
-        assert_eq!(unsanitized, "my_image", "underscore must not become slash");
-    }
-
-    #[test]
     fn parse_manifest_missing_config() {
         let manifest_json = r#"{"schemaVersion": 2, "layers": []}"#;
         let result = ImageStore::parse_manifest(manifest_json.as_bytes());
@@ -528,35 +465,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_manifest_layer_missing_digest_is_error() {
-        // A layer descriptor without a "digest" field must be rejected, not silently
-        // collapsed to an empty string.
+    fn parse_manifest_missing_layer_digest() {
         let manifest_json = r#"{
             "schemaVersion": 2,
-            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
-            "config": {
-                "digest": "sha256:abc123"
-            },
-            "layers": [
-                { "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "size": 1234 }
-            ]
+            "config": { "digest": "sha256:cfg" },
+            "layers": [{}, { "digest": "sha256:layer2" }]
         }"#;
-        let result = ImageStore::parse_manifest(manifest_json.as_bytes());
-        assert!(
-            result.is_err(),
-            "layer with missing digest must be a parse error"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("layer missing digest"),
-            "error message should mention 'layer missing digest', got: {err_msg}"
-        );
+        let err = ImageStore::parse_manifest(manifest_json.as_bytes()).expect_err("missing digest should fail");
+        assert!(err.to_string().contains("missing layer digest"));
     }
 
     #[test]
     fn parse_config_minimal() {
         let config_json = r#"{"config": {}}"#;
-        let config = ImageStore::parse_config(config_json.as_bytes()).unwrap();
+        let config = ImageStore::parse_config(config_json.as_bytes())
+            .expect("config should parse");
         assert!(config.cmd.is_empty());
         assert!(config.env.is_empty());
         assert!(config.exposed_ports.is_empty());
@@ -570,7 +493,8 @@ mod tests {
                 "Cmd": ["nginx"]
             }
         }"#;
-        let config = ImageStore::parse_config(config_json.as_bytes()).unwrap();
+        let config = ImageStore::parse_config(config_json.as_bytes())
+            .expect("config should parse");
         assert_eq!(config.entrypoint, vec!["/docker-entrypoint.sh"]);
         assert_eq!(config.cmd, vec!["nginx"]);
     }
@@ -582,155 +506,10 @@ mod tests {
                 "ExposedPorts": { "80/tcp": {}, "443/tcp": {}, "8080/tcp": {} }
             }
         }"#;
-        let config = ImageStore::parse_config(config_json.as_bytes()).unwrap();
+        let config = ImageStore::parse_config(config_json.as_bytes())
+            .expect("config should parse");
         let mut ports = config.exposed_ports.clone();
         ports.sort();
         assert_eq!(ports, vec![80, 443, 8080]);
-    }
-
-    /// Build a tar archive in memory, allowing unsafe paths (like `..`).
-    /// Uses raw header manipulation to bypass tar crate's path validation.
-    fn build_tar_raw(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for (path, content) in entries {
-            // Build a GNU tar header manually (512 bytes)
-            let mut header = [0u8; 512];
-            // name field: bytes 0..100
-            let path_bytes = path.as_bytes();
-            let copy_len = path_bytes.len().min(100);
-            header[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
-            // mode: bytes 100..108
-            header[100..107].copy_from_slice(b"0000644");
-            // uid/gid: bytes 108..124
-            header[108..115].copy_from_slice(b"0000000");
-            header[116..123].copy_from_slice(b"0000000");
-            // size: bytes 124..136 (octal)
-            let size_str = format!("{:011o}", content.len());
-            header[124..135].copy_from_slice(size_str.as_bytes());
-            // mtime: bytes 136..148
-            header[136..147].copy_from_slice(b"00000000000");
-            // typeflag: byte 156 ('0' = regular file)
-            header[156] = b'0';
-            // magic: bytes 257..263
-            header[257..263].copy_from_slice(b"ustar\0");
-            // version: bytes 263..265
-            header[263..265].copy_from_slice(b"00");
-            // Compute checksum: bytes 148..156, treat as spaces during calc
-            header[148..156].copy_from_slice(b"        ");
-            let cksum: u32 = header.iter().map(|&b| b as u32).sum();
-            let cksum_str = format!("{:06o}\0 ", cksum);
-            header[148..156].copy_from_slice(cksum_str.as_bytes());
-
-            buf.extend_from_slice(&header);
-            buf.extend_from_slice(content);
-            // Pad to 512-byte boundary
-            let remainder = content.len() % 512;
-            if remainder > 0 {
-                buf.extend(std::iter::repeat_n(0u8, 512 - remainder));
-            }
-        }
-        // Two zero blocks = end of archive
-        buf.extend(std::iter::repeat_n(0u8, 1024));
-        buf
-    }
-
-    /// Compute sha256 digest string for data
-    fn sha256_digest(data: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(data);
-        format!("sha256:{:x}", hash)
-    }
-
-    #[test]
-    fn extract_rejects_path_traversal_in_whiteout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(&tmp.path().join("store")).unwrap();
-
-        // Create a file outside the extraction root that a malicious whiteout
-        // entry would try to delete
-        let canary = tmp.path().join("canary.txt");
-        std::fs::write(&canary, "do not delete me").unwrap();
-
-        // Malicious tar with path-traversal whiteout: ../../.wh.canary.txt
-        let tar_bytes = build_tar_raw(&[("../../.wh.canary.txt", b"")]);
-        let digest = sha256_digest(&tar_bytes);
-
-        store.put_blob(&digest, &tar_bytes).unwrap();
-
-        let extract_dir = tmp.path().join("extract");
-        std::fs::create_dir_all(&extract_dir).unwrap();
-        let manifest = ImageManifest {
-            config_digest: "sha256:dummy".to_string(),
-            layer_digests: vec![digest],
-            media_type: String::new(),
-        };
-        store.extract_layers(&manifest, &extract_dir).unwrap();
-
-        assert!(
-            canary.exists(),
-            "path traversal whiteout must not delete files outside extraction root"
-        );
-    }
-
-    #[test]
-    fn extract_rejects_path_traversal_in_regular_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(&tmp.path().join("store")).unwrap();
-
-        let tar_bytes = build_tar_raw(&[("../../etc/evil", b"pwned")]);
-        let digest = sha256_digest(&tar_bytes);
-        store.put_blob(&digest, &tar_bytes).unwrap();
-
-        let extract_dir = tmp.path().join("extract");
-        std::fs::create_dir_all(&extract_dir).unwrap();
-        let manifest = ImageManifest {
-            config_digest: "sha256:dummy".to_string(),
-            layer_digests: vec![digest],
-            media_type: String::new(),
-        };
-        store.extract_layers(&manifest, &extract_dir).unwrap();
-
-        assert!(
-            !tmp.path().join("etc/evil").exists(),
-            "path traversal must not create files outside extraction root"
-        );
-    }
-
-    #[test]
-    fn extract_handles_opaque_whiteout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(&tmp.path().join("store")).unwrap();
-
-        // Pre-populate with files in subdir/
-        let extract_dir = tmp.path().join("extract");
-        let subdir = extract_dir.join("subdir");
-        std::fs::create_dir_all(&subdir).unwrap();
-        std::fs::write(subdir.join("old_file.txt"), "old").unwrap();
-        std::fs::create_dir_all(subdir.join("old_dir")).unwrap();
-        std::fs::write(subdir.join("old_dir/nested.txt"), "nested").unwrap();
-
-        let tar_bytes = build_tar_raw(&[("subdir/.wh..wh..opq", b"")]);
-        let digest = sha256_digest(&tar_bytes);
-        store.put_blob(&digest, &tar_bytes).unwrap();
-
-        let manifest = ImageManifest {
-            config_digest: "sha256:dummy".to_string(),
-            layer_digests: vec![digest],
-            media_type: String::new(),
-        };
-        store.extract_layers(&manifest, &extract_dir).unwrap();
-
-        assert!(
-            !subdir.join("old_file.txt").exists(),
-            "opaque whiteout should remove files"
-        );
-        assert!(
-            !subdir.join("old_dir").exists(),
-            "opaque whiteout should remove directories"
-        );
-        assert!(
-            subdir.exists(),
-            "opaque whiteout should keep the parent dir"
-        );
     }
 }

@@ -8,7 +8,7 @@
 //! ```text
 //! VmDriver trait        ← Platform-agnostic VM lifecycle
 //!   ├── AppleVzDriver   ← macOS: Apple Virtualization.framework
-//!   └── CloudHvDriver   ← Linux: Cloud Hypervisor CLI
+//!   └── CloudHvDriver   ← Linux: Cloud Hypervisor REST API
 //!
 //! VmManager             ← Multi-VM orchestration (auto-selects driver)
 //! NetworkSwitch         ← L2 userspace Ethernet switch with MAC learning
@@ -25,6 +25,9 @@ pub mod setup;
 pub mod vm;
 
 // Re-exports for convenience
-pub use config::{NetworkAttachment, SharedDir, VmConfig, VmHandle, VmState, READY_MARKER};
+pub use config::{
+    NetworkAttachment, SharedDir, VmConfig, VmHandle, VmSocketEndpoint, VmState, VmmProcess,
+    READY_MARKER,
+};
 pub use driver::{VmDriver, VmError};
 pub use vm::VmManager;

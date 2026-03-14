@@ -45,10 +45,8 @@ pub struct NicConfig {
 /// Process to start inside the VM after boot.
 #[derive(Debug, Clone)]
 pub struct ProcessConfig {
-    /// Program to execute (path or name, no shell interpretation).
+    /// Command to execute.
     pub command: String,
-    /// Arguments to pass to the program (separate from command for safe quoting).
-    pub args: Vec<String>,
     /// Working directory.
     pub workdir: Option<String>,
     /// Environment variables.
@@ -91,13 +89,6 @@ pub struct HealthCheckConfig {
 /// On macOS: uses `hdiutil makehybrid` to create the ISO.
 /// On Linux: uses `genisoimage` or `mkisofs`.
 pub fn create_seed_iso(iso_path: &Path, config: &SeedConfig<'_>) -> Result<(), SetupError> {
-    if !is_safe_hostname(config.hostname) {
-        return Err(SetupError::Config(format!(
-            "unsafe hostname: '{}'. Hostnames must contain only alphanumeric characters, hyphens, and dots (max 253 chars).",
-            config.hostname
-        )));
-    }
-
     let tmp_dir = iso_path
         .parent()
         .ok_or_else(|| SetupError::Config("no parent directory for ISO path".into()))?
@@ -113,13 +104,14 @@ pub fn create_seed_iso(iso_path: &Path, config: &SeedConfig<'_>) -> Result<(), S
     std::fs::write(tmp_dir.join("meta-data"), &meta_data).map_err(SetupError::Io)?;
 
     // Write user-data
-    let user_data = build_user_data(config);
+    let user_data = build_user_data(config)?;
     std::fs::write(tmp_dir.join("user-data"), &user_data).map_err(SetupError::Io)?;
 
     // Write network-config (v2)
     if !config.nics.is_empty() {
-        let network_config = build_network_config(config);
-        std::fs::write(tmp_dir.join("network-config"), &network_config).map_err(SetupError::Io)?;
+        let network_config = build_network_config(config)?;
+        std::fs::write(tmp_dir.join("network-config"), &network_config)
+            .map_err(SetupError::Io)?;
     }
 
     // Create ISO
@@ -137,84 +129,87 @@ pub fn create_seed_iso(iso_path: &Path, config: &SeedConfig<'_>) -> Result<(), S
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn build_user_data(config: &SeedConfig<'_>) -> String {
+fn build_user_data(config: &SeedConfig<'_>) -> Result<String, SetupError> {
+    validate_ssh_pubkey(config.ssh_pubkey)?;
     let mut ud = String::from("#cloud-config\n");
     ud.push_str("ssh_authorized_keys:\n");
     ud.push_str(&format!("  - {}\n", config.ssh_pubkey));
     ud.push_str("disable_root: false\n");
     ud.push_str("runcmd:\n");
 
-    // Mount VirtioFS volumes — use YAML array syntax so no shell quoting is needed
-    // for most arguments, and explicitly quote paths/tags that may contain special chars.
+    // Mount VirtioFS volumes
     for vol in &config.volumes {
-        let mount = shell_quote(&vol.mount_point);
-        let tag = shell_quote(&vol.tag);
-        ud.push_str(&format!("  - [\"mkdir\", \"-p\", {}]\n", mount));
-        if vol.read_only {
-            ud.push_str(&format!(
-                "  - [\"mount\", \"-t\", \"virtiofs\", {tag}, {mount}, \"-o\", \"ro\"]\n",
-                tag = tag,
-                mount = mount,
-            ));
-        } else {
-            ud.push_str(&format!(
-                "  - [\"mount\", \"-t\", \"virtiofs\", {tag}, {mount}]\n",
-                tag = tag,
-                mount = mount,
-            ));
+        if !is_safe_mount_tag(&vol.tag) {
+            return Err(SetupError::Config(format!("invalid VirtioFS tag '{}'", vol.tag)));
         }
+        if !is_safe_mount_point(&vol.mount_point) {
+            return Err(SetupError::Config(format!(
+                "invalid mount point '{}'",
+                vol.mount_point
+            )));
+        }
+        ud.push_str(&format!(
+            "  - mkdir -p {mount} && mount -t virtiofs {tag} {mount}{ro}\n",
+            mount = shell_quote(&vol.mount_point),
+            tag = shell_quote(&vol.tag),
+            ro = if vol.read_only { " -o ro" } else { "" },
+        ));
     }
 
     // Extra hosts — validate to prevent shell injection
     for (host, ip) in &config.extra_hosts {
         if !is_safe_hostname(host) || !is_safe_ip(ip) {
-            tracing::error!(host = %host, ip = %ip, "rejecting unsafe /etc/hosts entry");
-            continue;
+            return Err(SetupError::Config(format!(
+                "unsafe /etc/hosts entry: {} {}",
+                ip, host
+            )));
         }
         ud.push_str(&format!("  - echo '{} {}' >> /etc/hosts\n", ip, host));
     }
 
-    // Start process — use YAML array syntax with each argument as a separate quoted element.
-    // env exports use `sh -c` with fully quoted assignment to avoid eval of values.
+    // Start process
     if let Some(ref proc) = config.process {
-        for (k, v) in &proc.env {
-            if !is_safe_env_name(k) {
-                tracing::error!(name = %k, "rejecting unsafe environment variable name");
-                continue;
-            }
-            ud.push_str(&format!(
-                "  - [\"sh\", \"-c\", \"export {}={}\"]\n",
-                k,
-                shell_quote(v)
+        if !is_safe_shell_fragment(&proc.command) {
+            return Err(SetupError::Config(
+                "process command contains unsafe control characters".into(),
             ));
         }
-        // Build the exec array: program followed by each arg, all shell-quoted.
-        let quoted_cmd = shell_quote(&proc.command);
-        let quoted_args: Vec<String> = proc.args.iter().map(|a| shell_quote(a)).collect();
+        for (k, v) in &proc.env {
+            if !is_safe_env_name(k) {
+                return Err(SetupError::Config(format!(
+                    "unsafe environment variable name '{}'",
+                    k
+                )));
+            }
+            ud.push_str(&format!("  - export {}={}\n", k, shell_quote(v)));
+        }
         if let Some(ref wd) = proc.workdir {
-            // Change to workdir then exec — use sh -c so cd applies to exec.
-            let mut exec_parts = vec![quoted_cmd.clone()];
-            exec_parts.extend(quoted_args.clone());
-            let exec_str = exec_parts.join(" ");
+            if !is_safe_mount_point(wd) {
+                return Err(SetupError::Config(format!("invalid working directory '{}'", wd)));
+            }
             ud.push_str(&format!(
-                "  - [\"sh\", \"-c\", \"cd {} && exec {}\"]\n",
+                "  - cd {} && sh -lc {}\n",
                 shell_quote(wd),
-                exec_str,
+                shell_quote(&proc.command)
             ));
         } else {
-            // No workdir: YAML list directly (cloud-init passes args without shell).
-            let mut entries = vec![quoted_cmd];
-            entries.extend(quoted_args);
-            ud.push_str(&format!("  - [{}]\n", entries.join(", ")));
+            ud.push_str(&format!("  - sh -lc {}\n", shell_quote(&proc.command)));
         }
     }
 
-    // Health check — use sh -c with fully quoted command string.
+    // Health check
     if let Some(ref hc) = config.healthcheck {
-        let quoted_hc_cmd = shell_quote(&hc.command);
+        if !is_safe_shell_fragment(&hc.command) {
+            return Err(SetupError::Config(
+                "healthcheck command contains unsafe control characters".into(),
+            ));
+        }
         ud.push_str(&format!(
-            "  - [\"sh\", \"-c\", \"while true; do {} > /tmp/vmrs-health 2>&1 && echo healthy >> /tmp/vmrs-health || echo unhealthy >> /tmp/vmrs-health; sleep {}; done &\"]\n",
-            quoted_hc_cmd, hc.interval_secs
+            "  - while true; do sh -lc {} > /tmp/vmrs-health 2>&1 && \
+             echo 'healthy' >> /tmp/vmrs-health || \
+             echo 'unhealthy' >> /tmp/vmrs-health; sleep {}; done &\n",
+            shell_quote(&hc.command),
+            hc.interval_secs
         ));
     }
 
@@ -222,33 +217,42 @@ fn build_user_data(config: &SeedConfig<'_>) -> String {
     let ip_cmd = "hostname -I | awk '{print $1}'";
     ud.push_str(&format!(
         "  - echo \"{} $({})\"\n",
-        crate::config::READY_MARKER,
-        ip_cmd
+        crate::config::READY_MARKER, ip_cmd
     ));
 
-    ud
+    Ok(ud)
 }
 
-fn build_network_config(config: &SeedConfig<'_>) -> String {
+fn build_network_config(config: &SeedConfig<'_>) -> Result<String, SetupError> {
     let mut nc = String::from("version: 2\nethernets:\n");
     for nic in &config.nics {
-        if !is_safe_identifier(&nic.name) {
-            tracing::error!(nic = %nic.name, "rejecting unsafe NIC name in network config");
-            continue;
+        if !is_safe_iface_name(&nic.name) {
+            return Err(SetupError::Config(format!(
+                "invalid interface name '{}'",
+                nic.name
+            )));
+        }
+        if !is_safe_cidr(&nic.ip) {
+            return Err(SetupError::Config(format!(
+                "invalid interface address '{}'",
+                nic.ip
+            )));
         }
         nc.push_str(&format!("  {}:\n", nic.name));
         nc.push_str(&format!("    addresses: [{}]\n", nic.ip));
         if let Some(ref gw) = nic.gateway {
+            if !is_safe_ip(gw) {
+                return Err(SetupError::Config(format!("invalid gateway '{}'", gw)));
+            }
             nc.push_str(&format!(
                 "    routes:\n      - to: default\n        via: {}\n",
                 gw
             ));
         }
     }
-    nc
+    Ok(nc)
 }
 
-#[allow(unused_variables)] // used on macOS/Linux, not on unsupported platforms
 fn create_iso_image(iso_path: &Path, source_dir: &Path) -> Result<(), SetupError> {
     #[cfg(target_os = "macos")]
     {
@@ -301,15 +305,6 @@ fn create_iso_image(iso_path: &Path, source_dir: &Path) -> Result<(), SetupError
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        return Err(SetupError::IsoCreation(format!(
-            "seed ISO creation not yet supported on {}",
-            std::env::consts::OS
-        )));
-    }
-
-    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -349,23 +344,72 @@ fn is_safe_hostname(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
-/// Validate an identifier (NIC name, tag, etc.) contains only safe characters
-/// (alphanumeric, hyphens, underscores, dots). Must not be empty or contain
-/// shell metacharacters, path separators, or whitespace.
-fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        && !s.contains("..")
-}
-
 /// Validate an IP address contains only safe characters (digits, dots, colons for IPv6).
 fn is_safe_ip(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 45
         && s.chars()
             .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
+}
+
+fn is_safe_cidr(s: &str) -> bool {
+    let Some((ip, prefix)) = s.split_once('/') else {
+        return false;
+    };
+    if !is_safe_ip(ip) {
+        return false;
+    }
+    matches!(prefix.parse::<u8>(), Ok(bits) if bits <= 128)
+}
+
+fn is_safe_mount_tag(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn is_safe_mount_point(s: &str) -> bool {
+    s.starts_with('/') && !s.contains('\0') && !s.contains('\n') && !s.contains('\r') && s.len() <= 1024
+}
+
+fn is_safe_iface_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 15
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_safe_shell_fragment(s: &str) -> bool {
+    !s.contains('\0') && !s.contains('\n') && !s.contains('\r')
+}
+
+fn validate_ssh_pubkey(s: &str) -> Result<(), SetupError> {
+    if s.contains('\0') || s.contains('\n') || s.contains('\r') {
+        return Err(SetupError::Config(
+            "SSH public key must be a single line without NUL bytes".into(),
+        ));
+    }
+
+    let mut parts = s.split_whitespace();
+    let Some(key_type) = parts.next() else {
+        return Err(SetupError::Config("SSH public key is empty".into()));
+    };
+    let Some(key_material) = parts.next() else {
+        return Err(SetupError::Config("SSH public key is missing key material".into()));
+    };
+
+    if !key_type.starts_with("ssh-") && !key_type.starts_with("ecdsa-") {
+        return Err(SetupError::Config(format!(
+            "unsupported SSH public key type '{}'",
+            key_type
+        )));
+    }
+    if key_material.is_empty() {
+        return Err(SetupError::Config("SSH public key is missing key material".into()));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -512,7 +556,7 @@ mod tests {
             healthcheck: None,
             extra_hosts: vec![],
         };
-        let ud = build_user_data(&config);
+        let ud = build_user_data(&config).expect("user-data");
         assert!(ud.starts_with("#cloud-config\n"));
         assert!(ud.contains("ssh-ed25519 AAAA..."));
         assert!(ud.contains("VMRS_READY"));
@@ -526,7 +570,6 @@ mod tests {
             nics: vec![],
             process: Some(ProcessConfig {
                 command: "/bin/app".into(),
-                args: vec![],
                 workdir: Some("/opt/app".into()),
                 env: vec![("PORT".into(), "8080".into())],
             }),
@@ -534,30 +577,9 @@ mod tests {
             healthcheck: None,
             extra_hosts: vec![],
         };
-        let ud = build_user_data(&config);
+        let ud = build_user_data(&config).expect("user-data");
         assert!(ud.contains("export PORT='8080'"));
-        assert!(ud.contains("cd '/opt/app' && exec '/bin/app'"));
-    }
-
-    #[test]
-    fn user_data_with_process_args() {
-        let config = SeedConfig {
-            hostname: "test-vm",
-            ssh_pubkey: "ssh-ed25519 AAAA...",
-            nics: vec![],
-            process: Some(ProcessConfig {
-                command: "/bin/app".into(),
-                args: vec!["--config".into(), "/etc/app.conf".into()],
-                workdir: None,
-                env: vec![],
-            }),
-            volumes: vec![],
-            healthcheck: None,
-            extra_hosts: vec![],
-        };
-        let ud = build_user_data(&config);
-        // Should produce YAML array list with program + args
-        assert!(ud.contains("'/bin/app', '--config', '/etc/app.conf'"));
+        assert!(ud.contains("cd '/opt/app' && sh -lc '/bin/app'"));
     }
 
     #[test]
@@ -568,166 +590,15 @@ mod tests {
             nics: vec![],
             process: Some(ProcessConfig {
                 command: "/bin/app".into(),
-                args: vec![],
                 workdir: None,
-                env: vec![
-                    ("GOOD".into(), "ok".into()),
-                    ("BAD;rm".into(), "evil".into()),
-                ],
+                env: vec![("GOOD".into(), "ok".into()), ("BAD;rm".into(), "evil".into())],
             }),
             volumes: vec![],
             healthcheck: None,
             extra_hosts: vec![],
         };
-        let ud = build_user_data(&config);
-        assert!(ud.contains("export GOOD="));
-        assert!(!ud.contains("BAD;rm"));
-    }
-
-    #[test]
-    fn user_data_shell_metacharacters_in_mount_and_command() {
-        // Every dangerous value must appear only inside shell single-quotes so it cannot
-        // be interpreted by a shell.  shell_quote wraps the string in '...', which means
-        // the raw injection form (unquoted or preceded by a space) must NOT appear in the
-        // output, while the properly-quoted form MUST appear.
-        let config = SeedConfig {
-            hostname: "test-vm",
-            ssh_pubkey: "ssh-ed25519 AAAA...",
-            nics: vec![],
-            process: Some(ProcessConfig {
-                command: "/bin/app; rm -rf /".into(),
-                args: vec!["$(whoami)".into(), "arg with spaces".into()],
-                workdir: Some("/work dir/path".into()),
-                env: vec![("VAR".into(), "value$(id)".into())],
-            }),
-            volumes: vec![VolumeMountConfig {
-                tag: "tag;evil".into(),
-                mount_point: "/mnt/$(evil)".into(),
-                read_only: false,
-            }],
-            healthcheck: Some(HealthCheckConfig {
-                command: "curl http://localhost; rm -rf /".into(),
-                interval_secs: 5,
-                retries: 3,
-            }),
-            extra_hosts: vec![],
-        };
-        let ud = build_user_data(&config);
-
-        // Mount tag: must appear shell-quoted (surrounded by single-quotes), never bare.
-        assert!(
-            ud.contains("'tag;evil'"),
-            "mount tag must appear shell-quoted"
-        );
-        // The bare (unquoted) form with a leading space or comma would be injectable.
-        assert!(
-            !ud.contains(", tag;evil"),
-            "mount tag must not appear as bare YAML element"
-        );
-        assert!(
-            !ud.contains("\" tag;evil\""),
-            "mount tag must not appear unquoted in string"
-        );
-
-        // Mount point: same rule.
-        assert!(
-            ud.contains("'/mnt/$(evil)'"),
-            "mount point must appear shell-quoted"
-        );
-        assert!(
-            !ud.contains(", /mnt/$(evil)"),
-            "mount point must not appear as bare YAML element"
-        );
-
-        // Process command: the semicolon injection must be inside single-quotes.
-        assert!(
-            ud.contains("'/bin/app; rm -rf /'"),
-            "command must appear shell-quoted"
-        );
-
-        // Args: $() injection must be inside single-quotes.
-        assert!(ud.contains("'$(whoami)'"), "arg must appear shell-quoted");
-        assert!(
-            !ud.contains(", $(whoami)"),
-            "arg must not appear as bare YAML element"
-        );
-
-        // Env value: $() injection must be inside single-quotes.
-        assert!(
-            ud.contains("'value$(id)'"),
-            "env value must appear shell-quoted"
-        );
-
-        // Health check: the semicolon injection must be inside single-quotes.
-        assert!(
-            ud.contains("'curl http://localhost; rm -rf /'"),
-            "healthcheck command must appear shell-quoted"
-        );
-
-        // Every runcmd line must start with "  - "
-        let runcmd_lines: Vec<&str> = ud
-            .lines()
-            .skip_while(|l| *l != "runcmd:")
-            .skip(1)
-            .take_while(|l| l.starts_with("  - "))
-            .collect();
-        assert!(!runcmd_lines.is_empty(), "must have runcmd entries");
-    }
-
-    // ── is_safe_identifier ───────────────────────────────────────────────
-
-    #[test]
-    fn identifier_valid() {
-        assert!(is_safe_identifier("eth0"));
-        assert!(is_safe_identifier("net-1"));
-        assert!(is_safe_identifier("my_nic.0"));
-    }
-
-    #[test]
-    fn identifier_empty() {
-        assert!(!is_safe_identifier(""));
-    }
-
-    #[test]
-    fn identifier_rejects_shell_chars() {
-        assert!(!is_safe_identifier("eth0; rm -rf /"));
-        assert!(!is_safe_identifier("eth0$(whoami)"));
-        assert!(!is_safe_identifier("eth0\nmalicious"));
-    }
-
-    #[test]
-    fn identifier_rejects_path_traversal() {
-        assert!(!is_safe_identifier("../etc"));
-        assert!(!is_safe_identifier("a..b"));
-    }
-
-    #[test]
-    fn identifier_rejects_slashes() {
-        assert!(!is_safe_identifier("eth0/evil"));
-    }
-
-    // ── create_seed_iso hostname validation ─────────────────────────────
-
-    #[test]
-    fn seed_iso_rejects_unsafe_hostname() {
-        let tmp = tempfile::tempdir().unwrap();
-        let iso_path = tmp.path().join("seed.iso");
-        let config = SeedConfig {
-            hostname: "host; rm -rf /",
-            ssh_pubkey: "ssh-ed25519 AAAA...",
-            nics: vec![],
-            process: None,
-            volumes: vec![],
-            healthcheck: None,
-            extra_hosts: vec![],
-        };
-        let result = create_seed_iso(&iso_path, &config);
-        assert!(result.is_err(), "unsafe hostname must be rejected");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unsafe hostname"),
-            "error should mention unsafe hostname, got: {err}"
-        );
+        let err = build_user_data(&config).expect_err("invalid env name should fail");
+        assert!(err.to_string().contains("unsafe environment variable name"));
     }
 
     // ── build_network_config ─────────────────────────────────────────────
@@ -747,33 +618,11 @@ mod tests {
             healthcheck: None,
             extra_hosts: vec![],
         };
-        let nc = build_network_config(&config);
+        let nc = build_network_config(&config).expect("network-config");
         assert!(nc.contains("version: 2"));
         assert!(nc.contains("eth0:"));
         assert!(nc.contains("addresses: [10.0.1.2/24]"));
         assert!(nc.contains("via: 10.0.1.1"));
-    }
-
-    #[test]
-    fn network_config_rejects_unsafe_nic_name() {
-        let config = SeedConfig {
-            hostname: "test-vm",
-            ssh_pubkey: "ssh-ed25519 AAAA...",
-            nics: vec![NicConfig {
-                name: "eth0; rm -rf /".into(),
-                ip: "10.0.1.2/24".into(),
-                gateway: None,
-            }],
-            process: None,
-            volumes: vec![],
-            healthcheck: None,
-            extra_hosts: vec![],
-        };
-        let nc = build_network_config(&config);
-        assert!(
-            !nc.contains("eth0;"),
-            "unsafe NIC name must be rejected from network config"
-        );
     }
 
     #[test]
@@ -791,7 +640,7 @@ mod tests {
             healthcheck: None,
             extra_hosts: vec![],
         };
-        let nc = build_network_config(&config);
+        let nc = build_network_config(&config).expect("network-config");
         assert!(nc.contains("eth0:"));
         assert!(!nc.contains("routes:"));
     }

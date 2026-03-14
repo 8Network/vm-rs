@@ -2,11 +2,8 @@
 name = "vm-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Cross-platform VM lifecycle management — Apple VZ (macOS), Cloud Hypervisor (Linux), WHP (Windows)"
+description = "Cross-platform VM lifecycle management — Apple Virtualization.framework (macOS) + Cloud Hypervisor (Linux)"
 license = "MIT"
-repository = "https://github.com/8Network/vm-rs"
-homepage = "https://github.com/8Network/vm-rs"
-readme = "README.md"
 keywords = ["virtualization", "vm", "apple-vz", "cloud-hypervisor", "microvm"]
 categories = ["virtualization", "os"]
 
@@ -40,21 +37,16 @@ sha2 = "0.10"
 # Tar archive (OCI layer extraction)
 tar = "0.4"
 
+# Process management + Unix primitives
+libc = "0.2"
+
 # Progress reporting (asset downloads)
 indicatif = "0.17"
-
-# Unix: process signals, socketpairs, poll
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 # macOS: Apple Virtualization.framework (FFI absorbed from virtualization-rs)
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"
 objc = "0.2"
-
-# Windows: Windows Hypervisor Platform (WHP) — same hypervisor as WSL2/Docker Desktop
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = ["Win32_System_Hypervisor", "Win32_System_Memory", "Win32_Foundation"] }
 
 [dev-dependencies]
 tempfile = "3"

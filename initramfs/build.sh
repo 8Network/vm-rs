@@ -54,7 +54,6 @@ if [ -f "$ALPINE_INITRAMFS" ]; then
 
     cd "$WORK_DIR"
     zcat "$ALPINE_INITRAMFS" | cpio -id \
-        "lib/modules/$KVER/kernel/net/packet/af_packet.ko.gz" \
         "lib/modules/$KVER/kernel/drivers/net/virtio_net.ko.gz" \
         "lib/modules/$KVER/kernel/drivers/net/net_failover.ko.gz" \
         "lib/modules/$KVER/kernel/net/core/failover.ko.gz" \

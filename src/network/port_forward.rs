@@ -13,6 +13,8 @@ use tokio::sync::Notify;
 pub struct PortForwarder {
     stop: Arc<Notify>,
     handle: tokio::task::JoinHandle<()>,
+    /// The host address being listened on.
+    pub bind_addr: SocketAddr,
     /// The host port being listened on.
     pub host_port: u16,
     /// The target address (VM IP + port).
@@ -20,22 +22,37 @@ pub struct PortForwarder {
 }
 
 impl PortForwarder {
-    /// Start forwarding `host_port` on 0.0.0.0 to `target_ip:target_port`.
+    /// Start forwarding `host_port` on loopback to `target_ip:target_port`.
     pub async fn start(
         host_port: u16,
         target_ip: &str,
         target_port: u16,
     ) -> Result<Self, PortForwardError> {
+        Self::start_on("127.0.0.1", host_port, target_ip, target_port).await
+    }
+
+    /// Start forwarding `host_port` on a specific host bind address.
+    pub async fn start_on(
+        bind_ip: &str,
+        host_port: u16,
+        target_ip: &str,
+        target_port: u16,
+    ) -> Result<Self, PortForwardError> {
+        let bind_addr: SocketAddr = format!("{}:{}", bind_ip, host_port)
+            .parse()
+            .map_err(|e| PortForwardError::InvalidBindAddress(format!("{}", e)))?;
         let target: SocketAddr = format!("{}:{}", target_ip, target_port)
             .parse()
             .map_err(|e| PortForwardError::InvalidTarget(format!("{}", e)))?;
 
-        let listener = TcpListener::bind(("0.0.0.0", host_port))
+        let listener = TcpListener::bind(bind_addr)
             .await
             .map_err(|e| PortForwardError::BindFailed {
-                port: host_port,
+                address: bind_addr,
                 detail: format!("{}", e),
             })?;
+
+        tracing::info!(bind = %bind_addr, target = %target, "port forwarder started");
 
         let stop = Arc::new(Notify::new());
         let stop_clone = Arc::clone(&stop);
@@ -64,6 +81,7 @@ impl PortForwarder {
         Ok(PortForwarder {
             stop,
             handle,
+            bind_addr,
             host_port,
             target,
         })
@@ -103,9 +121,12 @@ async fn proxy(mut client: TcpStream, target: SocketAddr) {
 /// Port forwarding errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PortForwardError {
+    #[error("invalid bind address: {0}")]
+    InvalidBindAddress(String),
+
     #[error("invalid target address: {0}")]
     InvalidTarget(String),
 
-    #[error("cannot bind port {port}: {detail}")]
-    BindFailed { port: u16, detail: String },
+    #[error("cannot bind {address}: {detail}")]
+    BindFailed { address: SocketAddr, detail: String },
 }
