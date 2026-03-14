@@ -27,14 +27,11 @@ pub fn data_dir() -> Result<PathBuf, SetupError> {
     if let Ok(dir) = std::env::var("VMRS_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| {
-            SetupError::Config(
-                "HOME/USERPROFILE environment variable not set. Set VMRS_DATA_DIR explicitly."
-                    .into(),
-            )
-        })?;
+    let home = std::env::var("HOME").map_err(|_| {
+        SetupError::Config(
+            "HOME environment variable not set. Set VMRS_DATA_DIR explicitly.".into(),
+        )
+    })?;
     Ok(PathBuf::from(home).join(".vm-rs"))
 }
 

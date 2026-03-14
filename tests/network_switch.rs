@@ -3,6 +3,8 @@
 //! These tests exercise the actual socketpair-based forwarding loop
 //! with real Ethernet frames. No VM needed — just Unix sockets.
 
+use std::os::fd::AsRawFd;
+
 use vm_rs::network::NetworkSwitch;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -17,16 +19,23 @@ fn build_frame(dst: [u8; 6], src: [u8; 6], payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-fn send_raw(fd: i32, data: &[u8]) -> isize {
+fn send_raw(fd: &impl AsRawFd, data: &[u8]) -> isize {
     // SAFETY: Sending to our own socketpair fd.
-    unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), 0) }
+    unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            data.as_ptr() as *const libc::c_void,
+            data.len(),
+            0,
+        )
+    }
 }
 
-fn recv_raw(fd: i32, buf: &mut [u8]) -> isize {
+fn recv_raw(fd: &impl AsRawFd, buf: &mut [u8]) -> isize {
     // SAFETY: Reading from our own socketpair fd.
     unsafe {
         libc::recv(
-            fd,
+            fd.as_raw_fd(),
             buf.as_mut_ptr() as *mut libc::c_void,
             buf.len(),
             libc::MSG_DONTWAIT,
@@ -45,23 +54,23 @@ const MAC_C: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x03];
 #[test]
 fn broadcast_floods_to_all_ports_on_same_network() {
     let switch = NetworkSwitch::new();
-    let fd_a = switch.add_port("net0", "a").unwrap();
-    let fd_b = switch.add_port("net0", "b").unwrap();
-    let fd_c = switch.add_port("net0", "c").unwrap();
-    switch.start().unwrap();
+    let fd_a = switch.add_port("net0", "a").expect("add port a");
+    let fd_b = switch.add_port("net0", "b").expect("add port b");
+    let fd_c = switch.add_port("net0", "c").expect("add port c");
+    switch.start().expect("start switch");
 
     let frame = build_frame(BROADCAST, MAC_A, b"hello");
-    assert_eq!(send_raw(fd_a, &frame), frame.len() as isize);
+    assert_eq!(send_raw(&fd_a, &frame), frame.len() as isize);
 
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut buf = vec![0u8; 1518];
 
     // Both B and C should receive
-    let n_b = recv_raw(fd_b, &mut buf);
+    let n_b = recv_raw(&fd_b, &mut buf);
     assert_eq!(n_b, frame.len() as isize, "port B should receive broadcast");
 
-    let n_c = recv_raw(fd_c, &mut buf);
+    let n_c = recv_raw(&fd_c, &mut buf);
     assert_eq!(n_c, frame.len() as isize, "port C should receive broadcast");
 
     switch.stop();
@@ -72,35 +81,31 @@ fn broadcast_floods_to_all_ports_on_same_network() {
 #[test]
 fn unicast_to_learned_mac() {
     let switch = NetworkSwitch::new();
-    let fd_a = switch.add_port("net0", "a").unwrap();
-    let fd_b = switch.add_port("net0", "b").unwrap();
-    let fd_c = switch.add_port("net0", "c").unwrap();
-    switch.start().unwrap();
+    let fd_a = switch.add_port("net0", "a").expect("add port a");
+    let fd_b = switch.add_port("net0", "b").expect("add port b");
+    let fd_c = switch.add_port("net0", "c").expect("add port c");
+    switch.start().expect("start switch");
 
     // Step 1: B sends a broadcast → switch learns MAC_B is on port B
     let frame_from_b = build_frame(BROADCAST, MAC_B, b"learn-me");
-    send_raw(fd_b, &frame_from_b);
+    send_raw(&fd_b, &frame_from_b);
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Drain broadcast from A and C
     let mut buf = vec![0u8; 1518];
-    recv_raw(fd_a, &mut buf);
-    recv_raw(fd_c, &mut buf);
+    recv_raw(&fd_a, &mut buf);
+    recv_raw(&fd_c, &mut buf);
 
     // Step 2: A sends unicast to MAC_B → should ONLY go to B, not C
     let unicast = build_frame(MAC_B, MAC_A, b"just-for-b");
-    send_raw(fd_a, &unicast);
+    send_raw(&fd_a, &unicast);
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let n_b = recv_raw(fd_b, &mut buf);
+    let n_b = recv_raw(&fd_b, &mut buf);
     assert_eq!(n_b, unicast.len() as isize, "B should receive unicast");
 
-    let n_c = recv_raw(fd_c, &mut buf);
-    assert!(
-        n_c <= 0,
-        "C should NOT receive unicast destined for B, got {} bytes",
-        n_c
-    );
+    let n_c = recv_raw(&fd_c, &mut buf);
+    assert!(n_c <= 0, "C should NOT receive unicast destined for B, got {} bytes", n_c);
 
     switch.stop();
 }
@@ -110,21 +115,18 @@ fn unicast_to_learned_mac() {
 #[test]
 fn different_networks_are_isolated() {
     let switch = NetworkSwitch::new();
-    let fd_frontend = switch.add_port("frontend", "web").unwrap();
-    let fd_backend = switch.add_port("backend", "db").unwrap();
-    switch.start().unwrap();
+    let fd_frontend = switch.add_port("frontend", "web").expect("add frontend port");
+    let fd_backend = switch.add_port("backend", "db").expect("add backend port");
+    switch.start().expect("start switch");
 
     let frame = build_frame(BROADCAST, MAC_A, b"secret-data");
-    send_raw(fd_frontend, &frame);
+    send_raw(&fd_frontend, &frame);
 
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut buf = vec![0u8; 1518];
-    let n = recv_raw(fd_backend, &mut buf);
-    assert!(
-        n <= 0,
-        "backend network should NOT receive frames from frontend network"
-    );
+    let n = recv_raw(&fd_backend, &mut buf);
+    assert!(n <= 0, "backend network should NOT receive frames from frontend network");
 
     switch.stop();
 }
@@ -134,17 +136,17 @@ fn different_networks_are_isolated() {
 #[test]
 fn broadcast_does_not_echo_back_to_sender() {
     let switch = NetworkSwitch::new();
-    let fd_a = switch.add_port("net0", "a").unwrap();
-    let _fd_b = switch.add_port("net0", "b").unwrap();
-    switch.start().unwrap();
+    let fd_a = switch.add_port("net0", "a").expect("add port a");
+    let _fd_b = switch.add_port("net0", "b").expect("add port b");
+    switch.start().expect("start switch");
 
     let frame = build_frame(BROADCAST, MAC_A, b"data");
-    send_raw(fd_a, &frame);
+    send_raw(&fd_a, &frame);
 
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut buf = vec![0u8; 1518];
-    let n = recv_raw(fd_a, &mut buf);
+    let n = recv_raw(&fd_a, &mut buf);
     assert!(n <= 0, "sender should NOT receive its own broadcast back");
 
     switch.stop();
@@ -155,18 +157,18 @@ fn broadcast_does_not_echo_back_to_sender() {
 #[test]
 fn runt_frames_are_dropped() {
     let switch = NetworkSwitch::new();
-    let fd_a = switch.add_port("net0", "a").unwrap();
-    let fd_b = switch.add_port("net0", "b").unwrap();
-    switch.start().unwrap();
+    let fd_a = switch.add_port("net0", "a").expect("add port a");
+    let fd_b = switch.add_port("net0", "b").expect("add port b");
+    switch.start().expect("start switch");
 
     // Send a frame smaller than 14 bytes (minimum Ethernet)
     let runt = vec![0xff; 10];
-    send_raw(fd_a, &runt);
+    send_raw(&fd_a, &runt);
 
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut buf = vec![0u8; 1518];
-    let n = recv_raw(fd_b, &mut buf);
+    let n = recv_raw(&fd_b, &mut buf);
     assert!(n <= 0, "runt frame should be dropped, not forwarded");
 
     switch.stop();
@@ -177,16 +179,16 @@ fn runt_frames_are_dropped() {
 #[test]
 fn handles_burst_of_frames() {
     let switch = NetworkSwitch::new();
-    let fd_a = switch.add_port("net0", "a").unwrap();
-    let fd_b = switch.add_port("net0", "b").unwrap();
-    switch.start().unwrap();
+    let fd_a = switch.add_port("net0", "a").expect("add port a");
+    let fd_b = switch.add_port("net0", "b").expect("add port b");
+    switch.start().expect("start switch");
 
     // First: B sends a broadcast so switch learns MAC_B
     let learn = build_frame(BROADCAST, MAC_B, b"learn");
-    send_raw(fd_b, &learn);
+    send_raw(&fd_b, &learn);
     std::thread::sleep(std::time::Duration::from_millis(100));
     let mut drain = vec![0u8; 1518];
-    recv_raw(fd_a, &mut drain); // drain the flood
+    recv_raw(&fd_a, &mut drain); // drain the flood
 
     // Send frames one at a time with a pause to let the poll loop process.
     // The switch uses poll(2) with 50ms timeout per iteration and acquires
@@ -195,7 +197,7 @@ fn handles_burst_of_frames() {
     let frame = build_frame(MAC_B, MAC_A, &[0xAA; 100]);
     let count = 10;
     for _ in 0..count {
-        send_raw(fd_a, &frame);
+        send_raw(&fd_a, &frame);
         std::thread::sleep(std::time::Duration::from_millis(60));
     }
 
@@ -205,7 +207,7 @@ fn handles_burst_of_frames() {
     let mut received = 0;
     let mut buf = vec![0u8; 1518];
     loop {
-        let n = recv_raw(fd_b, &mut buf);
+        let n = recv_raw(&fd_b, &mut buf);
         if n <= 0 {
             break;
         }
@@ -229,41 +231,33 @@ fn handles_burst_of_frames() {
 fn multiple_networks_operate_independently() {
     let switch = NetworkSwitch::new();
 
-    let fd_a1 = switch.add_port("net-a", "a1").unwrap();
-    let fd_a2 = switch.add_port("net-a", "a2").unwrap();
-    let fd_b1 = switch.add_port("net-b", "b1").unwrap();
-    let fd_b2 = switch.add_port("net-b", "b2").unwrap();
-    switch.start().unwrap();
+    let fd_a1 = switch.add_port("net-a", "a1").expect("add net-a port a1");
+    let fd_a2 = switch.add_port("net-a", "a2").expect("add net-a port a2");
+    let fd_b1 = switch.add_port("net-b", "b1").expect("add net-b port b1");
+    let fd_b2 = switch.add_port("net-b", "b2").expect("add net-b port b2");
+    switch.start().expect("start switch");
 
     // Send on both networks simultaneously
     let frame_a = build_frame(BROADCAST, MAC_A, b"net-a-data");
     let frame_b = build_frame(BROADCAST, MAC_B, b"net-b-data");
 
-    send_raw(fd_a1, &frame_a);
-    send_raw(fd_b1, &frame_b);
+    send_raw(&fd_a1, &frame_a);
+    send_raw(&fd_b1, &frame_b);
 
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut buf = vec![0u8; 1518];
 
     // net-a: a2 should receive frame_a
-    let n = recv_raw(fd_a2, &mut buf);
-    assert_eq!(
-        n,
-        frame_a.len() as isize,
-        "a2 should receive net-a broadcast"
-    );
+    let n = recv_raw(&fd_a2, &mut buf);
+    assert_eq!(n, frame_a.len() as isize, "a2 should receive net-a broadcast");
 
     // net-b: b2 should receive frame_b
-    let n = recv_raw(fd_b2, &mut buf);
-    assert_eq!(
-        n,
-        frame_b.len() as isize,
-        "b2 should receive net-b broadcast"
-    );
+    let n = recv_raw(&fd_b2, &mut buf);
+    assert_eq!(n, frame_b.len() as isize, "b2 should receive net-b broadcast");
 
     // Cross-check: a2 should NOT get net-b's frame
-    let n = recv_raw(fd_a2, &mut buf);
+    let n = recv_raw(&fd_a2, &mut buf);
     assert!(n <= 0, "net-a should not receive net-b frames");
 
     switch.stop();
@@ -274,16 +268,16 @@ fn multiple_networks_operate_independently() {
 #[test]
 fn switch_restart() {
     let switch = NetworkSwitch::new();
-    let fd_a = switch.add_port("net0", "a").unwrap();
-    let fd_b = switch.add_port("net0", "b").unwrap();
+    let fd_a = switch.add_port("net0", "a").expect("add port a");
+    let fd_b = switch.add_port("net0", "b").expect("add port b");
 
     // First run
-    switch.start().unwrap();
+    switch.start().expect("start switch");
     let frame = build_frame(BROADCAST, MAC_A, b"first");
-    send_raw(fd_a, &frame);
+    send_raw(&fd_a, &frame);
     std::thread::sleep(std::time::Duration::from_millis(200));
     let mut buf = vec![0u8; 1518];
-    let n = recv_raw(fd_b, &mut buf);
+    let n = recv_raw(&fd_b, &mut buf);
     assert_eq!(n, frame.len() as isize);
 
     // Stop
@@ -291,11 +285,11 @@ fn switch_restart() {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Restart
-    switch.start().unwrap();
+    switch.start().expect("restart switch");
     let frame2 = build_frame(BROADCAST, MAC_A, b"second");
-    send_raw(fd_a, &frame2);
+    send_raw(&fd_a, &frame2);
     std::thread::sleep(std::time::Duration::from_millis(200));
-    let n = recv_raw(fd_b, &mut buf);
+    let n = recv_raw(&fd_b, &mut buf);
     assert_eq!(n, frame2.len() as isize, "switch should work after restart");
 
     switch.stop();

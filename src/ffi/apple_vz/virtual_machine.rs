@@ -1,15 +1,14 @@
 //! virtual machine module
 
 use super::{
-    base::{Id, NSArray, NSError, NIL, NSURL},
+    base::{Id, NIL, NSArray, NSError},
     boot_loader::VZBootLoader,
     entropy_device::VZEntropyDeviceConfiguration,
     memory_device::VZMemoryBalloonDeviceConfiguration,
     network_device::VZNetworkDeviceConfiguration,
-    platform::VZPlatformConfiguration,
     serial_port::VZSerialPortConfiguration,
     shared_directory::VZDirectorySharingDeviceConfiguration,
-    socket_device::{VZSocketDeviceConfiguration, VZVirtioSocketDevice},
+    socket_device::VZSocketDeviceConfiguration,
     storage_device::VZStorageDeviceConfiguration,
 };
 
@@ -36,12 +35,6 @@ use objc::{rc::StrongPtr, runtime::YES};
 /// ```
 pub struct VZVirtualMachineConfigurationBuilder {
     conf: VZVirtualMachineConfiguration,
-}
-
-impl Default for VZVirtualMachineConfigurationBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl VZVirtualMachineConfigurationBuilder {
@@ -119,13 +112,14 @@ impl VZVirtualMachineConfigurationBuilder {
         self
     }
 
-    pub fn platform<T: VZPlatformConfiguration>(mut self, platform: T) -> Self {
-        self.conf.set_platform(platform);
-        self
-    }
-
     pub fn build(self) -> VZVirtualMachineConfiguration {
         self.conf
+    }
+}
+
+impl Default for VZVirtualMachineConfigurationBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -220,12 +214,6 @@ impl VZVirtualMachineConfiguration {
         }
     }
 
-    fn set_platform<T: VZPlatformConfiguration>(&mut self, platform: T) {
-        unsafe {
-            let _: () = msg_send![*self.0, setPlatform:platform.id()];
-        }
-    }
-
     pub fn validate_with_error(&self) -> Result<BOOL, NSError> {
         unsafe {
             let mut error: Id = NIL;
@@ -249,7 +237,7 @@ unsafe impl Send for VZVirtualMachine {}
 unsafe impl Sync for VZVirtualMachine {}
 
 /// state of virtual machine
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VZVirtualMachineState {
     /// Initial state before the virtual machine is started.
     VZVirtualMachineStateStopped,
@@ -292,7 +280,9 @@ impl VZVirtualMachine {
     }
 
     /// # Safety
-    /// Must be called from the same dispatch queue that started the VM.
+    ///
+    /// The underlying Objective-C `VZVirtualMachine` must still be valid and
+    /// owned for the duration of the call.
     pub unsafe fn request_stop_with_error(&mut self) -> Result<bool, NSError> {
         let mut error: Id = NIL;
         let ret: BOOL = msg_send![*self.0, requestStopWithError: &mut error];
@@ -310,18 +300,10 @@ impl VZVirtualMachine {
         }
     }
 
-    /// Force-stop the VM (macOS 14+). Calls `-[VZVirtualMachine stopWithCompletionHandler:]`.
+    /// # Safety
     ///
-    /// # Safety
-    /// Must be called from the same dispatch queue that started the VM.
-    pub fn stop_with_completion_handler(&self, completion_handler: &Block<(Id,), ()>) {
-        unsafe {
-            let _: Id = msg_send![*self.0, stopWithCompletionHandler: completion_handler];
-        }
-    }
-
-    /// # Safety
-    /// Must be called from the same dispatch queue that owns the VM.
+    /// The underlying Objective-C `VZVirtualMachine` must still be valid and
+    /// owned for the duration of the call.
     pub unsafe fn state(&self) -> VZVirtualMachineState {
         let n: isize = msg_send![*self.0, state];
         match n {
@@ -334,109 +316,5 @@ impl VZVirtualMachine {
             6 => VZVirtualMachineState::VZVirtualMachineStateResuming,
             _ => VZVirtualMachineState::Other,
         }
-    }
-
-    // ─── Pause / Resume (macOS 11+) ────────────────────────────────────
-
-    /// Check if the VM can be paused in its current state.
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub unsafe fn can_pause(&self) -> bool {
-        let b: BOOL = msg_send![*self.0, canPause];
-        b == YES
-    }
-
-    /// Check if the VM can be resumed in its current state.
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub unsafe fn can_resume(&self) -> bool {
-        let b: BOOL = msg_send![*self.0, canResume];
-        b == YES
-    }
-
-    /// Check if a stop request can be sent.
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub unsafe fn can_request_stop(&self) -> bool {
-        let b: BOOL = msg_send![*self.0, canRequestStop];
-        b == YES
-    }
-
-    /// Pause a running VM. The guest is suspended but memory is preserved.
-    ///
-    /// The completion handler receives an NSError (nil on success).
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub fn pause_with_completion_handler(&self, completion_handler: &Block<(Id,), ()>) {
-        unsafe {
-            let _: Id = msg_send![*self.0, pauseWithCompletionHandler: completion_handler];
-        }
-    }
-
-    /// Resume a paused VM.
-    ///
-    /// The completion handler receives an NSError (nil on success).
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub fn resume_with_completion_handler(&self, completion_handler: &Block<(Id,), ()>) {
-        unsafe {
-            let _: Id = msg_send![*self.0, resumeWithCompletionHandler: completion_handler];
-        }
-    }
-
-    // ─── Save / Restore (macOS 14+) ────────────────────────────────────
-
-    /// Save the VM's full machine state to a file.
-    ///
-    /// The VM must be paused first. The saved state includes memory, CPU
-    /// registers, and device state — a full hibernation snapshot.
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub fn save_machine_state_to_url(&self, url: &NSURL, completion_handler: &Block<(Id,), ()>) {
-        unsafe {
-            let _: () =
-                msg_send![*self.0, saveMachineStateTo:*url.0 completionHandler:completion_handler];
-        }
-    }
-
-    /// Restore the VM's machine state from a previously saved file.
-    ///
-    /// The VM must be paused first.
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub fn restore_machine_state_from_url(
-        &self,
-        url: &NSURL,
-        completion_handler: &Block<(Id,), ()>,
-    ) {
-        unsafe {
-            let _: () = msg_send![*self.0, restoreMachineStateFrom:*url.0 completionHandler:completion_handler];
-        }
-    }
-
-    // ─── Socket Devices Accessor ───────────────────────────────────────
-
-    /// Get the first vsock device from the running VM.
-    ///
-    /// Returns `None` if no socket device was configured.
-    /// The returned device can be used for host↔guest communication.
-    ///
-    /// # Safety
-    /// Must be called from the VM's dispatch queue.
-    pub unsafe fn first_socket_device(&self) -> Option<VZVirtioSocketDevice> {
-        let devices: Id = msg_send![*self.0, socketDevices];
-        let count: usize = msg_send![devices, count];
-        if count == 0 {
-            return None;
-        }
-        let device: Id = msg_send![devices, objectAtIndex:0usize];
-        Some(VZVirtioSocketDevice(StrongPtr::retain(device)))
     }
 }

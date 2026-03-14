@@ -13,12 +13,6 @@ pub trait VZMemoryBalloonDeviceConfiguration {
 /// configure of memory balloon device through the Virtio interface
 pub struct VZVirtioTraditionalMemoryBalloonDeviceConfiguration(StrongPtr);
 
-impl Default for VZVirtioTraditionalMemoryBalloonDeviceConfiguration {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl VZVirtioTraditionalMemoryBalloonDeviceConfiguration {
     pub fn new() -> VZVirtioTraditionalMemoryBalloonDeviceConfiguration {
         unsafe {
@@ -28,6 +22,12 @@ impl VZVirtioTraditionalMemoryBalloonDeviceConfiguration {
             ]);
             VZVirtioTraditionalMemoryBalloonDeviceConfiguration(p)
         }
+    }
+}
+
+impl Default for VZVirtioTraditionalMemoryBalloonDeviceConfiguration {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

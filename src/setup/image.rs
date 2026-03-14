@@ -3,6 +3,7 @@
 //! Resolves an `ImageSpec` (distro + version + arch) to download URLs,
 //! fetches and caches the assets, and converts disk formats as needed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -59,8 +60,7 @@ pub struct PreparedImage {
     /// Path to the initramfs (if the distro provides one).
     pub initramfs: Option<PathBuf>,
     /// Path to the root disk image (raw format, ready for CoW cloning).
-    /// `None` for diskless distros (e.g., Alpine netboot with tmpfs rootfs).
-    pub disk: Option<PathBuf>,
+    pub disk: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +72,8 @@ pub struct PreparedImage {
 struct ImageAsset {
     filename: &'static str,
     url: String,
-    /// Expected SHA-256 hex digest for verification. `None` means log-only (no comparison).
-    expected_sha256: Option<&'static str>,
+    source_filename: String,
+    checksum_url: Option<String>,
 }
 
 /// Resolve an image spec to download URLs.
@@ -87,9 +87,14 @@ fn resolve_image(spec: &ImageSpec) -> Result<Vec<ImageAsset>, SetupError> {
 
     match distro.as_str() {
         "ubuntu" => resolve_ubuntu(version, arch),
-        "alpine" => resolve_alpine(version, arch),
+        "alpine" => Err(SetupError::UnsupportedImage(
+            "Alpine cloud-init images are not currently supported: the published assets here are \
+             netboot kernel/initramfs plus an ISO, not a writable root disk. Provide your own \
+             root disk image or use Ubuntu."
+                .into(),
+        )),
         _ => Err(SetupError::UnsupportedImage(format!(
-            "unknown distro '{}'. Supported: ubuntu, alpine. \
+            "unknown distro '{}'. Supported: ubuntu. \
              Or bring your own kernel + disk image.",
             distro
         ))),
@@ -108,43 +113,29 @@ fn resolve_ubuntu(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupErr
     Ok(vec![
         ImageAsset {
             filename: "vmlinuz",
-            url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"),
-            expected_sha256: None,
+            source_filename: format!(
+                "ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"
+            ),
+            url: format!(
+                "{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-vmlinuz-generic"
+            ),
+            checksum_url: Some(format!("{unpacked}/SHA256SUMS")),
         },
         ImageAsset {
             filename: "initramfs",
-            url: format!("{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"),
-            expected_sha256: None,
+            source_filename: format!(
+                "ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"
+            ),
+            url: format!(
+                "{unpacked}/ubuntu-{version}-server-cloudimg-{arch_str}-initrd-generic"
+            ),
+            checksum_url: Some(format!("{unpacked}/SHA256SUMS")),
         },
         ImageAsset {
             filename: "disk.img",
+            source_filename: format!("ubuntu-{version}-server-cloudimg-{arch_str}.img"),
             url: format!("{base}/ubuntu-{version}-server-cloudimg-{arch_str}.img"),
-            expected_sha256: None,
-        },
-    ])
-}
-
-fn resolve_alpine(version: &str, arch: Arch) -> Result<Vec<ImageAsset>, SetupError> {
-    let arch_str = match arch {
-        Arch::Aarch64 => "aarch64",
-        Arch::X86_64 => "x86_64",
-    };
-
-    let base = format!("https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch_str}");
-
-    // Alpine only provides kernel + initramfs for netboot.
-    // The .iso is NOT a root disk image — it cannot be attached as /dev/vda1
-    // or converted with qemu-img. Alpine boots diskless with tmpfs rootfs.
-    Ok(vec![
-        ImageAsset {
-            filename: "vmlinuz",
-            url: format!("{base}/netboot/vmlinuz-virt"),
-            expected_sha256: None,
-        },
-        ImageAsset {
-            filename: "initramfs",
-            url: format!("{base}/netboot/initramfs-virt"),
-            expected_sha256: None,
+            checksum_url: Some(format!("{base}/SHA256SUMS")),
         },
     ])
 }
@@ -173,16 +164,33 @@ pub async fn prepare_image(
     std::fs::create_dir_all(&image_dir).map_err(SetupError::Io)?;
 
     let assets = resolve_image(spec)?;
+    let client = reqwest::Client::new();
+    let mut checksum_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     for asset in &assets {
         let path = image_dir.join(asset.filename);
-        if path.exists() {
-            tracing::debug!(file = %asset.filename, "cached, skipping download");
+        let expected_sha256 = match asset.checksum_url.as_deref() {
+            Some(checksum_url) => Some(
+                expected_sha256(&client, checksum_url, &asset.source_filename, &mut checksum_cache)
+                    .await?,
+            ),
+            None => None,
+        };
+
+        if path.exists() && verify_download(&path, expected_sha256.as_deref())? {
+            tracing::debug!(file = %asset.filename, "cached and verified, skipping download");
             continue;
         }
+
+        if path.exists() {
+            tracing::warn!(
+                file = %asset.filename,
+                path = %path.display(),
+                "cached asset failed verification; re-downloading"
+            );
+        }
         tracing::info!(file = %asset.filename, url = %asset.url, "downloading");
-        download_file(&asset.url, &path).await?;
-        verify_download(&path, asset.filename, asset.expected_sha256)?;
+        download_file(&client, &asset.url, &path, expected_sha256.as_deref()).await?;
     }
 
     let kernel = image_dir.join("vmlinuz");
@@ -193,15 +201,7 @@ pub async fn prepare_image(
         None
     };
 
-    if !kernel.exists() {
-        return Err(SetupError::AssetDownload(format!(
-            "kernel not found after download: {}",
-            kernel.display()
-        )));
-    }
-
-    // On macOS, Apple VZ needs raw disk images — convert from QCOW2 if needed.
-    // Disk is optional: diskless distros (e.g., Alpine netboot) have no disk asset.
+    // On macOS, Apple VZ needs raw disk images — convert from QCOW2 if needed
     let disk_downloaded = image_dir.join("disk.img");
     let disk = if cfg!(target_os = "macos") {
         let raw_path = image_dir.join("disk.raw");
@@ -209,17 +209,26 @@ pub async fn prepare_image(
             convert_to_raw(&disk_downloaded, &raw_path)?;
         }
         if raw_path.exists() {
-            Some(raw_path)
-        } else if disk_downloaded.exists() {
-            Some(disk_downloaded)
+            raw_path
         } else {
-            None
+            disk_downloaded
         }
-    } else if disk_downloaded.exists() {
-        Some(disk_downloaded)
     } else {
-        None
+        disk_downloaded
     };
+
+    if !kernel.exists() {
+        return Err(SetupError::AssetDownload(format!(
+            "kernel not found after download: {}",
+            kernel.display()
+        )));
+    }
+    if !disk.exists() {
+        return Err(SetupError::AssetDownload(format!(
+            "disk image not found after download: {}",
+            disk.display()
+        )));
+    }
 
     Ok(PreparedImage {
         kernel,
@@ -231,63 +240,6 @@ pub async fn prepare_image(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/// Verify a downloaded file: non-empty check + SHA-256 digest verification.
-///
-/// Rejects zero-byte downloads (indicates server error or truncated transfer).
-/// When `expected_sha256` is `Some`, the computed digest is compared and an error
-/// is returned on mismatch. When `None`, the digest is logged for manual auditing only.
-fn verify_download(
-    path: &Path,
-    filename: &str,
-    expected_sha256: Option<&str>,
-) -> Result<(), SetupError> {
-    let metadata = std::fs::metadata(path).map_err(SetupError::Io)?;
-    if metadata.len() == 0 {
-        // Remove the empty file so it isn't treated as cached on retry
-        std::fs::remove_file(path).map_err(|e| {
-            tracing::error!(path = %path.display(), "failed to remove empty download: {e}");
-            SetupError::Io(e)
-        })?;
-        return Err(SetupError::AssetDownload(format!(
-            "downloaded file is empty (0 bytes): {}",
-            filename
-        )));
-    }
-
-    // Compute SHA-256 for integrity verification.
-    // Reads in 64KB chunks to avoid buffering large images.
-    let mut file = std::fs::File::open(path).map_err(SetupError::Io)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        use std::io::Read;
-        let n = file.read(&mut buf).map_err(SetupError::Io)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = format!("{:x}", hasher.finalize());
-
-    if let Some(expected) = expected_sha256 {
-        if digest != expected {
-            return Err(SetupError::AssetDownload(format!(
-                "SHA-256 mismatch for {}: expected {}, got {}",
-                filename, expected, digest
-            )));
-        }
-    }
-
-    tracing::info!(
-        file = filename,
-        bytes = metadata.len(),
-        sha256 = %digest,
-        "download verified"
-    );
-
-    Ok(())
-}
 
 /// Convert a QCOW2 disk image to raw format.
 fn convert_to_raw(qcow2: &Path, raw: &Path) -> Result<(), SetupError> {
@@ -315,42 +267,19 @@ fn convert_to_raw(qcow2: &Path, raw: &Path) -> Result<(), SetupError> {
     Ok(())
 }
 
-async fn download_file(url: &str, path: &Path) -> Result<(), SetupError> {
-    // Write to a sibling temp file so interrupted downloads cannot poison the cache.
-    // The final atomic rename only happens after fsync succeeds.
-    let filename = path
-        .file_name()
-        .map(|n| format!(".{}.tmp", n.to_string_lossy()))
-        .unwrap_or_else(|| ".download.tmp".into());
-    let tmp_path = path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join(&filename);
-
-    let result = download_file_to_tmp(url, path, &tmp_path).await;
-    if result.is_err() && tmp_path.exists() {
-        if let Err(e) = std::fs::remove_file(&tmp_path) {
-            tracing::warn!(path = %tmp_path.display(), "failed to clean up temp download: {e}");
-        }
-    }
-    result
-}
-
-async fn download_file_to_tmp(
+async fn download_file(
+    client: &reqwest::Client,
     url: &str,
-    final_path: &Path,
-    tmp_path: &Path,
+    path: &Path,
+    expected_sha256: Option<&str>,
 ) -> Result<(), SetupError> {
-    use tokio::io::AsyncWriteExt;
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| SetupError::AssetDownload(format!("failed to create HTTP client: {}", e)))?;
-    let resp = client.get(url).send().await.map_err(|e| {
-        SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
-    })?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| {
+            SetupError::AssetDownload(format!("HTTP request failed for {}: {}", url, e))
+        })?;
 
     if !resp.status().is_success() {
         return Err(SetupError::AssetDownload(format!(
@@ -360,35 +289,132 @@ async fn download_file_to_tmp(
         )));
     }
 
-    // Stream to disk instead of buffering the whole response in memory.
-    // VM images can be hundreds of MB.
-    let mut file = tokio::fs::File::create(tmp_path)
-        .await
-        .map_err(SetupError::Io)?;
-    let mut stream = resp.bytes_stream();
-    let mut total_bytes = 0u64;
+    let bytes = resp.bytes().await.map_err(|e| {
+        SetupError::AssetDownload(format!(
+            "failed to read response body from {}: {}",
+            url, e
+        ))
+    })?;
 
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            SetupError::AssetDownload(format!("failed to read response body from {}: {}", url, e))
-        })?;
-        file.write_all(&chunk).await.map_err(SetupError::Io)?;
-        total_bytes += chunk.len() as u64;
+    if let Some(expected) = expected_sha256 {
+        verify_bytes(&bytes, expected, url)?;
     }
-    file.flush().await.map_err(SetupError::Io)?;
-    // fsync so the data is durable before we expose it via rename
-    file.sync_all().await.map_err(SetupError::Io)?;
-    drop(file);
 
-    // Atomic rename: the final path is either intact or absent — never partial.
-    std::fs::rename(tmp_path, final_path).map_err(SetupError::Io)?;
-
+    std::fs::write(path, &bytes).map_err(SetupError::Io)?;
     tracing::info!(
-        path = %final_path.display(),
-        bytes = total_bytes,
+        path = %path.display(),
+        bytes = bytes.len(),
         "downloaded"
     );
+    Ok(())
+}
+
+async fn expected_sha256(
+    client: &reqwest::Client,
+    checksum_url: &str,
+    filename: &str,
+    cache: &mut HashMap<String, HashMap<String, String>>,
+) -> Result<String, SetupError> {
+    if !cache.contains_key(checksum_url) {
+        let manifest = fetch_checksum_manifest(client, checksum_url).await?;
+        cache.insert(checksum_url.to_string(), manifest);
+    }
+
+    cache
+        .get(checksum_url)
+        .and_then(|manifest| manifest.get(filename))
+        .cloned()
+        .ok_or_else(|| {
+            SetupError::AssetDownload(format!(
+                "checksum manifest {} does not contain {}",
+                checksum_url, filename
+            ))
+        })
+}
+
+async fn fetch_checksum_manifest(
+    client: &reqwest::Client,
+    checksum_url: &str,
+) -> Result<HashMap<String, String>, SetupError> {
+    let resp = client
+        .get(checksum_url)
+        .send()
+        .await
+        .map_err(|e| {
+            SetupError::AssetDownload(format!(
+                "failed to fetch checksum manifest {}: {}",
+                checksum_url, e
+            ))
+        })?;
+
+    if !resp.status().is_success() {
+        return Err(SetupError::AssetDownload(format!(
+            "HTTP {} for checksum manifest {}",
+            resp.status(),
+            checksum_url
+        )));
+    }
+
+    let body = resp.text().await.map_err(|e| {
+        SetupError::AssetDownload(format!(
+            "failed to read checksum manifest {}: {}",
+            checksum_url, e
+        ))
+    })?;
+
+    parse_checksum_manifest(&body)
+}
+
+fn parse_checksum_manifest(body: &str) -> Result<HashMap<String, String>, SetupError> {
+    let mut manifest = HashMap::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(split_at) = line.find(char::is_whitespace) else {
+            return Err(SetupError::AssetDownload(format!(
+                "malformed checksum line: {}",
+                line
+            )));
+        };
+        let (digest, path) = line.split_at(split_at);
+        let digest = digest.trim();
+        let filename = path
+            .trim()
+            .trim_start_matches('*')
+            .trim_start_matches("./");
+        if digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()) {
+            manifest.insert(filename.to_string(), digest.to_ascii_lowercase());
+        }
+    }
+
+    if manifest.is_empty() {
+        return Err(SetupError::AssetDownload(
+            "checksum manifest did not contain any SHA256 entries".into(),
+        ));
+    }
+
+    Ok(manifest)
+}
+
+fn verify_download(path: &Path, expected_sha256: Option<&str>) -> Result<bool, SetupError> {
+    let Some(expected_sha256) = expected_sha256 else {
+        return Ok(true);
+    };
+    let bytes = std::fs::read(path).map_err(SetupError::Io)?;
+    verify_bytes(&bytes, expected_sha256, &path.display().to_string())?;
+    Ok(true)
+}
+
+fn verify_bytes(bytes: &[u8], expected_sha256: &str, label: &str) -> Result<(), SetupError> {
+    let actual_sha256 = format!("{:x}", Sha256::digest(bytes));
+    if actual_sha256 != expected_sha256 {
+        return Err(SetupError::AssetDownload(format!(
+            "SHA256 mismatch for {}: expected {}, got {}",
+            label, expected_sha256, actual_sha256
+        )));
+    }
     Ok(())
 }
 
@@ -405,7 +431,6 @@ mod tests {
     #[test]
     fn arch_host_returns_valid() {
         let arch = Arch::host();
-        // Must be one of the two variants
         assert!(matches!(arch, Arch::Aarch64 | Arch::X86_64));
     }
 
@@ -416,7 +441,7 @@ mod tests {
             version: "24.04".into(),
             arch: Some(Arch::Aarch64),
         };
-        let assets = resolve_image(&spec).unwrap();
+        let assets = resolve_image(&spec).expect("ubuntu assets");
         assert_eq!(assets.len(), 3);
         assert_eq!(assets[0].filename, "vmlinuz");
         assert_eq!(assets[1].filename, "initramfs");
@@ -425,18 +450,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_alpine_returns_2_assets() {
+    fn resolve_alpine_is_explicitly_unsupported() {
         let spec = ImageSpec {
             distro: "alpine".into(),
             version: "3.20".into(),
             arch: Some(Arch::X86_64),
         };
-        let assets = resolve_image(&spec).unwrap();
-        // Alpine netboot: kernel + initramfs only (no disk image)
-        assert_eq!(assets.len(), 2);
-        assert_eq!(assets[0].filename, "vmlinuz");
-        assert_eq!(assets[1].filename, "initramfs");
-        assert!(assets[0].url.contains("x86_64"));
+        let err = resolve_image(&spec).expect_err("alpine should fail fast");
+        assert!(err.to_string().contains("not currently supported"));
     }
 
     #[test]
@@ -446,9 +467,9 @@ mod tests {
             version: "40".into(),
             arch: None,
         };
-        let result = resolve_image(&spec);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = resolve_image(&spec)
+            .expect_err("unknown distro should fail")
+            .to_string();
         assert!(err.contains("fedora"));
     }
 
@@ -459,7 +480,41 @@ mod tests {
             version: "24.04".into(),
             arch: Some(Arch::X86_64),
         };
-        let assets = resolve_image(&spec).unwrap();
+        let assets = resolve_image(&spec).expect("ubuntu assets");
         assert!(assets[0].url.contains("amd64"));
+    }
+
+    #[test]
+    fn parse_checksum_manifest_supports_coreutils_format() {
+        let manifest = parse_checksum_manifest(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef *disk.img\n\
+             abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd ./initramfs\n",
+        )
+        .expect("manifest");
+
+        assert_eq!(
+            manifest.get("disk.img"),
+            Some(&"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string())
+        );
+        assert_eq!(
+            manifest.get("initramfs"),
+            Some(&"abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_checksum_manifest_rejects_malformed_lines() {
+        let err = parse_checksum_manifest("not-a-valid-line")
+            .expect_err("malformed manifest should fail")
+            .to_string();
+        assert!(err.contains("malformed checksum line"));
+    }
+
+    #[test]
+    fn verify_bytes_rejects_digest_mismatch() {
+        let err = verify_bytes(b"vm-rs", &"00".repeat(32), "fixture")
+            .expect_err("mismatched digest should fail")
+            .to_string();
+        assert!(err.contains("SHA256 mismatch"));
     }
 }

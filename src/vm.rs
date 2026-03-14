@@ -56,41 +56,32 @@ impl VmManager {
     }
 
     /// Boot a VM. Creates the VM directory and delegates to the driver.
-    ///
-    /// Holds a write lock across the duplicate check AND boot to prevent
-    /// two concurrent callers from booting the same VM name.
     pub fn start(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
-        // Take write lock for the entire operation: check + boot + insert.
-        // This prevents a TOCTOU race where two callers both pass the
-        // duplicate check and boot separate VMs with the same name.
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-
-        if let Some(existing) = vms.get(&config.name) {
-            if existing.state != VmState::Stopped {
-                return Err(VmError::BootFailed {
-                    name: config.name.clone(),
-                    detail: format!("VM already exists in state: {}", existing.state),
-                });
+        // Reserve the name up front so concurrent callers cannot boot the same VM twice.
+        {
+            let mut vms = self
+                .vms
+                .write()
+                .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+            if let Some(existing) = vms.get(&config.name) {
+                if existing.state != VmState::Stopped {
+                    return Err(VmError::BootFailed {
+                        name: config.name.clone(),
+                        detail: format!("VM already exists in state: {}", existing.state),
+                    });
+                }
             }
+            vms.insert(
+                config.name.clone(),
+                VmHandle {
+                    name: config.name.clone(),
+                    namespace: config.namespace.clone(),
+                    state: VmState::Starting,
+                    process: None,
+                    serial_log: config.serial_log.clone(),
+                },
+            );
         }
-
-        // Reserve the name with a Starting entry before boot.
-        // If boot fails, we remove it.
-        let placeholder = VmHandle {
-            name: config.name.clone(),
-            namespace: config.namespace.clone(),
-            state: VmState::Starting,
-            pid: None,
-            serial_log: config.serial_log.clone(),
-            machine_id: None,
-        };
-        vms.insert(config.name.clone(), placeholder);
-
-        // Release the lock during the actual boot (which may take time)
-        drop(vms);
 
         // Ensure VM directory exists
         let vm_dir = self.vm_dir(&config.name);
@@ -103,23 +94,25 @@ impl VmManager {
             "booting VM"
         );
 
-        match self.driver.boot(config) {
-            Ok(handle) => {
+        let handle = match self.driver.boot(config) {
+            Ok(handle) => handle,
+            Err(err) => {
                 let mut vms = self
                     .vms
                     .write()
                     .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-                vms.insert(config.name.clone(), handle.clone());
-                Ok(handle)
+                vms.remove(&config.name);
+                return Err(err);
             }
-            Err(e) => {
-                // Boot failed — remove the placeholder
-                if let Ok(mut vms) = self.vms.write() {
-                    vms.remove(&config.name);
-                }
-                Err(e)
-            }
+        };
+
+        // Track the VM
+        {
+            let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+            vms.insert(config.name.clone(), handle.clone());
         }
+
+        Ok(handle)
     }
 
     /// Stop a VM gracefully.
@@ -128,10 +121,7 @@ impl VmManager {
         self.driver.stop(&handle)?;
 
         // Update state
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = VmState::Stopped;
         }
@@ -143,10 +133,7 @@ impl VmManager {
         let handle = self.get_handle(name)?;
         self.driver.kill(&handle)?;
 
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = VmState::Stopped;
         }
@@ -160,10 +147,7 @@ impl VmManager {
     pub fn stop_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
         self.driver.stop(handle)?;
 
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(&handle.name) {
             h.state = VmState::Stopped;
         }
@@ -174,10 +158,7 @@ impl VmManager {
     pub fn kill_by_handle(&self, handle: &VmHandle) -> Result<(), VmError> {
         self.driver.kill(handle)?;
 
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(&handle.name) {
             h.state = VmState::Stopped;
         }
@@ -190,44 +171,11 @@ impl VmManager {
         let state = self.driver.state(&handle)?;
 
         // Update cached state
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let mut vms = self.vms.write().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         if let Some(h) = vms.get_mut(name) {
             h.state = state.clone();
         }
         Ok(state)
-    }
-
-    /// Pause a running VM (suspends execution, preserves memory).
-    pub fn pause(&self, name: &str) -> Result<(), VmError> {
-        let handle = self.get_handle(name)?;
-        self.driver.pause(&handle)?;
-
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(name) {
-            h.state = VmState::Paused;
-        }
-        Ok(())
-    }
-
-    /// Resume a paused VM.
-    pub fn resume(&self, name: &str) -> Result<(), VmError> {
-        let handle = self.get_handle(name)?;
-        self.driver.resume(&handle)?;
-
-        let mut vms = self
-            .vms
-            .write()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        if let Some(h) = vms.get_mut(name) {
-            h.state = VmState::Starting; // Will transition to Running once ready marker appears
-        }
-        Ok(())
     }
 
     /// Get the IP address of a running VM.
@@ -240,10 +188,7 @@ impl VmManager {
 
     /// List all tracked VMs.
     pub fn list(&self) -> Result<Vec<VmHandle>, VmError> {
-        let vms = self
-            .vms
-            .read()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
         Ok(vms.values().cloned().collect())
     }
 
@@ -255,10 +200,7 @@ impl VmManager {
         loop {
             if start.elapsed() > timeout {
                 let pending: Vec<String> = {
-                    let vms = self
-                        .vms
-                        .read()
-                        .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                    let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
                     vms.iter()
                         .filter(|(_, h)| !matches!(h.state, VmState::Running { .. }))
                         .map(|(name, _)| name.clone())
@@ -272,10 +214,7 @@ impl VmManager {
 
             let mut all_ready = true;
             let names: Vec<String> = {
-                let vms = self
-                    .vms
-                    .read()
-                    .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+                let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
                 vms.keys().cloned().collect()
             };
 
@@ -326,7 +265,12 @@ impl VmManager {
                 .status()
                 .map_err(VmError::Io)?;
             if !status.success() {
-                // Fallback to regular copy if APFS clone not supported
+                tracing::warn!(
+                    base = %base.display(),
+                    target = %target.display(),
+                    status = %status,
+                    "APFS clone failed; falling back to a full file copy"
+                );
                 std::fs::copy(base, target).map_err(VmError::Io)?;
             }
         }
@@ -340,27 +284,26 @@ impl VmManager {
                 .status()
                 .map_err(VmError::Io)?;
             if !status.success() {
+                tracing::warn!(
+                    base = %base.display(),
+                    target = %target.display(),
+                    status = %status,
+                    "reflink clone failed; falling back to a full file copy"
+                );
                 std::fs::copy(base, target).map_err(VmError::Io)?;
             }
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            // No CoW support — plain copy
-            std::fs::copy(base, target).map_err(VmError::Io)?;
         }
 
         Ok(())
     }
 
     fn get_handle(&self, name: &str) -> Result<VmHandle, VmError> {
-        let vms = self
-            .vms
-            .read()
-            .map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
-        vms.get(name).cloned().ok_or_else(|| VmError::NotFound {
-            name: name.to_string(),
-        })
+        let vms = self.vms.read().map_err(|e| VmError::Hypervisor(format!("lock poisoned: {}", e)))?;
+        vms.get(name)
+            .cloned()
+            .ok_or_else(|| VmError::NotFound {
+                name: name.to_string(),
+            })
     }
 }
 
@@ -376,16 +319,103 @@ fn create_platform_driver() -> Result<Box<dyn VmDriver>, VmError> {
         Ok(Box::new(crate::driver::cloud_hv::CloudHvDriver::new()))
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        Ok(Box::new(crate::driver::whp::WhpDriver::new()))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Err(VmError::Hypervisor(format!(
             "unsupported platform: {}",
             std::env::consts::OS
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    use super::*;
+
+    struct BlockingDriver {
+        boot_calls: AtomicUsize,
+        release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl VmDriver for Arc<BlockingDriver> {
+        fn boot(&self, config: &VmConfig) -> Result<VmHandle, VmError> {
+            self.boot_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(rx) = self.release_rx.lock().expect("release lock").take() {
+                rx.recv().expect("release boot");
+            }
+            Ok(VmHandle {
+                name: config.name.clone(),
+                namespace: config.namespace.clone(),
+                state: VmState::Starting,
+                process: None,
+                serial_log: config.serial_log.clone(),
+            })
+        }
+
+        fn stop(&self, _handle: &VmHandle) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        fn kill(&self, _handle: &VmHandle) -> Result<(), VmError> {
+            Ok(())
+        }
+
+        fn state(&self, _handle: &VmHandle) -> Result<VmState, VmError> {
+            Ok(VmState::Stopped)
+        }
+    }
+
+    fn test_config(base_dir: &Path) -> VmConfig {
+        VmConfig {
+            name: "test-vm".into(),
+            namespace: "tests".into(),
+            kernel: PathBuf::from("/tmp/kernel"),
+            initramfs: None,
+            root_disk: None,
+            data_disk: None,
+            seed_iso: None,
+            cpus: 1,
+            memory_mb: 256,
+            networks: vec![],
+            shared_dirs: vec![],
+            serial_log: base_dir.join("serial.log"),
+            cmdline: None,
+            netns: None,
+        }
+    }
+
+    #[test]
+    fn start_reserves_name_before_driver_boot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (release_tx, release_rx) = mpsc::channel();
+        let driver = Arc::new(BlockingDriver {
+            boot_calls: AtomicUsize::new(0),
+            release_rx: Mutex::new(Some(release_rx)),
+        });
+        let manager = Arc::new(
+            VmManager::with_driver(Box::new(driver.clone()), tmp.path().to_path_buf())
+                .expect("manager"),
+        );
+        let config = test_config(tmp.path());
+
+        let manager_clone = Arc::clone(&manager);
+        let config_clone = config.clone();
+        let boot_thread = std::thread::spawn(move || manager_clone.start(&config_clone));
+
+        while driver.boot_calls.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let err = manager.start(&config).expect_err("second concurrent start should fail");
+        assert!(err.to_string().contains("already exists"));
+
+        release_tx.send(()).expect("release first boot");
+        boot_thread.join().expect("join").expect("first boot should succeed");
+
+        assert_eq!(driver.boot_calls.load(Ordering::SeqCst), 1);
     }
 }

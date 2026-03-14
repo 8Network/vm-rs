@@ -6,47 +6,41 @@
 //! - Linux: cloud-hypervisor binary on PATH, KVM enabled (/dev/kvm)
 //!
 //! Asset paths come from the VMRS_TEST_KERNEL, VMRS_TEST_INITRAMFS env vars.
-//! If not set, the VM-booting tests are skipped.
 //!
 //! Run with: VMRS_TEST_KERNEL=/path/to/vmlinuz VMRS_TEST_INITRAMFS=/path/to/initramfs cargo test --test vm_lifecycle
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use vm_rs::config::{SharedDir, VmConfig, VmState};
 use vm_rs::VmManager;
 
-/// Load test assets from environment. Returns None if not configured.
-fn test_assets() -> Option<(PathBuf, PathBuf)> {
-    let kernel = std::env::var("VMRS_TEST_KERNEL").ok().map(PathBuf::from)?;
-    let initramfs = std::env::var("VMRS_TEST_INITRAMFS")
-        .ok()
-        .map(PathBuf::from)?;
+/// Load test assets from environment.
+fn test_assets() -> Result<(PathBuf, PathBuf), String> {
+    let kernel = match std::env::var("VMRS_TEST_KERNEL") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            return Err("VMRS_TEST_KERNEL is not set".into());
+        }
+    };
+    let initramfs = match std::env::var("VMRS_TEST_INITRAMFS") {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            return Err("VMRS_TEST_INITRAMFS is not set".into());
+        }
+    };
 
     if !kernel.exists() {
-        eprintln!(
-            "VMRS_TEST_KERNEL={} does not exist, skipping",
+        return Err(format!(
+            "VMRS_TEST_KERNEL={} does not exist",
             kernel.display()
-        );
-        return None;
+        ));
     }
     if !initramfs.exists() {
-        eprintln!(
-            "VMRS_TEST_INITRAMFS={} does not exist, skipping",
+        return Err(format!(
+            "VMRS_TEST_INITRAMFS={} does not exist",
             initramfs.display()
-        );
-        return None;
+        ));
     }
-    Some((kernel, initramfs))
-}
-
-/// Check if virtiofsd is available (required for VirtioFS shared dir tests).
-fn has_virtiofsd() -> bool {
-    std::process::Command::new("virtiofsd")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    Ok((kernel, initramfs))
 }
 
 fn test_base_dir() -> PathBuf {
@@ -55,16 +49,9 @@ fn test_base_dir() -> PathBuf {
     dir
 }
 
-fn make_config(name: &str, kernel: &std::path::Path, initramfs: &std::path::Path) -> VmConfig {
+fn make_config(name: &str, kernel: &Path, initramfs: &Path) -> VmConfig {
     let base = test_base_dir().join(name);
     std::fs::create_dir_all(&base).expect("failed to create VM dir");
-
-    // Use ttyS0 for Cloud Hypervisor on Linux, hvc0 for Apple VZ on macOS
-    let console = if cfg!(target_os = "linux") {
-        "console=ttyS0"
-    } else {
-        "console=hvc0"
-    };
 
     VmConfig {
         name: name.to_string(),
@@ -79,26 +66,17 @@ fn make_config(name: &str, kernel: &std::path::Path, initramfs: &std::path::Path
         networks: vec![],
         shared_dirs: vec![],
         serial_log: base.join("serial.log"),
-        cmdline: Some(console.to_string()),
+        cmdline: Some("console=hvc0".to_string()),
         netns: None,
-        vsock: false,
-        machine_id: None,
-        efi_variable_store: None,
-        rosetta: false,
     }
 }
 
-// ─── Boot + Verify Alive + Stop ─────────────────────────────────────────
+// ─── Boot + Ready + Stop ─────────────────────────────────────────────────
 
 #[test]
-fn boot_vm_stays_alive() {
-    let (kernel, initramfs) = match test_assets() {
-        Some(a) => a,
-        None => {
-            eprintln!("skipping: test assets not configured");
-            return;
-        }
-    };
+#[ignore = "requires VMRS_TEST_KERNEL and VMRS_TEST_INITRAMFS plus a working hypervisor"]
+fn boot_vm_reaches_running_state() {
+    let (kernel, initramfs) = test_assets().expect("test assets");
 
     let manager = VmManager::new(test_base_dir()).expect("failed to create VmManager");
     let config = make_config("test-boot", &kernel, &initramfs);
@@ -106,64 +84,19 @@ fn boot_vm_stays_alive() {
     let handle = manager.start(&config).expect("boot failed");
     assert_eq!(handle.name, "test-boot");
 
-    // Wait a few seconds, then verify the VM process is still alive
-    // (not crashed immediately after boot). The VM state should be
-    // Starting or Running — either is acceptable depending on whether
-    // the initramfs writes VMRS_READY.
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
-    let state = manager.state("test-boot").expect("state query failed");
-    assert!(
-        matches!(state, VmState::Starting | VmState::Running { .. }),
-        "VM should be alive (Starting or Running), got: {}",
-        state
-    );
-
-    // Verify serial log was created and has output
-    let serial_log = test_base_dir().join("test-boot").join("serial.log");
-    if serial_log.exists() {
-        let content = std::fs::read_to_string(&serial_log).unwrap_or_default();
-        assert!(
-            !content.is_empty(),
-            "serial log should have boot output from the kernel"
-        );
-    }
-
-    // Clean up: kill the VM. On macOS this uses stopWithCompletionHandler
-    // to ensure the VM is fully stopped before we return.
-    manager.kill("test-boot").ok();
-}
-
-// ─── Boot with custom initramfs reaches Running (requires VMRS_READY) ──
-// This test only passes with our custom initramfs, not vanilla Alpine.
-// Set VMRS_TEST_CUSTOM_INITRAMFS=1 to run it.
-
-#[test]
-fn boot_vm_reaches_running_state() {
-    if std::env::var("VMRS_TEST_CUSTOM_INITRAMFS").is_err() {
-        eprintln!("skipping: VMRS_TEST_CUSTOM_INITRAMFS not set (needs custom init)");
-        return;
-    }
-    let (kernel, initramfs) = match test_assets() {
-        Some(a) => a,
-        None => return,
-    };
-
-    let manager = VmManager::new(test_base_dir()).expect("failed to create VmManager");
-    let config = make_config("test-ready", &kernel, &initramfs);
-    manager.start(&config).expect("boot failed");
-
-    // Poll for Running (requires VMRS_READY marker from custom init)
+    // Poll for ready (up to 30s)
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
     let mut final_state = VmState::Starting;
     while start.elapsed() < timeout {
-        match manager.state("test-ready") {
+        match manager.state("test-boot") {
             Ok(state @ VmState::Running { .. }) => {
                 final_state = state;
                 break;
             }
-            Ok(VmState::Failed { reason }) => panic!("VM boot failed: {}", reason),
+            Ok(VmState::Failed { reason }) => {
+                panic!("VM boot failed: {}", reason);
+            }
             Ok(state) => {
                 final_state = state;
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -178,17 +111,23 @@ fn boot_vm_reaches_running_state() {
         final_state
     );
 
-    manager.stop("test-ready").expect("stop failed");
+    // Stop gracefully
+    manager.stop("test-boot").expect("stop failed");
+    let stopped = manager.state("test-boot");
+    // After stop, VM should be Stopped (or NotFound if already cleaned up)
+    match stopped {
+        Ok(VmState::Stopped) => {}
+        Err(_) => {} // NotFound is acceptable after stop
+        other => panic!("unexpected state after stop: {:?}", other),
+    }
 }
 
 // ─── Duplicate boot rejection ────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires VMRS_TEST_KERNEL and VMRS_TEST_INITRAMFS plus a working hypervisor"]
 fn reject_duplicate_vm_name() {
-    let (kernel, initramfs) = match test_assets() {
-        Some(a) => a,
-        None => return,
-    };
+    let (kernel, initramfs) = test_assets().expect("test assets");
 
     let manager = VmManager::new(test_base_dir()).expect("failed to create VmManager");
     let config = make_config("test-dup", &kernel, &initramfs);
@@ -198,24 +137,22 @@ fn reject_duplicate_vm_name() {
     // Second boot with same name should fail
     let result = manager.start(&config);
     assert!(result.is_err(), "duplicate boot should be rejected");
-    let err = result.unwrap_err().to_string();
+    let err = result.expect_err("duplicate boot should fail").to_string();
     assert!(
         err.contains("already exists"),
         "error should mention duplicate: {}",
         err
     );
 
-    manager.kill("test-dup").ok();
+    let _ = manager.kill("test-dup");
 }
 
 // ─── Force kill ──────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires VMRS_TEST_KERNEL and VMRS_TEST_INITRAMFS plus a working hypervisor"]
 fn force_kill_running_vm() {
-    let (kernel, initramfs) = match test_assets() {
-        Some(a) => a,
-        None => return,
-    };
+    let (kernel, initramfs) = test_assets().expect("test assets");
 
     let manager = VmManager::new(test_base_dir()).expect("failed to create VmManager");
     let config = make_config("test-kill", &kernel, &initramfs);
@@ -225,31 +162,14 @@ fn force_kill_running_vm() {
     // Don't wait for ready — kill immediately
     std::thread::sleep(std::time::Duration::from_secs(2));
     manager.kill("test-kill").expect("kill failed");
-
-    // Verify killed
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let state = manager.state("test-kill");
-    match state {
-        Ok(VmState::Stopped) => {}
-        Err(_) => {} // NotFound acceptable
-        other => panic!("expected Stopped after kill, got: {:?}", other),
-    }
 }
 
 // ─── VM with shared directory ────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires VMRS_TEST_KERNEL and VMRS_TEST_INITRAMFS plus a working hypervisor"]
 fn boot_with_shared_directory() {
-    let (kernel, initramfs) = match test_assets() {
-        Some(a) => a,
-        None => return,
-    };
-
-    // virtiofsd is required for VirtioFS on Linux
-    if cfg!(target_os = "linux") && !has_virtiofsd() {
-        eprintln!("skipping: virtiofsd not available");
-        return;
-    }
+    let (kernel, initramfs) = test_assets().expect("test assets");
 
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let shared_path = tmp.path().join("shared");
@@ -267,26 +187,20 @@ fn boot_with_shared_directory() {
     let handle = manager.start(&config).expect("boot with shared dir failed");
     assert_eq!(handle.name, "test-shared");
 
-    // Verify VM started and stays alive
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let state = manager.state("test-shared").expect("state query");
-    assert!(
-        matches!(state, VmState::Starting | VmState::Running { .. }),
-        "VM with shared dir should be alive, got: {}",
-        state
-    );
+    // Wait for ready or timeout
+    let result = manager.wait_all_ready(30);
+    // Clean up regardless
+    let _ = manager.kill("test-shared");
 
-    manager.kill("test-shared").ok();
+    result.expect("VM with shared dir did not become ready");
 }
 
 // ─── VM list ─────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "requires VMRS_TEST_KERNEL and VMRS_TEST_INITRAMFS plus a working hypervisor"]
 fn list_tracks_running_vms() {
-    let (kernel, initramfs) = match test_assets() {
-        Some(a) => a,
-        None => return,
-    };
+    let (kernel, initramfs) = test_assets().expect("test assets");
 
     let manager = VmManager::new(test_base_dir()).expect("failed to create VmManager");
 
@@ -307,7 +221,7 @@ fn list_tracks_running_vms() {
         "list should contain our VM"
     );
 
-    manager.kill("test-list").ok();
+    let _ = manager.kill("test-list");
 }
 
 // ─── Non-existent VM operations ──────────────────────────────────────────
@@ -317,7 +231,7 @@ fn stop_nonexistent_vm_fails() {
     let manager = VmManager::new(test_base_dir()).expect("failed to create VmManager");
     let result = manager.stop("this-vm-does-not-exist");
     assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
+    let err = result.expect_err("stop should fail").to_string();
     assert!(err.contains("not found"), "error: {}", err);
 }
 

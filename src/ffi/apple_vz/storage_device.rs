@@ -1,6 +1,6 @@
 //! storage device module
 
-use super::base::{Id, NSError, NIL, NSURL};
+use super::base::{Id, NIL, NSError, NSURL};
 
 use objc::runtime::BOOL;
 use objc::{class, msg_send, sel, sel_impl};
@@ -49,12 +49,6 @@ pub struct VZDiskImageStorageDeviceAttachmentBuilder<Path, ReadOnly> {
     read_only: ReadOnly,
     caching_mode: Option<VZDiskImageCachingMode>,
     sync_mode: Option<VZDiskImageSynchronizationMode>,
-}
-
-impl Default for VZDiskImageStorageDeviceAttachmentBuilder<(), bool> {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl VZDiskImageStorageDeviceAttachmentBuilder<(), bool> {
@@ -108,12 +102,8 @@ impl VZDiskImageStorageDeviceAttachmentBuilder<String, bool> {
     pub fn build(self) -> Result<VZDiskImageStorageDeviceAttachment, NSError> {
         let read_only = if self.read_only { YES } else { NO };
         if self.caching_mode.is_some() || self.sync_mode.is_some() {
-            let caching = self
-                .caching_mode
-                .unwrap_or(VZDiskImageCachingMode::Automatic) as isize;
-            let sync = self
-                .sync_mode
-                .unwrap_or(VZDiskImageSynchronizationMode::Full) as isize;
+            let caching = self.caching_mode.unwrap_or(VZDiskImageCachingMode::Automatic) as isize;
+            let sync = self.sync_mode.unwrap_or(VZDiskImageSynchronizationMode::Full) as isize;
             unsafe {
                 VZDiskImageStorageDeviceAttachment::new_with_modes(
                     self.path.as_str(),
@@ -125,6 +115,12 @@ impl VZDiskImageStorageDeviceAttachmentBuilder<String, bool> {
         } else {
             unsafe { VZDiskImageStorageDeviceAttachment::new(self.path.as_str(), read_only) }
         }
+    }
+}
+
+impl Default for VZDiskImageStorageDeviceAttachmentBuilder<(), bool> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -195,41 +191,6 @@ impl VZVirtioBlockDeviceConfiguration {
 }
 
 impl VZStorageDeviceConfiguration for VZVirtioBlockDeviceConfiguration {
-    fn id(&self) -> Id {
-        *self.0
-    }
-}
-
-// ─── NVMe Storage (macOS 14+) ──────────────────────────────────────────
-
-/// NVMe storage device configuration (macOS 14+).
-///
-/// Provides better I/O performance than VirtioBlock for storage-intensive workloads.
-/// Uses the same `VZDiskImageStorageDeviceAttachment` as VirtioBlock.
-///
-/// # Examples
-///
-/// ```ignore
-/// let attachment = VZDiskImageStorageDeviceAttachmentBuilder::new()
-///     .path("/path/to/disk.img")
-///     .read_only(false)
-///     .build()
-///     .expect("disk attachment");
-/// let nvme = VZNVMExpressControllerDeviceConfiguration::new(attachment);
-/// ```
-pub struct VZNVMExpressControllerDeviceConfiguration(StrongPtr);
-
-impl VZNVMExpressControllerDeviceConfiguration {
-    pub fn new<T: VZStorageDeviceAttachment>(attachment: T) -> Self {
-        unsafe {
-            let alloc: Id = msg_send![class!(VZNVMExpressControllerDeviceConfiguration), alloc];
-            let p = StrongPtr::new(msg_send![alloc, initWithAttachment:attachment.id()]);
-            VZNVMExpressControllerDeviceConfiguration(p)
-        }
-    }
-}
-
-impl VZStorageDeviceConfiguration for VZNVMExpressControllerDeviceConfiguration {
     fn id(&self) -> Id {
         *self.0
     }
