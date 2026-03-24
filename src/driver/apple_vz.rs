@@ -37,8 +37,13 @@ use crate::driver::{ReadyMarkerCache, VmDriver, VmError};
 
 struct RegisteredVm {
     vm: VZVirtualMachine,
+    queue: Id,
     ready: ReadyMarkerCache,
 }
+
+// SAFETY: dispatch_queue Id is thread-safe (GCD queues are designed for cross-thread use).
+unsafe impl Send for RegisteredVm {}
+unsafe impl Sync for RegisteredVm {}
 
 /// Apple Virtualization.framework driver for macOS.
 pub struct AppleVzDriver {
@@ -277,6 +282,7 @@ impl VmDriver for AppleVzDriver {
                 name.to_string(),
                 RegisteredVm {
                     vm: vm.clone(),
+                    queue,
                     ready: ReadyMarkerCache::default(),
                 },
             );
@@ -356,31 +362,68 @@ impl VmDriver for AppleVzDriver {
 
     fn stop(&self, handle: &VmHandle) -> Result<(), VmError> {
         tracing::info!(vm = %handle.name, "requesting graceful stop via Apple VZ");
-        let vm = self
-            .vms
-            .lock()
-            .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?
-            .get(&handle.name)
-            .map(|entry| entry.vm.clone())
-            .ok_or_else(|| VmError::NotFound {
+
+        let (vm, queue) = {
+            let registry = self
+                .vms
+                .lock()
+                .map_err(|e| VmError::Hypervisor(format!("VM registry lock poisoned: {}", e)))?;
+            let entry = registry.get(&handle.name).ok_or_else(|| VmError::NotFound {
                 name: handle.name.clone(),
             })?;
+            (entry.vm.clone(), entry.queue)
+        };
 
-        let mut vm_clone = vm.clone();
-        // SAFETY: vm_clone is a valid VZVirtualMachine reference from the registry.
-        unsafe {
-            vm_clone
-                .request_stop_with_error()
-                .map_err(|e| VmError::StopFailed {
-                    name: handle.name.clone(),
-                    detail: format!(
+        // Dispatch requestStop on the VM's queue — Apple VZ requires all VM
+        // operations to happen on the same dispatch queue the VM was created on.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let vm_for_stop = std::cell::RefCell::new(vm.clone());
+        let name_for_log = handle.name.clone();
+        let dispatch_block = ConcreteBlock::new(move || {
+            // SAFETY: we are on the VM's dispatch queue. RefCell is safe because
+            // the dispatch block runs serially on the VM's queue.
+            let result = unsafe { vm_for_stop.borrow_mut().request_stop_with_error() };
+            match result {
+                Ok(_) => {
+                    tracing::info!("VM '{}' stop requested on dispatch queue", name_for_log);
+                    let _ = tx.send(Ok(()));
+                }
+                Err(e) => {
+                    let msg = format!(
                         "error code {}: {}",
                         e.code(),
                         e.localized_description().as_str()
-                    ),
-                })?;
+                    );
+                    tracing::error!("VM '{}' stop FAILED: {}", name_for_log, msg);
+                    let _ = tx.send(Err(msg));
+                }
+            }
+        });
+        let dispatch_block = dispatch_block.copy();
+        let dispatch_block: &Block<(), ()> = &dispatch_block;
+        // SAFETY: queue is the same GCD queue the VM was created on.
+        unsafe {
+            dispatch_async(queue, dispatch_block);
         }
 
+        // Wait for the stop request to complete
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                return Err(VmError::StopFailed {
+                    name: handle.name.clone(),
+                    detail: msg,
+                });
+            }
+            Err(_) => {
+                return Err(VmError::StopFailed {
+                    name: handle.name.clone(),
+                    detail: "timed out sending stop request to dispatch queue".into(),
+                });
+            }
+        }
+
+        // Wait for the VM to actually stop
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             let ready_ip = super::check_ready_marker(&handle.serial_log);
