@@ -377,12 +377,11 @@ impl VmDriver for AppleVzDriver {
         // Dispatch requestStop on the VM's queue — Apple VZ requires all VM
         // operations to happen on the same dispatch queue the VM was created on.
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let vm_for_stop = std::cell::RefCell::new(vm.clone());
+        let vm_for_stop = Mutex::new(vm.clone());
         let name_for_log = handle.name.clone();
         let dispatch_block = ConcreteBlock::new(move || {
-            // SAFETY: we are on the VM's dispatch queue. RefCell is safe because
-            // the dispatch block runs serially on the VM's queue.
-            let result = unsafe { vm_for_stop.borrow_mut().request_stop_with_error() };
+            // SAFETY: we are on the VM's dispatch queue. Mutex is Send+Sync safe.
+            let result = unsafe { vm_for_stop.lock().unwrap().request_stop_with_error() };
             match result {
                 Ok(_) => {
                     tracing::info!("VM '{}' stop requested on dispatch queue", name_for_log);
